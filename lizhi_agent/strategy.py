@@ -39,7 +39,7 @@ class WindowStrategy:
 
 class BaselineStrategy:
     def __init__(self, player_id: str, config: StrategyConfig, logger: DecisionLogger) -> None:
-        self.player_id = player_id
+        self.player_id = str(player_id)
         self.config = config
         self.logger = logger
         self.route_planner = RoutePlanner()
@@ -64,15 +64,23 @@ class BaselineStrategy:
         if window is not None:
             card = self.window_strategy.choose_card(state, window)
             return Decision(
-                ActionBundle(window=WindowAction(window_id=window.id, card=card), main=MainAction(MainActionType.WAIT)),
+                ActionBundle(
+                    window=WindowAction(contest_id=window.id, card=card),
+                    # Sending no main action is a valid heartbeat when window cards are present.
+                    # Avoid active WAIT during MOVING because WAIT pauses movement.
+                    main=None,
+                ),
                 f"window:{window.window_type}:{card.value}",
             )
 
         if me.delivered or me.status == ConvoyStatus.DELIVERED:
-            return Decision(wait("already_delivered"), "already_delivered")
+            return Decision(wait("already_delivered", active_wait=False), "already_delivered")
 
-        if me.status in {ConvoyStatus.RESTING, ConvoyStatus.PROCESSING, ConvoyStatus.VERIFYING, ConvoyStatus.CONTESTING, ConvoyStatus.FORCED_PASSING}:
-            return Decision(wait(f"busy:{me.status.value}"), f"busy:{me.status.value}")
+        if me.status in {ConvoyStatus.PROCESSING, ConvoyStatus.VERIFYING, ConvoyStatus.CONTESTING, ConvoyStatus.FORCED_PASSING}:
+            return Decision(wait(f"busy:{me.status.value}", active_wait=False), f"busy:{me.status.value}")
+
+        if me.status == ConvoyStatus.RESTING:
+            return Decision(wait("resting"), "resting")
 
         if me.station == "S15":
             if me.verified and me.good_fruit > 0 and me.freshness > 0:
@@ -93,7 +101,7 @@ class BaselineStrategy:
         task = self._best_station_task(state)
         if task is not None:
             return Decision(
-                ActionBundle(main=MainAction(MainActionType.CLAIM_TASK, target=task.target, task_id=task.id)),
+                ActionBundle(main=MainAction(MainActionType.CLAIM_TASK, task_id=task.id)),
                 f"claim_task:{task.template}:{task.id}",
             )
 
@@ -109,7 +117,7 @@ class BaselineStrategy:
 
     def _need_endgame(self, state: GameState) -> bool:
         me = state.me
-        if state.phase in {"宫宴冲刺", "BANQUET", "ENDGAME", "FINAL"}:
+        if state.phase in {"RUSH", "宫宴冲刺", "BANQUET", "ENDGAME", "FINAL"}:
             return True
         if me.station is None:
             return False
@@ -119,34 +127,37 @@ class BaselineStrategy:
         return state.turns_left <= to_s14 + to_s15 + verify_frames + self.config.endgame_buffer_frames
 
     def _can_verify_gate(self, state: GameState) -> bool:
-        # The official phase gate is: banquet sprint stage. Keep permissive in
-        # baseline because field names may not be aligned yet.
-        return state.phase in {"宫宴冲刺", "BANQUET", "ENDGAME", "FINAL", "UNKNOWN"}
+        # Official values: NORMAL / RUSH / ENDED. Keep UNKNOWN permissive for local tests.
+        return state.phase in {"RUSH", "宫宴冲刺", "BANQUET", "ENDGAME", "FINAL", "UNKNOWN"}
 
     def _fixed_process_action(self, state: GameState) -> ActionBundle | None:
-        raw = state.raw.get("state", state.raw)
-        process_points = raw.get("processPoints") or raw.get("fixedProcesses") or []
-        if not isinstance(process_points, list):
+        station_id = state.me.station
+        if station_id is None:
             return None
-        for item in process_points:
-            if not isinstance(item, dict):
-                continue
-            station = item.get("station") or item.get("stationId") or item.get("node")
-            completed = item.get("completed") or item.get("done") or False
-            if station == state.me.station and not completed:
-                return ActionBundle(main=MainAction(MainActionType.PROCESS, target=str(station)))
+        station = state.stations.get(station_id)
+        if station is None:
+            return None
+        if station_id == "S14":
+            return None
+        if station.process_type and station.process_round > 0:
+            # If the server exposes currentProcess/done flags later, refine here.
+            # In busy states we already WAIT, so this only starts processing when idle.
+            return ActionBundle(main=MainAction(MainActionType.PROCESS, target=station_id))
         return None
 
     def _best_station_task(self, state: GameState) -> TaskInstance | None:
         station = state.me.station
-        tasks = state.station_tasks(station)
+        tasks = [t for t in state.station_tasks(station) if self._task_available_for_me(t, state)]
         if not tasks:
             return None
 
         def task_key(t: TaskInstance) -> tuple[int, int, int]:
             urgent_bonus = 100 if state.me.task_score_base < self.config.target_task_score and t.score >= 30 else 0
             clear_bonus = 30 if t.template == "T04" else 0
-            return (urgent_bonus + clear_bonus + t.score, -t.process_frames, 0)
+            expire_penalty = 0
+            if t.expire_frame:
+                expire_penalty = max(0, int(t.expire_frame) - state.frame)
+            return (urgent_bonus + clear_bonus + t.score, -t.process_frames, expire_penalty)
 
         best = max(tasks, key=task_key)
         if state.me.task_score_base < self.config.target_task_score:
@@ -155,6 +166,11 @@ class BaselineStrategy:
         if best.is_valuable and not self._need_endgame(state):
             return best
         return None
+
+    def _task_available_for_me(self, task: TaskInstance, state: GameState) -> bool:
+        if task.protection_player_id in (None, 0, "0"):
+            return True
+        return str(task.protection_player_id) == self.player_id
 
     def _best_station_resource(self, state: GameState) -> ResourceStock | None:
         stocks = state.station_resources(state.me.station)
@@ -174,13 +190,11 @@ class BaselineStrategy:
     def _move_towards_delivery(self, state: GameState) -> ActionBundle:
         me = state.me
         if me.station is None:
-            return wait("unknown_station")
+            return wait("unknown_station", active_wait=False)
 
         target = "S15" if me.verified else "S14"
         next_hop = self.route_planner.next_hop_to_any(state, me.station, (target,))
         if next_hop is None:
-            # If map edges are missing from protocol during early integration,
-            # attempt the canonical direct move only when adjacent list contains it.
             neighbors = state.neighbors(me.station)
             if target in neighbors:
                 next_hop = target
