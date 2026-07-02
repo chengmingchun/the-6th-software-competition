@@ -95,7 +95,7 @@ class DecisionLogger:
             if verified:
                 return "冲刺期：已验核奔终点"
             return "冲刺期：赶赴宫门验核"
-        if status in {"MOVING", "WAITING"}:
+        if status == "MOVING":
             return "行军中：等待系统推进"
         if status in {"PROCESSING", "VERIFYING", "RESTING", "FORCED_PASSING", "CONTESTING"}:
             return "忙碌读条：处理/验核/休整"

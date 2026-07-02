@@ -107,6 +107,38 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
 
+    def test_waiting_at_station_still_plans_next_move(self) -> None:
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.WAITING, station="S08", target="S14", task_score_base=90),
+            edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
+        )
+        action = self.strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
+
+    def test_waiting_on_route_edge_keeps_system_wait(self) -> None:
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.WAITING,
+                station="S08",
+                target="S09",
+                route_edge_id="E1",
+                task_score_base=90,
+            ),
+            edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
+        )
+        action = self.strategy.decide(state)
+        self.assertIsNone(action.main)
+
     def test_window_card_does_not_block_fixed_process(self) -> None:
         state = GameState(
             frame=57,

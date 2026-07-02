@@ -27,9 +27,9 @@ BUSY_STATES = {
     ConvoyStatus.FORCED_PASSING,
     ConvoyStatus.CONTESTING,
 }
-MOVING_STATES = {ConvoyStatus.MOVING, ConvoyStatus.WAITING}
+MOVING_STATES = {ConvoyStatus.MOVING}
 RUSH_PHASES = {"RUSH", "BANQUET", "ENDGAME", "FINAL", "宫宴冲刺"}
-PLANNING_STATES = {ConvoyStatus.IDLE, ConvoyStatus.UNKNOWN, ConvoyStatus.COST_BANKRUPT}
+PLANNING_STATES = {ConvoyStatus.IDLE, ConvoyStatus.WAITING, ConvoyStatus.UNKNOWN, ConvoyStatus.COST_BANKRUPT}
 PROCESS_RETRY_CODES = {"PROCESS_REQUIRED", "PROCESS_INTERRUPTED", "INTERRUPTED"}
 PROCESS_HARD_REJECT_CODES = {"PROCESS_NOT_AVAILABLE", "NOT_AT_TARGET_NODE", "INVALID_TARGET"}
 
@@ -211,7 +211,7 @@ class BaselineStrategy:
             return done(wait("already_delivered", active=False), "already_delivered")
         if me.retired or me.status == ConvoyStatus.RETIRED:
             return done(wait("retired", active=False), "retired")
-        if me.status in MOVING_STATES:
+        if me.status in MOVING_STATES or self._is_transit_waiting(state):
             horse = self._moving_horse_action(state)
             if horse is not None:
                 return done(horse, "use_horse_while_moving")
@@ -378,7 +378,7 @@ class BaselineStrategy:
         self._rejected_fixed_process_nodes.discard(node)
         self._pending_process_until.pop(node, None)
         self._pending_process_started_at.pop(node, None)
-        self.logger.info("feedback_learn", learned="fixed_process_completed", nodeId=node, event=raw)
+        self.logger.info("feedback_learn", learned="fixed_process_completed", nodeId=node, raw=raw)
 
     def _remember_outbound_process(self, state: GameState, bundle: ActionBundle) -> None:
         if bundle.main is None or bundle.main.action != MainActionType.PROCESS:
@@ -456,6 +456,12 @@ class BaselineStrategy:
         if status in {ConvoyStatus.DELIVERED, ConvoyStatus.RETIRED}:
             return "TERMINAL_GUARD"
         return "PLANNING"
+
+    def _is_transit_waiting(self, state: GameState) -> bool:
+        me = state.me
+        if me.status != ConvoyStatus.WAITING:
+            return False
+        return bool(me.route_edge_id)
 
     def _need_endgame(self, state: GameState) -> bool:
         me = state.me
