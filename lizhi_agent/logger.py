@@ -187,6 +187,17 @@ class DecisionLogger:
                 lines.append("    [收到.contests] " + self._json_short(contests, 4000))
         return "\n".join(lines)
 
+    def _fmt_fixture_frame(self, fields: dict[str, Any]) -> str:
+        payload = {
+            "round": fields.get("round"),
+            "playerId": fields.get("playerId"),
+            "matchId": fields.get("matchId"),
+            "startData": fields.get("startData"),
+            "inquireData": fields.get("inquireData"),
+            "expectedActions": fields.get("expectedActions", []),
+        }
+        return "[夹板] 可回放帧已记录 @@LIZHI_FIXTURE@@" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+
     def _fmt_handle_message(self, fields: dict[str, Any]) -> str:
         return f"[分拣] 处理 {fields.get('msgName')}，字段={fields.get('msgDataKeys')}"
 
