@@ -149,6 +149,51 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.RUSH_PROTECT)
 
+    def test_rush_speed_beats_protect_when_deadline_is_tight(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=570,
+            max_frame=600,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S10",
+                freshness=95,
+                good_fruit=95,
+                task_score_base=120,
+                rush_tactic_used_count=0,
+            ),
+            edges=[RouteEdge(id="E1", start="S10", end="S14", distance=10)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.RUSH_SPEED)
+
+    def test_rush_uses_horse_before_protect_when_available(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=500,
+            max_frame=600,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S10",
+                freshness=95,
+                task_score_base=120,
+                rush_tactic_used_count=0,
+                resources={"FAST_HORSE": 1},
+            ),
+            edges=[RouteEdge(id="E1", start="S10", end="S14", distance=6)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
+        self.assertEqual(action.main.to_action()["resourceType"], "FAST_HORSE")
+
     def test_rush_protect_does_not_skip_fixed_process(self) -> None:
         strategy = self.make_strategy()
         state = GameState(

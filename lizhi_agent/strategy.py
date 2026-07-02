@@ -301,6 +301,10 @@ class BaselineStrategy:
         rush_tactic = self._rush_tactic_action(state)
         if rush_tactic is not None:
             return done(rush_tactic, "use_rush_tactic")
+        if state.phase in RUSH_PHASES:
+            rush_resource = self._pre_move_resource_action(state)
+            if rush_resource is not None:
+                return done(rush_resource, "use_rush_route_resource")
         if self._need_endgame(state) or self._opponent_pressure(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_deadline_delivery_first")
             scout = self._squad_scout_action(state)
@@ -577,15 +581,19 @@ class BaselineStrategy:
             return None
         if me.status not in PLANNING_STATES or me.current_process is not None:
             return None
-        if not me.has_buff("RUSH_PROTECT") and (me.task_score_base >= self.config.target_task_score or me.freshness <= 86):
-            self.logger.info("rush_tactic", action="RUSH_PROTECT", reason="protect_freshness_in_rush", freshness=me.freshness, taskScore=me.task_score_base)
-            return ActionBundle(main=MainAction(MainActionType.RUSH_PROTECT))
-        if not me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") and me.good_fruit >= 88:
-            target = state.terminal_node if me.verified else state.gate_node
-            remaining_cost = self.route_planner.estimate_frames(state, me.station, target)
+        target = state.terminal_node if me.verified else state.gate_node
+        remaining_cost = self.route_planner.estimate_frames(state, me.station, target)
+        has_speed_resource = me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")
+        if not me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") and not has_speed_resource and me.good_fruit >= 88 and me.freshness >= 88:
             if remaining_cost >= 8 and state.turns_left <= remaining_cost + 32:
                 self.logger.info("rush_tactic", action="RUSH_SPEED", reason="deadline_speedup", remainingCost=remaining_cost, turnsLeft=state.turns_left)
                 return ActionBundle(main=MainAction(MainActionType.RUSH_SPEED))
+        if has_speed_resource and not me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") and me.freshness >= 83 and remaining_cost >= 6:
+            self.logger.info("rush_tactic_skip", action="RUSH_PROTECT", reason="use_horse_before_protect", remainingCost=remaining_cost)
+            return None
+        if not me.has_buff("RUSH_PROTECT") and (me.task_score_base >= self.config.target_task_score or me.freshness <= 86):
+            self.logger.info("rush_tactic", action="RUSH_PROTECT", reason="protect_freshness_in_rush", freshness=me.freshness, taskScore=me.task_score_base)
+            return ActionBundle(main=MainAction(MainActionType.RUSH_PROTECT))
         return None
 
     def _freshness_action(self, state: GameState) -> ActionBundle | None:
