@@ -21,8 +21,10 @@ class DecisionLogger:
         self.enabled = os.environ.get("LIZHI_DEBUG", "1") != "0"
         self.file_enabled = os.environ.get("LIZHI_FILE_LOG", "0") == "1"
         self.style = os.environ.get("LIZHI_LOG_STYLE", "pretty").lower()
+        self.stage_banner_enabled = os.environ.get("LIZHI_STAGE_BANNER", "1") != "0"
         self._file = None
         self._last_round: Any = None
+        self._last_stage: str | None = None
         if self.file_enabled:
             os.makedirs(log_dir, exist_ok=True)
             suffix = "jsonl" if self.style == "json" else "log"
@@ -40,11 +42,17 @@ class DecisionLogger:
             "event": event,
             **fields,
         }
+        banner = None
         if self.style == "json":
             line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         else:
+            banner = self._stage_banner(event, fields)
             line = self._format_pretty(event, fields)
         try:
+            if banner is not None:
+                print(banner, file=sys.stderr, flush=True)
+                if self._file is not None:
+                    self._file.write(banner + "\n")
             print(line, file=sys.stderr, flush=True)
             if self._file is not None:
                 self._file.write(line + "\n")
@@ -59,6 +67,45 @@ class DecisionLogger:
                 self._file.close()
             except Exception:
                 pass
+
+    def _stage_banner(self, event: str, fields: dict[str, Any]) -> str | None:
+        if not self.stage_banner_enabled or event != "state_snapshot":
+            return None
+        stage = self._stage_name(fields)
+        if stage == self._last_stage:
+            return None
+        self._last_stage = stage
+        round_no = fields.get("round", self._last_round)
+        return f"\n==================== ==阶段：{stage}｜第{round_no}帧== ===================="
+
+    def _stage_name(self, fields: dict[str, Any]) -> str:
+        phase = str(fields.get("phase") or "UNKNOWN").upper()
+        status = str(fields.get("status") or "UNKNOWN").upper()
+        station = fields.get("station")
+        verified = bool(fields.get("verified"))
+        delivered = bool(fields.get("delivered"))
+        task_score = fields.get("taskScore")
+        escape_until = fields.get("stationEscapeUntil")
+
+        if delivered or status == "DELIVERED":
+            return "已交付收尾"
+        if phase in {"RUSH", "BANQUET", "ENDGAME", "FINAL", "宫宴冲刺"}:
+            if verified:
+                return "冲刺期：已验核奔终点"
+            return "冲刺期：赶赴宫门验核"
+        if status in {"MOVING", "WAITING"}:
+            return "行军中：等待系统推进"
+        if status in {"PROCESSING", "VERIFYING", "RESTING", "FORCED_PASSING", "CONTESTING"}:
+            return "忙碌读条：处理/验核/休整"
+        if escape_until not in (None, "", 0):
+            return "破局逃逸：放弃支线回主线"
+        if verified:
+            return "已验核：冲向终点"
+        if station == "S14":
+            return "宫门前：等待/执行验核"
+        if isinstance(task_score, int) and task_score < 90:
+            return "前期攒分：任务资源取舍"
+        return "主线推进：赶赴宫门"
 
     def _format_pretty(self, event: str, fields: dict[str, Any]) -> str:
         round_no = fields.get("round", self._last_round)
@@ -87,6 +134,15 @@ class DecisionLogger:
     def _fmt_send_message(self, fields: dict[str, Any]) -> str:
         actions = fields.get("actions") or []
         return f"[发令] 发送 {fields.get('msgName')} | 动作={self._actions_text(actions)}"
+
+    def _fmt_frame_sent(self, fields: dict[str, Any]) -> str:
+        return (
+            f"[出包] {fields.get('msgName')} 已写入 socket，"
+            f"prefix={fields.get('prefix')} body={fields.get('bodyBytes')}B frame={fields.get('frameBytes')}B"
+        )
+
+    def _fmt_registration_sent(self, fields: dict[str, Any]) -> str:
+        return f"[报名] registration 已发送，playerId={fields.get('playerId')}"
 
     def _fmt_strategy_start(self, fields: dict[str, Any]) -> str:
         return f"[开局] 地图装入完成：节点 {fields.get('nodes')} 个，路线 {fields.get('edges')} 条"
@@ -128,6 +184,24 @@ class DecisionLogger:
             f"任务={fields.get('tasks')} 资源点={fields.get('resourcesOnMap')} 窗口={fields.get('windows')} | "
             f"到宫门≈{self._cost(fields.get('gateCost'))}帧 剩余={fields.get('turnsLeft')}帧"
         )
+
+    def _fmt_feedback_learn(self, fields: dict[str, Any]) -> str:
+        learned = fields.get("learned")
+        if learned == "fixed_process_completed":
+            return f"[回执] 固定处理完成：{fields.get('nodeId')}，本次到站不再重复 PROCESS"
+        if learned == "fixed_process_rejected":
+            return f"[回执] 固定处理被拒：{fields.get('nodeId')} code={fields.get('code')}，加入跳过列表"
+        if learned == "task_rejected":
+            return f"[回执] 任务被拒：{fields.get('taskId')} code={fields.get('code')}，加入冷却/黑名单"
+        if learned == "resource_rejected":
+            return f"[回执] 资源领取被拒：{fields.get('nodeId')} {fields.get('resourceType')} code={fields.get('code')}，加入冷却"
+        return f"[回执] learned={learned} | {self._short(fields)}"
+
+    def _fmt_fixed_process_eval(self, fields: dict[str, Any]) -> str:
+        return f"[处理] 当前站 {fields.get('station')} 需要 {fields.get('processType')}，准备提交 {fields.get('action')}"
+
+    def _fmt_fixed_process_skip(self, fields: dict[str, Any]) -> str:
+        return f"[处理] 跳过 {fields.get('station')} 的 {fields.get('processType')}，原因={fields.get('reason')}"
 
     def _fmt_task_eval_station(self, fields: dict[str, Any]) -> str:
         candidates = fields.get("candidates") or []
@@ -173,10 +247,16 @@ class DecisionLogger:
             return f"[小队] 派出 {fields.get('action')} -> {fields.get('target')}，提前探路压缩读条"
         return "[小队] 暂不派出，小队留作后手"
 
+    def _fmt_squad_eval_skip(self, fields: dict[str, Any]) -> str:
+        return f"[小队] 跳过探路目标 {fields.get('target')}，原因={fields.get('reason')}"
+
     def _fmt_route_decision(self, fields: dict[str, Any]) -> str:
         if fields.get("nextHop") is None:
             return f"[岔路] 从 {fields.get('fromNode')} 找不到去 {fields.get('target')} 的路，原地保守"
-        return f"[岔路] 目标={fields.get('target')}，下一跳={fields.get('nextHop')}，车队拔营"
+        return (
+            f"[岔路] 规划目标={fields.get('target')}，下一跳={fields.get('nextHop')}。"
+            "注意：这是路线计划，不代表已移动；是否真的起步看后面的 [发令]/[回执]/下一帧状态。"
+        )
 
     def _fmt_blocker_decision(self, fields: dict[str, Any]) -> str:
         return (
@@ -185,7 +265,7 @@ class DecisionLogger:
         )
 
     def _fmt_move_decision(self, fields: dict[str, Any]) -> str:
-        return f"[行军] 向 {fields.get('target')} 前进"
+        return f"[行军] 准备发送 MOVE->{fields.get('target')}；下一帧变 MOVING 或位置变化才算真的动起来"
 
     def _fmt_stall_breaker(self, fields: dict[str, Any]) -> str:
         kind = fields.get("kind")
