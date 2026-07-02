@@ -284,6 +284,9 @@ class BaselineStrategy:
         fresh_action = self._freshness_action(state)
         if fresh_action is not None:
             return done(fresh_action, "use_ice_box")
+        rush_tactic = self._rush_tactic_action(state)
+        if rush_tactic is not None:
+            return done(rush_tactic, "use_rush_tactic")
         if me.station == state.terminal_node:
             if me.verified and me.good_fruit > 0 and me.freshness > 0:
                 return done(ActionBundle(main=MainAction(MainActionType.DELIVER)), "deliver")
@@ -552,6 +555,25 @@ class BaselineStrategy:
     def _verify_action(self, state: GameState) -> ActionBundle:
         rush = "BREAK_ORDER" if state.me.rush_tactic_used_count == 0 and state.phase in RUSH_PHASES else None
         return ActionBundle(main=MainAction(MainActionType.VERIFY_GATE, target=state.gate_node, rush_tactic=rush))
+
+    def _rush_tactic_action(self, state: GameState) -> ActionBundle | None:
+        me = state.me
+        if state.phase not in RUSH_PHASES or me.rush_tactic_used_count > 0:
+            return None
+        if me.station in {None, state.gate_node, state.terminal_node}:
+            return None
+        if me.status not in PLANNING_STATES or me.current_process is not None:
+            return None
+        if not me.has_buff("RUSH_PROTECT") and (me.task_score_base >= self.config.target_task_score or me.freshness <= 86):
+            self.logger.info("rush_tactic", action="RUSH_PROTECT", reason="protect_freshness_in_rush", freshness=me.freshness, taskScore=me.task_score_base)
+            return ActionBundle(main=MainAction(MainActionType.RUSH_PROTECT))
+        if not me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") and me.good_fruit >= 88:
+            target = state.terminal_node if me.verified else state.gate_node
+            remaining_cost = self.route_planner.estimate_frames(state, me.station, target)
+            if remaining_cost >= 8 and state.turns_left <= remaining_cost + 32:
+                self.logger.info("rush_tactic", action="RUSH_SPEED", reason="deadline_speedup", remainingCost=remaining_cost, turnsLeft=state.turns_left)
+                return ActionBundle(main=MainAction(MainActionType.RUSH_SPEED))
+        return None
 
     def _freshness_action(self, state: GameState) -> ActionBundle | None:
         me = state.me

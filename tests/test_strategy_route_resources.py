@@ -85,6 +85,46 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
         self.assertEqual(action.main.to_action()["resourceType"], "SHORT_HORSE")
 
+    def test_rush_protect_used_before_gate_to_preserve_freshness(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=430,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S10",
+                freshness=82,
+                task_score_base=120,
+                rush_tactic_used_count=0,
+            ),
+            edges=[RouteEdge(id="E1", start="S10", end="S14", distance=3)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.RUSH_PROTECT)
+
+    def test_gate_verify_keeps_break_order_priority(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=430,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S14",
+                freshness=82,
+                task_score_base=120,
+                rush_tactic_used_count=0,
+            ),
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.VERIFY_GATE)
+        self.assertEqual(action.main.to_action()["rushTactic"], "BREAK_ORDER")
+
     def test_after_90_score_still_detours_for_high_value_task(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
