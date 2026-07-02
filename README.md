@@ -35,6 +35,12 @@
 ./start.sh <playerId> <host> <port>
 ```
 
+Windows 本地调试可以使用：
+
+```bat
+start.bat <playerId> <host> <port>
+```
+
 本地可以运行单元测试：
 
 ```bash
@@ -67,6 +73,47 @@ python main.py 1001
 8. 当前站点有高价值资源时，提交 `CLAIM_RESOURCE`。
 9. 在不危及交付的前提下，轻微绕路拿 30 分任务或关键资源。
 10. 否则按加权最短路前往 S14/S15 完成交付。
+
+## 状态机说明
+
+当前策略是“状态机守卫 + 优先级调度”。
+
+状态机守卫先按主车队状态决定是否允许主动规划：
+
+| 状态类 | 原始状态 | 策略行为 |
+|---|---|---|
+| `TERMINAL_GUARD` | `DELIVERED` / `RETIRED` | 只发空动作心跳，不再主动操作 |
+| `MOVING_GUARD` | `MOVING` / `WAITING` | 默认发空动作心跳让系统继续推进；若没有移动 buff 且有马类资源，会尝试使用马 |
+| `BUSY_GUARD` | `PROCESSING` / `VERIFYING` / `RESTING` / `FORCED_PASSING` / `CONTESTING` | 不打断读条、休整或强制通行，只发空动作心跳 |
+| `PLANNING` | `IDLE` / `UNKNOWN` / `COST_BANKRUPT` | 进入完整策略调度，评估交付、处理、任务、资源和路线 |
+
+进入 `PLANNING` 后，再按“交付优先、90 分任务门槛、顺路资源、终局保护”的优先级选择动作。
+
+## 日志说明
+
+默认会向 `stderr` 输出 JSON Lines 日志，便于从比赛日志里复盘。可以用环境变量控制：
+
+```bash
+LIZHI_DEBUG=1       # 默认开启 stderr 日志
+LIZHI_DEBUG=0       # 关闭策略日志
+LIZHI_FILE_LOG=1    # 同时写入 logs/<playerId>.jsonl
+```
+
+关键日志事件：
+
+| event | 含义 |
+|---|---|
+| `recv_message` | 收到服务端消息，记录 round、phase、任务数、窗口数、事件数 |
+| `send_message` | 发给服务端的消息，记录本帧 actions |
+| `state_snapshot` | 每帧状态机快照，包含位置、状态类、分数、资源、鲜度、任务数、窗口数和到门/终点估计成本 |
+| `task_eval_station` | 当前站点可处理任务候选及排序 |
+| `resource_eval_station` | 当前站点可领取资源候选及优先级 |
+| `task_eval_reachable` | 可绕路任务候选、估值和最终选择 |
+| `resource_eval_reachable` | 可绕路资源候选、估值和最终选择 |
+| `route_decision` | 目标点和下一跳 |
+| `blocker_decision` | 遇到障碍或敌方设卡时选择 T04、CLEAR、BREAK_GUARD 或 FORCED_PASS |
+| `squad_eval` | 小分队探路目标选择 |
+| `decision` | 本帧最终动作和最终原因 |
 
 ## 设计参考
 

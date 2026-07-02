@@ -89,6 +89,7 @@ class CompetitionClient:
             reader = sock.makefile("rb")
             writer = sock.makefile("wb")
             codec = LengthPrefixedCodec(_Duplex(reader=reader, writer=writer))
+            self.logger.info("send_registration", playerId=self.context.player_id)
             codec.write_message(self._registration_message())
             return self._run_official_loop(codec)
 
@@ -121,13 +122,17 @@ class CompetitionClient:
                 self.logger.info("server_closed")
                 break
             try:
+                self._log_inbound(payload)
                 response = self._handle_message(payload)
                 if response is not None:
+                    self._log_outbound(response)
                     codec.write_message(response)
             except Exception as exc:
                 self.logger.info("message_error", error=repr(exc), payload=str(payload)[:500])
                 if self.context.match_id is not None:
-                    codec.write_message(self._action_message(wait("exception_fallback")))
+                    fallback = self._action_message(wait("exception_fallback"))
+                    self._log_outbound(fallback)
+                    codec.write_message(fallback)
         self.logger.close()
         return 0
 
@@ -159,6 +164,29 @@ class CompetitionClient:
 
         self.logger.info("ignored_message", msgName=msg_name, keys=list(payload.keys()))
         return None
+
+    def _log_inbound(self, payload: dict[str, Any]) -> None:
+        msg_name = payload.get("msg_name") or payload.get("type")
+        msg_data = payload.get("msg_data") if isinstance(payload.get("msg_data"), dict) else {}
+        self.logger.info(
+            "recv_message",
+            msgName=msg_name,
+            round=msg_data.get("round"),
+            phase=msg_data.get("phase"),
+            players=len(msg_data.get("players", []) or []) if isinstance(msg_data.get("players"), list) else None,
+            tasks=len(msg_data.get("tasks", []) or []) if isinstance(msg_data.get("tasks"), list) else None,
+            contests=len(msg_data.get("contests", []) or []) if isinstance(msg_data.get("contests"), list) else None,
+            events=len(msg_data.get("events", []) or []) if isinstance(msg_data.get("events"), list) else None,
+        )
+
+    def _log_outbound(self, payload: dict[str, Any]) -> None:
+        msg_data = payload.get("msg_data") if isinstance(payload.get("msg_data"), dict) else {}
+        self.logger.info(
+            "send_message",
+            msgName=payload.get("msg_name"),
+            round=msg_data.get("round"),
+            actions=msg_data.get("actions"),
+        )
 
     def _registration_message(self) -> dict[str, Any]:
         return {

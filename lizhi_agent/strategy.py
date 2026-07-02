@@ -86,6 +86,7 @@ class BaselineStrategy:
         )
 
     def decide(self, state: GameState) -> ActionBundle:
+        self._log_state_snapshot(state)
         decision = self._decide(state)
         if decision.bundle.squad is not None and decision.bundle.squad.action == SquadActionType.SQUAD_SCOUT:
             self._scout_dispatched.add(decision.bundle.squad.target)
@@ -103,12 +104,65 @@ class BaselineStrategy:
         )
         return decision.bundle
 
+    def _log_state_snapshot(self, state: GameState) -> None:
+        me = state.me
+        gate_cost = self.route_planner.estimate_frames(state, me.station, state.gate_node) if me.station else None
+        terminal_cost = self.route_planner.estimate_frames(state, state.gate_node, state.terminal_node)
+        self.logger.info(
+            "state_snapshot",
+            round=state.frame,
+            phase=state.phase,
+            status=me.status.value,
+            stateClass=self._state_class(me.status),
+            station=me.station,
+            target=me.target,
+            verified=me.verified,
+            delivered=me.delivered,
+            goodFruit=me.good_fruit,
+            badFruit=me.bad_fruit,
+            freshness=me.freshness,
+            taskScore=me.task_score_base,
+            bountyScore=me.bounty_score,
+            totalScore=me.total_score,
+            resources=me.resources,
+            buffs=me.buffs,
+            squadAvailable=me.squad_available,
+            guardPoints=me.guard_points,
+            tasks=len(state.tasks),
+            resourcesOnMap=len(state.resources),
+            windows=len(state.windows),
+            events=len(state.events),
+            gateCost=gate_cost,
+            terminalCost=terminal_cost,
+            turnsLeft=state.turns_left,
+        )
+
+    def _state_class(self, status: ConvoyStatus) -> str:
+        if status in MOVING_STATES:
+            return "MOVING_GUARD"
+        if status in BUSY_STATES:
+            return "BUSY_GUARD"
+        if status in {ConvoyStatus.DELIVERED, ConvoyStatus.RETIRED}:
+            return "TERMINAL_GUARD"
+        return "PLANNING"
+
     def _decide(self, state: GameState) -> Decision:
         me = state.me
 
         window = state.active_window()
         if window is not None:
             card = self.window_strategy.choose_card(state, window)
+            self.logger.info(
+                "strategy_step",
+                step="window_card",
+                contestId=window.id,
+                contestType=window.window_type,
+                target=window.target,
+                resourceType=window.resource_type,
+                taskId=window.task_id,
+                roundIndex=window.round_index,
+                chosenCard=card.value,
+            )
             return Decision(ActionBundle(window=WindowAction(window.id, card)), f"window:{window.window_type}:{card.value}")
 
         if me.delivered or me.status == ConvoyStatus.DELIVERED:
@@ -143,6 +197,7 @@ class BaselineStrategy:
             return Decision(self._move_to(state, state.terminal_node), "gate_to_terminal")
 
         if self._need_endgame(state):
+            self.logger.info("strategy_step", step="endgame_guard", reason="rush_phase_or_deadline")
             return Decision(self._move_towards_delivery(state), "endgame_delivery")
 
         fixed_process = self._fixed_process_action(state)
@@ -220,6 +275,7 @@ class BaselineStrategy:
     def _best_station_task(self, state: GameState) -> TaskInstance | None:
         tasks = state.station_tasks(state.me.station)
         if not tasks:
+            self.logger.info("task_eval_station", station=state.me.station, candidates=[])
             return None
         if state.me.task_score_base >= self.config.greed_task_score and not self._need_endgame(state):
             return None
@@ -230,6 +286,21 @@ class BaselineStrategy:
             return threshold_bonus + clear_bonus + task.score, -task.process_frames
 
         best = max(tasks, key=score)
+        self.logger.info(
+            "task_eval_station",
+            station=state.me.station,
+            candidates=[
+                {
+                    "taskId": task.id,
+                    "template": task.template,
+                    "score": task.score,
+                    "processFrames": task.process_frames,
+                    "rank": score(task),
+                }
+                for task in tasks
+            ],
+            chosen=best.id,
+        )
         if state.me.task_score_base < self.config.target_task_score:
             return best
         if best.score >= 30 and not self._need_endgame(state):
@@ -239,14 +310,35 @@ class BaselineStrategy:
     def _best_station_resource(self, state: GameState) -> ResourceStock | None:
         stocks = state.station_resources(state.me.station)
         if not stocks:
+            self.logger.info("resource_eval_station", station=state.me.station, candidates=[])
             return None
         priority = {name: i for i, name in enumerate(self.config.resource_priority)}
         useful = [stock for stock in stocks if stock.resource_type in priority]
         if self._need_endgame(state):
             useful = [stock for stock in useful if stock.resource_type in {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE"}]
         if not useful:
+            self.logger.info(
+                "resource_eval_station",
+                station=state.me.station,
+                candidates=[{"resourceType": stock.resource_type, "amount": stock.amount} for stock in stocks],
+                chosen=None,
+            )
             return None
-        return min(useful, key=lambda stock: priority.get(stock.resource_type, 999))
+        chosen = min(useful, key=lambda stock: priority.get(stock.resource_type, 999))
+        self.logger.info(
+            "resource_eval_station",
+            station=state.me.station,
+            candidates=[
+                {
+                    "resourceType": stock.resource_type,
+                    "amount": stock.amount,
+                    "priority": priority.get(stock.resource_type, 999),
+                }
+                for stock in stocks
+            ],
+            chosen=chosen.resource_type,
+        )
+        return chosen
 
     def _best_reachable_task(self, state: GameState) -> TaskInstance | None:
         if state.me.task_score_base >= self.config.target_task_score:
@@ -267,8 +359,26 @@ class BaselineStrategy:
                     value += 40
                 candidates.append((value, task))
         if not candidates:
+            self.logger.info("task_eval_reachable", directToGate=direct, candidates=[])
             return None
-        return max(candidates, key=lambda item: item[0])[1]
+        chosen_value, chosen = max(candidates, key=lambda item: item[0])
+        self.logger.info(
+            "task_eval_reachable",
+            directToGate=direct,
+            candidates=[
+                {
+                    "taskId": task.id,
+                    "template": task.template,
+                    "target": task.target,
+                    "score": task.score,
+                    "value": value,
+                }
+                for value, task in sorted(candidates, key=lambda item: item[0], reverse=True)[:5]
+            ],
+            chosen=chosen.id,
+            chosenValue=chosen_value,
+        )
+        return chosen
 
     def _best_reachable_resource(self, state: GameState) -> ResourceStock | None:
         if state.me.station is None:
@@ -285,8 +395,25 @@ class BaselineStrategy:
             if detour <= self.config.max_resource_detour_frames:
                 candidates.append((100 - priority[stock.resource_type] * 10 - max(0, detour), stock))
         if not candidates:
+            self.logger.info("resource_eval_reachable", directToGate=direct, candidates=[])
             return None
-        return max(candidates, key=lambda item: item[0])[1]
+        chosen_value, chosen = max(candidates, key=lambda item: item[0])
+        self.logger.info(
+            "resource_eval_reachable",
+            directToGate=direct,
+            candidates=[
+                {
+                    "resourceType": stock.resource_type,
+                    "station": stock.station,
+                    "value": value,
+                }
+                for value, stock in sorted(candidates, key=lambda item: item[0], reverse=True)[:5]
+            ],
+            chosen=chosen.resource_type,
+            chosenStation=chosen.station,
+            chosenValue=chosen_value,
+        )
+        return chosen
 
     def _squad_scout_action(self, state: GameState) -> SquadAction | None:
         if state.phase in RUSH_PHASES or state.me.squad_available <= 0:
@@ -299,7 +426,9 @@ class BaselineStrategy:
             if target in self._scout_dispatched or self._has_own_scout_marker(state, target):
                 continue
             if self.route_planner.estimate_frames(state, state.me.station, target) < 10**8:
+                self.logger.info("squad_eval", action="SQUAD_SCOUT", target=target, reason="preferred_scout_target")
                 return SquadAction(SquadActionType.SQUAD_SCOUT, target)
+        self.logger.info("squad_eval", action=None, reason="no_available_scout_target")
         return None
 
     def _has_own_scout_marker(self, state: GameState, target: str) -> bool:
@@ -329,7 +458,9 @@ class BaselineStrategy:
             return wait("unknown_station", active=False)
         next_hop = self.route_planner.next_hop_to_any(state, state.me.station, (target,))
         if next_hop is None:
+            self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=None, reason="no_route")
             return wait("no_route", active=False)
+        self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=next_hop)
         return self._move_to(state, next_hop, squad=squad)
 
     def _move_to(self, state: GameState, target: str, squad: SquadAction | None = None) -> ActionBundle:
@@ -337,12 +468,16 @@ class BaselineStrategy:
         if station is not None and station.has_obstacle:
             t04 = self._t04_for_target(state, target)
             if t04 is not None:
+                self.logger.info("blocker_decision", target=target, blocker="obstacle", action="CLAIM_TASK", taskId=t04.id)
                 return self._claim_task(t04)
             if state.me.good_fruit > 5:
+                self.logger.info("blocker_decision", target=target, blocker="obstacle", action="CLEAR")
                 return ActionBundle(main=MainAction(MainActionType.CLEAR, target=target), squad=squad)
+            self.logger.info("blocker_decision", target=target, blocker="obstacle", action="FORCED_PASS")
             return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=target), squad=squad)
         if station is not None and station.has_enemy_guard(state.me.team_id):
             if state.me.bad_fruit >= 2 or state.me.good_fruit >= 95:
+                self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="BREAK_GUARD")
                 return ActionBundle(
                     main=MainAction(
                         MainActionType.BREAK_GUARD,
@@ -352,7 +487,9 @@ class BaselineStrategy:
                     ),
                     squad=squad,
                 )
+            self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="FORCED_PASS")
             return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=target), squad=squad)
+        self.logger.info("move_decision", target=target, action="MOVE")
         return ActionBundle(main=MainAction(MainActionType.MOVE, target=target), squad=squad)
 
     def _t04_for_target(self, state: GameState, target: str) -> TaskInstance | None:
