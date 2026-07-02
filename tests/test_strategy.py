@@ -107,6 +107,35 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
 
+    def test_window_card_does_not_block_fixed_process(self) -> None:
+        state = GameState(
+            frame=57,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=4),
+            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
+            windows=[WindowState(id="contest-process", window_type="TASK", target="S02", active=True, my_turn=True, round_index=1)],
+        )
+        action = self.strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.PROCESS)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+        self.assertIsNotNone(action.window)
+
+    def test_window_card_does_not_block_move(self) -> None:
+        state = GameState(
+            frame=120,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=90, guard_points=4),
+            edges=[RouteEdge(id="E1", start="S01", end="S02", distance=1), RouteEdge(id="E2", start="S02", end="S14", distance=1)],
+            windows=[WindowState(id="contest-move", window_type="TASK", target="S02", active=True, my_turn=True, round_index=1)],
+        )
+        action = self.strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+        self.assertIsNotNone(action.window)
+
     def test_obstacle_uses_t04_instead_of_plain_clear(self) -> None:
         state = GameState(
             frame=100,
