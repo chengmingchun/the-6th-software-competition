@@ -5,7 +5,7 @@ import os
 import socket
 import sys
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO, TextIO
+from typing import Any, BinaryIO, Protocol
 
 from lizhi_agent.actions import ActionBundle, wait
 from lizhi_agent.logger import DecisionLogger
@@ -22,6 +22,13 @@ def _player_id_value(player_id: str) -> int | str:
 
 def _json_body(payload: dict[str, Any]) -> bytes:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _frame_bytes(payload: dict[str, Any]) -> bytes:
+    body = _json_body(payload)
+    if len(body) > LengthPrefixedCodec.MAX_BODY_SIZE:
+        raise ValueError(f"payload too large for protocol frame: {len(body)} bytes")
+    return f"{len(body):05d}".encode("ascii") + body
 
 
 def _preview(value: Any, limit: int = 3000) -> str:
@@ -48,8 +55,18 @@ class ProtocolContext:
     sent_actions: int = 0
 
 
+class MessageCodec(Protocol):
+    def read_message(self) -> dict[str, Any] | None: ...
+
+    def write_message(self, payload: dict[str, Any]) -> None: ...
+
+
 class LengthPrefixedCodec:
-    """Official TCP codec: five ASCII digits followed by UTF-8 JSON bytes."""
+    """Official frame codec for file-like streams.
+
+    Kept for tests and stdio-style harnesses. Official socket matches use
+    RawSocketCodec below so every outbound frame is sent via socket.sendall().
+    """
 
     PREFIX_SIZE = 5
     MAX_BODY_SIZE = 99_999
@@ -69,10 +86,7 @@ class LengthPrefixedCodec:
             self.buffer.extend(chunk)
 
     def write_message(self, payload: dict[str, Any]) -> None:
-        body = _json_body(payload)
-        if len(body) > self.MAX_BODY_SIZE:
-            raise ValueError(f"payload too large for protocol frame: {len(body)} bytes")
-        frame = f"{len(body):05d}".encode("ascii") + body
+        frame = _frame_bytes(payload)
         self.stream.write(frame)
         self.stream.flush()
 
@@ -93,6 +107,47 @@ class LengthPrefixedCodec:
         return json.loads(raw_body.decode("utf-8"))
 
 
+class RawSocketCodec:
+    """Official TCP codec using raw socket recv/sendall.
+
+    This avoids ambiguity from socket.makefile buffering. If the log says
+    frame_sent, the bytes were handed to the OS through sendall().
+    """
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.sock = sock
+        self.buffer = bytearray()
+
+    def read_message(self) -> dict[str, Any] | None:
+        while True:
+            message = self._try_pop_message()
+            if message is not None:
+                return message
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                return None
+            self.buffer.extend(chunk)
+
+    def write_message(self, payload: dict[str, Any]) -> None:
+        self.sock.sendall(_frame_bytes(payload))
+
+    def _try_pop_message(self) -> dict[str, Any] | None:
+        if len(self.buffer) < LengthPrefixedCodec.PREFIX_SIZE:
+            return None
+        prefix = bytes(self.buffer[: LengthPrefixedCodec.PREFIX_SIZE])
+        if not prefix.isdigit():
+            raise ValueError(f"invalid length prefix: {prefix!r}")
+        size = int(prefix)
+        if size > LengthPrefixedCodec.MAX_BODY_SIZE:
+            raise ValueError(f"declared body too large: {size}")
+        end = LengthPrefixedCodec.PREFIX_SIZE + size
+        if len(self.buffer) < end:
+            return None
+        raw_body = bytes(self.buffer[LengthPrefixedCodec.PREFIX_SIZE : end])
+        del self.buffer[:end]
+        return json.loads(raw_body.decode("utf-8"))
+
+
 class CompetitionClient:
     """Client for the official competition protocol."""
 
@@ -105,12 +160,10 @@ class CompetitionClient:
         self.logger.info("connect", host=host, port=port, mode="socket", playerIdValue=_player_id_value(self.context.player_id))
         with socket.create_connection((host, port), timeout=15) as sock:
             sock.settimeout(None)
-            reader = sock.makefile("rb")
-            writer = sock.makefile("wb")
-            codec = LengthPrefixedCodec(_Duplex(reader=reader, writer=writer))
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            codec = RawSocketCodec(sock)
             registration = self._registration_message()
-            self._log_outbound(registration)
-            codec.write_message(registration)
+            self._send_message(codec, registration)
             self.context.sent_registration = True
             self.logger.info("registration_sent", playerId=self.context.player_id)
             return self._run_official_loop(codec)
@@ -140,7 +193,7 @@ class CompetitionClient:
         self.logger.close()
         return 0
 
-    def _run_official_loop(self, codec: LengthPrefixedCodec) -> int:
+    def _run_official_loop(self, codec: MessageCodec) -> int:
         while True:
             payload = codec.read_message()
             if payload is None:
@@ -159,18 +212,28 @@ class CompetitionClient:
                 self._log_inbound(payload)
                 response = self._handle_message(payload)
                 if response is not None:
-                    self._log_outbound(response)
-                    codec.write_message(response)
+                    self._send_message(codec, response)
                     self._mark_sent(response)
             except Exception as exc:
                 self.logger.info("message_error", error=repr(exc), payloadPreview=_preview(payload, 2000))
                 if self.context.match_id is not None:
                     fallback = self._action_message(wait("exception_fallback"))
-                    self._log_outbound(fallback)
-                    codec.write_message(fallback)
+                    self._send_message(codec, fallback)
                     self._mark_sent(fallback)
         self.logger.close()
         return 0
+
+    def _send_message(self, codec: MessageCodec, payload: dict[str, Any]) -> None:
+        self._log_outbound(payload)
+        frame = _frame_bytes(payload)
+        codec.write_message(payload)
+        self.logger.info(
+            "frame_sent",
+            msgName=payload.get("msg_name"),
+            prefix=frame[: LengthPrefixedCodec.PREFIX_SIZE].decode("ascii"),
+            bodyBytes=len(frame) - LengthPrefixedCodec.PREFIX_SIZE,
+            frameBytes=len(frame),
+        )
 
     def _handle_message(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         msg_name = str(payload.get("msg_name") or payload.get("type") or "").lower()
@@ -318,7 +381,7 @@ class CompetitionClient:
 
 
 class _Duplex:
-    """Expose one read/write object for LengthPrefixedCodec."""
+    """Expose one read/write object for LengthPrefixedCodec tests."""
 
     def __init__(self, reader: BinaryIO, writer: BinaryIO) -> None:
         self.reader = reader
