@@ -16,6 +16,8 @@ cd /d "%~dp0"
 if not exist logs mkdir logs >nul 2>nul
 
 set "DEFAULT_PLAYER_ID=2779"
+set "DEFAULT_RED_PLAYER_ID=2765"
+set "DEFAULT_BLUE_PLAYER_ID=2779"
 set "DEFAULT_HOST=127.0.0.1"
 set "DEFAULT_PORT=30000"
 
@@ -51,18 +53,20 @@ echo Python: %PYTHON_CMD%
 echo 默认本地服务端: %DEFAULT_HOST%:%DEFAULT_PORT%
 echo 日志: stderr + logs\^<playerId^>.jsonl
 echo.
-echo 1. 连接本地调试服务端 ^(%DEFAULT_PLAYER_ID% / %DEFAULT_HOST% / %DEFAULT_PORT%^)
-echo 2. 手动输入 playerId/host/port 连接
-echo 3. 跑本地 fixture ^(不连服务端，只验证 start -^> ready -^> inquire -^> action^)
-echo 4. 跑单元测试
-echo 5. 退出
+echo 1. 启动单个本地客户端 ^(%DEFAULT_PLAYER_ID% / %DEFAULT_HOST% / %DEFAULT_PORT%^)
+echo 2. 同时启动两个本地客户端 ^(RED=%DEFAULT_RED_PLAYER_ID%, BLUE=%DEFAULT_BLUE_PLAYER_ID%^)
+echo 3. 手动输入 playerId/host/port 连接
+echo 4. 跑本地 fixture ^(不连服务端，只验证 start -^> ready -^> inquire -^> action^)
+echo 5. 跑单元测试
+echo 6. 退出
 echo.
-set /p "CHOICE=请选择 [1-5]: "
+set /p "CHOICE=请选择 [1-6]: "
 if "%CHOICE%"=="1" goto DEFAULT_LOCAL
-if "%CHOICE%"=="2" goto PROMPT_REMOTE
-if "%CHOICE%"=="3" goto LOCAL_FIXTURE
-if "%CHOICE%"=="4" goto UNIT_TEST
-if "%CHOICE%"=="5" exit /b 0
+if "%CHOICE%"=="2" goto DUAL_LOCAL
+if "%CHOICE%"=="3" goto PROMPT_REMOTE
+if "%CHOICE%"=="4" goto LOCAL_FIXTURE
+if "%CHOICE%"=="5" goto UNIT_TEST
+if "%CHOICE%"=="6" exit /b 0
 goto MENU
 
 :PROMPT_REMOTE
@@ -80,6 +84,15 @@ set "PLAYER_ID=%DEFAULT_PLAYER_ID%"
 set "HOST=%DEFAULT_HOST%"
 set "PORT=%DEFAULT_PORT%"
 goto RUN_REMOTE
+
+:DUAL_LOCAL
+if exist start_local_dual.bat (
+  call start_local_dual.bat %DEFAULT_RED_PLAYER_ID% %DEFAULT_BLUE_PLAYER_ID% %DEFAULT_HOST% %DEFAULT_PORT%
+) else (
+  echo [ERROR] Missing start_local_dual.bat
+  pause
+)
+goto MENU
 
 :RUN_WITH_ARGS
 set "PLAYER_ID=%~1"
