@@ -9,11 +9,15 @@ rem Usage with args, same as start.sh:
 rem   start.bat <playerId> <host> <port>
 rem
 rem Double click without args:
-rem   interactive menu for remote connect / local fixture / unit tests.
+rem   interactive menu for local connect / fixture / unit tests.
 
 cd /d "%~dp0"
 
 if not exist logs mkdir logs >nul 2>nul
+
+set "DEFAULT_PLAYER_ID=2779"
+set "DEFAULT_HOST=127.0.0.1"
+set "DEFAULT_PORT=30000"
 
 set "LIZHI_DEBUG=1"
 set "LIZHI_RAW_LOG=1"
@@ -44,17 +48,18 @@ echo 一骑红尘：荔枝争运战 - Windows 本地调试启动器
 echo ============================================================
 echo 当前目录: %CD%
 echo Python: %PYTHON_CMD%
+echo 默认本地服务端: %DEFAULT_HOST%:%DEFAULT_PORT%
 echo 日志: stderr + logs\^<playerId^>.jsonl
 echo.
-echo 1. 连接远程比赛服务端 ^(手动输入 playerId/host/port^)
-echo 2. 使用默认远程参数连接 ^(2779 / 7.225.86.238 / 6001^)
+echo 1. 连接本地调试服务端 ^(%DEFAULT_PLAYER_ID% / %DEFAULT_HOST% / %DEFAULT_PORT%^)
+echo 2. 手动输入 playerId/host/port 连接
 echo 3. 跑本地 fixture ^(不连服务端，只验证 start -^> ready -^> inquire -^> action^)
 echo 4. 跑单元测试
 echo 5. 退出
 echo.
 set /p "CHOICE=请选择 [1-5]: "
-if "%CHOICE%"=="1" goto PROMPT_REMOTE
-if "%CHOICE%"=="2" goto DEFAULT_REMOTE
+if "%CHOICE%"=="1" goto DEFAULT_LOCAL
+if "%CHOICE%"=="2" goto PROMPT_REMOTE
 if "%CHOICE%"=="3" goto LOCAL_FIXTURE
 if "%CHOICE%"=="4" goto UNIT_TEST
 if "%CHOICE%"=="5" exit /b 0
@@ -62,18 +67,18 @@ goto MENU
 
 :PROMPT_REMOTE
 echo.
-set /p "PLAYER_ID=playerId [2779]: "
-if "%PLAYER_ID%"=="" set "PLAYER_ID=2779"
-set /p "HOST=host [7.225.86.238]: "
-if "%HOST%"=="" set "HOST=7.225.86.238"
-set /p "PORT=port [6001]: "
-if "%PORT%"=="" set "PORT=6001"
+set /p "PLAYER_ID=playerId [%DEFAULT_PLAYER_ID%]: "
+if "%PLAYER_ID%"=="" set "PLAYER_ID=%DEFAULT_PLAYER_ID%"
+set /p "HOST=host [%DEFAULT_HOST%]: "
+if "%HOST%"=="" set "HOST=%DEFAULT_HOST%"
+set /p "PORT=port [%DEFAULT_PORT%]: "
+if "%PORT%"=="" set "PORT=%DEFAULT_PORT%"
 goto RUN_REMOTE
 
-:DEFAULT_REMOTE
-set "PLAYER_ID=2779"
-set "HOST=7.225.86.238"
-set "PORT=6001"
+:DEFAULT_LOCAL
+set "PLAYER_ID=%DEFAULT_PLAYER_ID%"
+set "HOST=%DEFAULT_HOST%"
+set "PORT=%DEFAULT_PORT%"
 goto RUN_REMOTE
 
 :RUN_WITH_ARGS
@@ -109,7 +114,7 @@ if not exist fixtures\minimal_start_inquire.jsonl (
   pause
   exit /b 1
 )
-%PYTHON_CMD% main.py 2779 < fixtures\minimal_start_inquire.jsonl
+%PYTHON_CMD% main.py %DEFAULT_PLAYER_ID% < fixtures\minimal_start_inquire.jsonl
 set "EXIT_CODE=%ERRORLEVEL%"
 echo ------------------------------------------------------------
 echo [INFO] Local fixture exited with code %EXIT_CODE%.
