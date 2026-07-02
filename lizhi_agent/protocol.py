@@ -291,7 +291,7 @@ class CompetitionClient:
             "msg_data": {
                 "playerId": _player_id_value(self.context.player_id),
                 "playerName": os.environ.get("LIZHI_PLAYER_NAME", "lizhi-python-baseline"),
-                "version": os.environ.get("LIZHI_VERSION", "1.0.0"),
+                "version": os.environ.get("LIZHI_VERSION", "1.0"),
             },
         }
 
