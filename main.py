@@ -4,9 +4,11 @@
 Usage:
     python3 main.py <playerId> [host] [port]
 
-The exact protocol should be aligned with the official communication document.
-This baseline supports JSON-lines over TCP when host/port are provided and
-JSON-lines over stdin/stdout for local debugging.
+Socket mode implements the official protocol:
+    5-digit length prefix + UTF-8 JSON body
+    registration -> start -> ready -> inquire/action -> over
+
+Stdio mode keeps JSON-lines for local debugging only.
 """
 
 from __future__ import annotations
