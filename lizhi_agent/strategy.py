@@ -30,6 +30,8 @@ BUSY_STATES = {
 MOVING_STATES = {ConvoyStatus.MOVING, ConvoyStatus.WAITING}
 RUSH_PHASES = {"RUSH", "BANQUET", "ENDGAME", "FINAL", "宫宴冲刺"}
 PLANNING_STATES = {ConvoyStatus.IDLE, ConvoyStatus.UNKNOWN, ConvoyStatus.COST_BANKRUPT}
+PROCESS_RETRY_CODES = {"PROCESS_REQUIRED", "PROCESS_INTERRUPTED", "INTERRUPTED"}
+PROCESS_HARD_REJECT_CODES = {"PROCESS_NOT_AVAILABLE", "NOT_AT_TARGET_NODE", "INVALID_TARGET"}
 
 
 @dataclass(frozen=True)
@@ -118,7 +120,7 @@ class WindowStrategy:
 
 
 class BaselineStrategy:
-    """Conservative baseline: first be legal, then move, then optimize."""
+    """Conservative baseline: legal first, delivery second, greed last."""
 
     def __init__(self, player_id: str, config: StrategyConfig, logger: DecisionLogger) -> None:
         self.player_id = player_id
@@ -136,6 +138,8 @@ class BaselineStrategy:
         self._completed_fixed_process_nodes: set[str] = set()
         self._rejected_fixed_process_nodes: set[str] = set()
         self._forced_process_nodes: set[str] = set()
+        self._pending_process_until: dict[str, int] = {}
+        self._pending_process_started_at: dict[str, int] = {}
         self._rejected_task_ids: set[str] = set()
         self._rejected_resource_keys: set[tuple[str, str]] = set()
 
@@ -148,9 +152,12 @@ class BaselineStrategy:
         self._update_station_tracking(state)
         if state.me.station != self._last_station and state.me.station is not None:
             self._completed_fixed_process_nodes.discard(state.me.station)
+            self._pending_process_until.pop(state.me.station, None)
+            self._pending_process_started_at.pop(state.me.station, None)
         self._last_station = state.me.station
         self._log_state_snapshot(state)
         decision = self._decide(state)
+        self._remember_outbound_process(state, decision.bundle)
         if decision.bundle.squad is not None and decision.bundle.squad.action == SquadActionType.SQUAD_SCOUT:
             self._scout_dispatched.add(decision.bundle.squad.target)
         self.logger.info(
@@ -181,30 +188,10 @@ class BaselineStrategy:
         )
         if should_abstain:
             self._cooldown_object(state, object_key or f"WINDOW:{window.id}", "window_stall")
-            self.logger.info(
-                "stall_breaker",
-                kind="window",
-                station=window.target or state.me.station,
-                objectKey=object_key,
-                action="ABSTAIN",
-                reason="窗口重复出现：只对窗口弃争，不阻塞主车队动作",
-            )
+            self.logger.info("stall_breaker", kind="window", station=window.target or state.me.station, objectKey=object_key, action="ABSTAIN", reason="窗口重复出现：只对窗口弃争，不阻塞主车队动作")
             return WindowAction(window.id, WindowCard.ABSTAIN), f"window_stall:{object_key}"
         choice = self.window_strategy.choose(state, window, self.config)
-        self.logger.info(
-            "strategy_step",
-            step="window_card",
-            contestId=window.id,
-            contestType=window.window_type,
-            target=window.target,
-            resourceType=window.resource_type,
-            taskId=window.task_id,
-            roundIndex=window.round_index,
-            chosenCard=choice.card.value,
-            windowStyle=choice.style,
-            choiceReason=choice.reason,
-            roll=choice.roll,
-        )
+        self.logger.info("strategy_step", step="window_card", contestId=window.id, contestType=window.window_type, target=window.target, resourceType=window.resource_type, taskId=window.task_id, roundIndex=window.round_index, chosenCard=choice.card.value, windowStyle=choice.style, choiceReason=choice.reason, roll=choice.roll)
         return WindowAction(window.id, choice.card), f"window:{window.window_type}:{choice.card.value}"
 
     def _attach_window(self, bundle: ActionBundle, window: WindowAction | None) -> ActionBundle:
@@ -229,8 +216,12 @@ class BaselineStrategy:
             if horse is not None:
                 return done(horse, "use_horse_while_moving")
             return done(wait(f"moving:{me.status.value}", active=False), f"moving:{me.status.value}")
-        if me.status in BUSY_STATES:
+        if me.status in BUSY_STATES or me.current_process is not None:
             return done(wait(f"busy:{me.status.value}", active=False), f"busy:{me.status.value}")
+
+        pending = self._pending_process_wait_action(state)
+        if pending is not None:
+            return done(pending, "wait_pending_process")
 
         fresh_action = self._freshness_action(state)
         if fresh_action is not None:
@@ -252,8 +243,10 @@ class BaselineStrategy:
         if fixed_process is not None:
             return done(fixed_process, "fixed_process")
 
-        if self._need_endgame(state) or self._opponent_pressure(state):
-            self.logger.info("strategy_step", step="delivery_guard", reason="rush_deadline_or_opponent_pressure")
+        # Delivery-first safety net. If we already have a score floor, or the
+        # clock says the gate trip is tight, stop taking optional detours.
+        if self._need_endgame(state) or self._opponent_pressure(state) or me.task_score_base >= self.config.target_task_score:
+            self.logger.info("strategy_step", step="delivery_guard", reason="score_or_deadline_delivery_first")
             return done(self._move_towards_delivery(state), "delivery_guard")
 
         if self._is_station_escape_active(state):
@@ -286,18 +279,16 @@ class BaselineStrategy:
             if not self._record_belongs_to_me(state, event):
                 self.logger.info("feedback_ignore", reason="opponent_event", eventPreview=str(event)[:300])
                 continue
-            event_type = str(event.get("event") or event.get("eventType") or event.get("type") or "").upper()
+            event_type = str(event.get("event") or event.get("eventType") or event.get("type") or event.get("effectType") or "").upper()
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-            node_id = event.get("targetNodeId") or event.get("nodeId") or payload.get("targetNodeId") or payload.get("nodeId")
+            node_id = event.get("targetNodeId") or event.get("nodeId") or payload.get("targetNodeId") or payload.get("nodeId") or state.me.station
             task_id = event.get("taskId") or payload.get("taskId")
+            resource_type = event.get("resourceType") or payload.get("resourceType")
             error_code = str(event.get("errorCode") or payload.get("errorCode") or event.get("code") or "").upper()
-            self._learn_error_code(state, str(event.get("action") or payload.get("action") or "").upper(), error_code, node_id, task_id, event.get("resourceType") or payload.get("resourceType"), event)
-            if event_type in {"PROCESS_COMPLETE", "FIXED_PROCESS_COMPLETE"} and node_id:
-                node = str(node_id)
-                self._completed_fixed_process_nodes.add(node)
-                self._forced_process_nodes.discard(node)
-                self._rejected_fixed_process_nodes.discard(node)
-                self.logger.info("feedback_learn", learned="fixed_process_completed", nodeId=node_id, event=event)
+            action = str(event.get("action") or payload.get("action") or event.get("actionType") or "").upper()
+            self._learn_error_code(state, action, error_code, node_id, task_id, resource_type, event)
+            if event_type in {"PROCESS_COMPLETE", "FIXED_PROCESS_COMPLETE", "PROCESS_COMPLETED"} and node_id:
+                self._mark_process_completed(str(node_id), state, event)
             if event_type in {"TASK_COMPLETE", "CLAIM_TASK_COMPLETE"} and task_id:
                 self._rejected_task_ids.discard(str(task_id))
             if event_type in {"WINDOW_CONTEST_DRAW", "WINDOW_CONTEST_REPEAT_SUPPRESSED", "CONTEST_DRAW"}:
@@ -314,13 +305,17 @@ class BaselineStrategy:
             action = str(result.get("action") or result.get("actionType") or result.get("type") or "").upper()
             accepted = result.get("accepted")
             success = result.get("success")
+            effective = result.get("effective")
             code = str(result.get("code") or result.get("errorCode") or result.get("reason") or result.get("message") or "").upper()
-            node_id = result.get("targetNodeId") or result.get("nodeId")
+            node_id = result.get("targetNodeId") or result.get("nodeId") or state.me.station
             task_id = result.get("taskId")
             resource_type = result.get("resourceType")
             self.logger.info("action_result", action=action, accepted=accepted, success=success, code=code, nodeId=node_id, taskId=task_id, resourceType=resource_type, raw=result)
-            if accepted is False or success is False or bool(code):
+            failed = accepted is False or success is False or effective is False or bool(code)
+            if failed:
                 self._learn_error_code(state, action, code, node_id, task_id, resource_type, result)
+            elif action == "PROCESS" and node_id:
+                self._mark_process_pending(str(node_id), state, "accepted")
 
     def _record_belongs_to_me(self, state: GameState, record: dict[str, Any]) -> bool:
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
@@ -339,25 +334,26 @@ class BaselineStrategy:
     def _learn_error_code(self, state: GameState, action: str, code: str, node_id: Any, task_id: Any, resource_type: Any, raw: dict[str, Any]) -> None:
         if not code:
             return
-        if code == "PROCESS_REQUIRED":
-            node = str(node_id or state.me.station or "")
+        node = str(node_id or state.me.station or "")
+        if code in PROCESS_RETRY_CODES:
             if node:
                 self._forced_process_nodes.add(node)
                 self._rejected_fixed_process_nodes.discard(node)
                 self._completed_fixed_process_nodes.discard(node)
+                self._pending_process_until.pop(node, None)
+                self._pending_process_started_at.pop(node, None)
                 self._station_escape_until.pop(node, None)
                 self.logger.info("feedback_learn", learned="process_required", nodeId=node, code=code, result=raw)
             return
-        if code == "PROCESS_NOT_AVAILABLE":
-            node = str(node_id or state.me.station or "")
+        if code in PROCESS_HARD_REJECT_CODES or (action in {"PROCESS", "DOCK"} and code):
             if node:
                 self._forced_process_nodes.discard(node)
-                self._rejected_fixed_process_nodes.add(node)
+                self._pending_process_until.pop(node, None)
+                self._pending_process_started_at.pop(node, None)
+                if code != "OBJECT_BUSY":
+                    self._rejected_fixed_process_nodes.add(node)
                 self.logger.info("feedback_learn", learned="fixed_process_rejected", nodeId=node, code=code, result=raw)
             return
-        if action in {"PROCESS", "DOCK"} and node_id:
-            self._rejected_fixed_process_nodes.add(str(node_id))
-            self.logger.info("feedback_learn", learned="fixed_process_rejected", nodeId=node_id, code=code, result=raw)
         if action == "CLAIM_TASK" and task_id:
             self._rejected_task_ids.add(str(task_id))
             self._cooldown_object(state, self._task_object_key(str(task_id)), f"reject:{code}")
@@ -366,6 +362,47 @@ class BaselineStrategy:
             self._rejected_resource_keys.add((str(node_id), str(resource_type)))
             self._cooldown_object(state, self._resource_object_key(str(node_id), str(resource_type)), f"reject:{code}")
             self.logger.info("feedback_learn", learned="resource_rejected", nodeId=node_id, resourceType=resource_type, code=code, result=raw)
+
+    def _mark_process_pending(self, node: str, state: GameState, reason: str) -> None:
+        station = state.station(node)
+        process_round = station.process_round if station is not None and station.process_round > 0 else 4
+        until = state.frame + process_round + 3
+        self._pending_process_until[node] = max(self._pending_process_until.get(node, 0), until)
+        self._pending_process_started_at.setdefault(node, state.frame)
+        self._completed_fixed_process_nodes.discard(node)
+        self.logger.info("process_pending", station=node, until=until, processRound=process_round, reason=reason)
+
+    def _mark_process_completed(self, node: str, state: GameState, raw: dict[str, Any]) -> None:
+        self._completed_fixed_process_nodes.add(node)
+        self._forced_process_nodes.discard(node)
+        self._rejected_fixed_process_nodes.discard(node)
+        self._pending_process_until.pop(node, None)
+        self._pending_process_started_at.pop(node, None)
+        self.logger.info("feedback_learn", learned="fixed_process_completed", nodeId=node, event=raw)
+
+    def _remember_outbound_process(self, state: GameState, bundle: ActionBundle) -> None:
+        if bundle.main is None or bundle.main.action != MainActionType.PROCESS:
+            return
+        target = bundle.main.target or state.me.station
+        if target:
+            self._mark_process_pending(str(target), state, "outbound")
+
+    def _pending_process_wait_action(self, state: GameState) -> ActionBundle | None:
+        station = state.me.station
+        if station is None or station not in self._pending_process_until:
+            return None
+        if station in self._completed_fixed_process_nodes:
+            self._pending_process_until.pop(station, None)
+            self._pending_process_started_at.pop(station, None)
+            return None
+        until = self._pending_process_until[station]
+        if state.frame <= until:
+            self.logger.info("process_pending_wait", station=station, startedAt=self._pending_process_started_at.get(station), until=until, reason="PROCESS 已提交，等待 PROCESS_COMPLETE，不重复提交，不移动离站")
+            return wait("pending_process", active=False)
+        self.logger.info("process_pending_timeout", station=station, startedAt=self._pending_process_started_at.get(station), until=until, reason="等待超时，允许重新提交 PROCESS")
+        self._pending_process_until.pop(station, None)
+        self._pending_process_started_at.pop(station, None)
+        return None
 
     def _log_state_snapshot(self, state: GameState) -> None:
         me = state.me
@@ -406,6 +443,7 @@ class BaselineStrategy:
             rejectedProcessNodes=list(sorted(self._rejected_fixed_process_nodes))[:5],
             forcedProcessNodes=list(sorted(self._forced_process_nodes))[:5],
             completedProcessNodes=list(sorted(self._completed_fixed_process_nodes))[:5],
+            pendingProcessNodes=dict(sorted(self._pending_process_until.items())),
             stationStay=self._station_stay_frames(state),
             stationEscapeUntil=self._station_escape_until.get(me.station or ""),
         )
@@ -621,7 +659,7 @@ class BaselineStrategy:
             return
         if state.me.status not in PLANNING_STATES:
             return
-        if self._is_mainline_station(state, station) or station in self._forced_process_nodes:
+        if self._is_mainline_station(state, station) or station in self._forced_process_nodes or station in self._pending_process_until:
             return
         stay_frames = self._station_stay_frames(state)
         if stay_frames < self.config.station_stall_frames or self._is_station_escape_active(state, station):
