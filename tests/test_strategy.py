@@ -76,12 +76,12 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.CLAIM_TASK)
         self.assertEqual(action.main.to_action()["taskId"], "task-1")
 
-    def test_claim_priority_resource(self) -> None:
+    def test_claim_priority_resource_before_score_floor(self) -> None:
         state = GameState(
             frame=100,
             phase="NORMAL",
             player_id="1001",
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=90),
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=30),
             resources=[
                 ResourceStock(station="S03", resource_type="BOAT_RIGHT", amount=1),
                 ResourceStock(station="S03", resource_type="ICE_BOX", amount=1),
@@ -91,7 +91,7 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.CLAIM_RESOURCE)
         self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
 
-    def test_move_towards_gate(self) -> None:
+    def test_move_towards_gate_after_score_floor(self) -> None:
         state = GameState(
             frame=100,
             phase="NORMAL",
@@ -120,6 +120,55 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.PROCESS)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
         self.assertIsNotNone(action.window)
+
+    def test_pending_process_waits_instead_of_repeating_process_or_moving(self) -> None:
+        first = GameState(
+            frame=57,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=4),
+            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
+            windows=[WindowState(id="contest-process", window_type="TASK", target="S02", active=True, my_turn=True, round_index=1)],
+        )
+        self.assertEqual(self.strategy.decide(first).main.action, MainActionType.PROCESS)
+
+        second = GameState(
+            frame=58,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=4),
+            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
+            windows=[WindowState(id="contest-process", window_type="TASK", target="S02", active=True, my_turn=True, round_index=2)],
+        )
+        action = self.strategy.decide(second)
+        self.assertIsNone(action.main)
+        self.assertIsNotNone(action.window)
+
+    def test_process_complete_allows_leaving_fixed_node(self) -> None:
+        first = GameState(
+            frame=57,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02"),
+            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
+            edges=[RouteEdge(id="E1", start="S02", end="S14", distance=1)],
+        )
+        self.assertEqual(self.strategy.decide(first).main.action, MainActionType.PROCESS)
+
+        completed = GameState(
+            frame=62,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", task_score_base=90),
+            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
+            edges=[RouteEdge(id="E1", start="S02", end="S14", distance=1)],
+            events=[{"eventType": "PROCESS_COMPLETE", "playerId": "1001", "nodeId": "S02"}],
+        )
+        action = self.strategy.decide(completed)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
 
     def test_window_card_does_not_block_move(self) -> None:
         state = GameState(
@@ -205,25 +254,8 @@ class BaselineStrategyTest(unittest.TestCase):
                 frame=30,
                 phase="NORMAL",
                 player_id="1001",
-                me=PlayerState(
-                    player_id="1001",
-                    status=ConvoyStatus.IDLE,
-                    station="S02",
-                    guard_points=4,
-                    good_fruit=100,
-                    freshness=100,
-                ),
-                windows=[
-                    WindowState(
-                        id=f"contest-{index}",
-                        window_type="TASK",
-                        target="S02",
-                        task_id="task-open",
-                        active=True,
-                        my_turn=True,
-                        round_index=1,
-                    )
-                ],
+                me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=4, good_fruit=100, freshness=100),
+                windows=[WindowState(id=f"contest-{index}", window_type="TASK", target="S02", task_id="task-open", active=True, my_turn=True, round_index=1)],
             )
             cards.add(strategy.decide(state).window.card)
         self.assertIn(WindowCard.BING_ZHENG, cards)
@@ -235,17 +267,7 @@ class BaselineStrategyTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=4),
-            windows=[
-                WindowState(
-                    id="contest-late",
-                    window_type="TASK",
-                    target="S02",
-                    task_id="task-late",
-                    active=True,
-                    my_turn=True,
-                    round_index=1,
-                )
-            ],
+            windows=[WindowState(id="contest-late", window_type="TASK", target="S02", task_id="task-late", active=True, my_turn=True, round_index=1)],
         )
         self.assertEqual(self.strategy.decide(state).window.card, WindowCard.BING_ZHENG)
 
