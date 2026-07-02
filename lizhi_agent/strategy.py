@@ -1015,23 +1015,41 @@ class BaselineStrategy:
             if support is not None and support is not squad:
                 self.logger.info("blocker_decision", target=target, blocker="obstacle", action="SQUAD_CLEAR", reason="save_good_fruit")
                 return ActionBundle(squad=support)
-            if state.me.good_fruit > 5:
-                self.logger.info("blocker_decision", target=target, blocker="obstacle", action="CLEAR")
+            if self._should_spend_good_fruit_to_clear(state):
+                self.logger.info("blocker_decision", target=target, blocker="obstacle", action="CLEAR", reason="deadline_over_good_fruit")
                 return ActionBundle(main=MainAction(MainActionType.CLEAR, target=target), squad=support)
-            self.logger.info("blocker_decision", target=target, blocker="obstacle", action="FORCED_PASS")
+            self.logger.info("blocker_decision", target=target, blocker="obstacle", action="FORCED_PASS", reason="save_good_fruit")
             return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=target), squad=support)
         if station is not None and station.has_enemy_guard(state.me.team_id):
-            if state.me.bad_fruit >= 2 or state.me.good_fruit >= 95:
-                self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="BREAK_GUARD")
-                return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=target, good_fruit=0 if state.me.bad_fruit >= 2 else 1, bad_fruit=min(2, state.me.bad_fruit)), squad=squad)
+            bad_to_spend = self._bad_fruit_to_break_guard(state, station)
+            if bad_to_spend > 0:
+                self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="BREAK_GUARD", reason="spend_bad_fruit_first", badFruit=bad_to_spend)
+                return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=target, good_fruit=0, bad_fruit=bad_to_spend), squad=squad)
             support = self._squad_blocker_action(state, target, "enemy_guard") or squad
             if support is not None and support is not squad:
                 self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="SQUAD_WEAKEN", reason="save_good_fruit")
                 return ActionBundle(squad=support)
-            self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="FORCED_PASS")
+            if self._should_spend_good_fruit_to_break_guard(state, station):
+                self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="BREAK_GUARD", reason="deadline_over_good_fruit")
+                return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=target, good_fruit=1, bad_fruit=0), squad=squad)
+            self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="FORCED_PASS", reason="save_good_fruit")
             return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=target), squad=support)
         self.logger.info("move_decision", target=target, action="MOVE")
         return ActionBundle(main=MainAction(MainActionType.MOVE, target=target), squad=squad)
+
+    def _should_spend_good_fruit_to_clear(self, state: GameState) -> bool:
+        return self._need_endgame(state) and state.me.good_fruit >= 95
+
+    def _bad_fruit_to_break_guard(self, state: GameState, station: Station) -> int:
+        if state.me.bad_fruit <= 0:
+            return 0
+        needed = max(1, (station.guard_defense + 2) // 3)
+        if needed <= min(2, state.me.bad_fruit):
+            return needed
+        return 0
+
+    def _should_spend_good_fruit_to_break_guard(self, state: GameState, station: Station) -> bool:
+        return self._need_endgame(state) and state.me.good_fruit >= 98 and station.guard_defense <= 2
 
     def _squad_blocker_action(self, state: GameState, target: str, blocker: str) -> SquadAction | None:
         if state.phase in RUSH_PHASES or state.me.squad_available <= 0:
