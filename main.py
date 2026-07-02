@@ -2,13 +2,11 @@
 """Competition client entrypoint.
 
 Usage:
-    python3 main.py <playerId> [host] [port]
+    python3 main.py <playerId> <host> <port>
 
-Socket mode implements the official protocol:
-    5-digit length prefix + UTF-8 JSON body
-    registration -> start -> ready -> inquire/action -> over
-
-Stdio mode keeps JSON-lines for local debugging only.
+When host/port are present the client uses the official TCP protocol:
+5 decimal length bytes plus a UTF-8 JSON body.  Without host/port it falls back
+to JSON-lines on stdin/stdout for local strategy fixtures.
 """
 
 from __future__ import annotations
@@ -17,7 +15,7 @@ import sys
 
 from lizhi_agent.config import StrategyConfig
 from lizhi_agent.logger import DecisionLogger
-from lizhi_agent.protocol import JsonLineClient
+from lizhi_agent.protocol import CompetitionClient
 from lizhi_agent.strategy import BaselineStrategy
 
 
@@ -29,7 +27,7 @@ def main(argv: list[str]) -> int:
     logger = DecisionLogger(player_id=player_id)
     config = StrategyConfig.default()
     strategy = BaselineStrategy(player_id=player_id, config=config, logger=logger)
-    client = JsonLineClient(player_id=player_id, strategy=strategy, logger=logger)
+    client = CompetitionClient(player_id=player_id, strategy=strategy, logger=logger)
 
     if host and port:
         return client.run_socket(host, port)

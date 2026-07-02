@@ -1,41 +1,12 @@
-# 一骑红尘：荔枝争运战 Baseline
+# 一骑红尘：荔枝争运战 Python Baseline
 
-这是一个面向《一骑红尘：荔枝争运战》的 Python 标准库 baseline。目标不是一次写满所有策略，而是先提供一个稳定、可扩展、可调试的比赛客户端骨架。
+这是一个面向《一骑红尘：荔枝争运战》的基础参赛客户端。目标不是一次写满所有博弈策略，而是先提供一个稳定、可解释、可继续迭代的框架：
 
-## 设计目标
-
-1. 先保证客户端能启动、连接、读状态、输出动作。
-2. 主策略优先做到：不退赛、少非法、能走主线、能验核、能交付。
-3. 代码保持模块化，后续方便让 Codex 分模块增强。
-4. 不依赖第三方库，避免比赛环境现场安装依赖。
-
-## 通信协议状态
-
-当前已按官方通信协议接入：
-
-```text
-TCP Socket
-5 位十进制长度前缀 + UTF-8 JSON body
-registration -> start -> ready -> inquire/action -> over
-```
-
-客户端连接后会自动发送 `registration`，收到 `start` 后缓存 `matchId / nodes / edges / resources / taskTemplates`，随后发送 `ready`。每次收到 `inquire.round=N` 后，会发送 `action.round=N`。
-
-动作输出为官方平铺格式：
-
-```json
-{
-  "msg_name": "action",
-  "msg_data": {
-    "matchId": "match_001",
-    "round": 12,
-    "playerId": 1001,
-    "actions": [
-      {"action": "MOVE", "targetNodeId": "S03"}
-    ]
-  }
-}
-```
+- 按官方 TCP 协议接入比赛服务端。
+- 每帧可靠回包，避免失联退赛。
+- 本地解析地图、状态、任务、资源、窗口和事件。
+- 使用动态路线规划和保守策略完成验核、交付、顺路任务与资源获取。
+- 代码按层拆分，方便后续增强抢资源、设卡、窗口博弈和小分队策略。
 
 ## 文件结构
 
@@ -44,60 +15,74 @@ registration -> start -> ready -> inquire/action -> over
 ├── start.sh
 ├── main.py
 ├── lizhi_agent/
-│   ├── __init__.py
-│   ├── actions.py
-│   ├── config.py
-│   ├── logger.py
-│   ├── models.py
-│   ├── protocol.py
-│   ├── route_planner.py
-│   ├── strategy.py
+│   ├── actions.py        # 官方 actions[] 动作结构
+│   ├── config.py         # 策略阈值和资源优先级
+│   ├── logger.py         # 安全日志，不影响比赛主循环
+│   ├── models.py         # start/inquire 状态模型与解析
+│   ├── protocol.py       # 5 位长度前缀 TCP 协议
+│   ├── route_planner.py  # 加权图搜索与路线耗时估算
+│   ├── strategy.py       # 分层基础策略
 │   └── utils.py
 └── tests/
     └── test_strategy.py
 ```
 
-## 启动方式
+## 启动
 
-平台通常会传入：
+平台会按以下格式启动：
 
 ```bash
 ./start.sh <playerId> <host> <port>
 ```
 
-本地也可以用标准输入 JSON Lines 调试：
+本地可以运行单元测试：
 
 ```bash
-python3 main.py 1001
+python -m unittest
 ```
 
-本地跑测试：
+也可以用 JSON Lines 走本地调试入口：
 
 ```bash
-python3 -m unittest
+python main.py 1001
 ```
 
-## 当前 baseline 策略
+正式比赛时必须传入 `host` 和 `port`，客户端会使用官方格式：
 
-每帧按顺序判断：
+```text
+5 位十进制长度前缀 + UTF-8 JSON body
+```
 
-1. 若有窗口，提交 `WINDOW_CARD`。
-2. 若已交付，发送空动作心跳。
-3. 若在 S15 且满足交付条件，提交 `DELIVER`。
-4. 若在 S14 且可验核，提交 `VERIFY_GATE`。
-5. 若当前位置需要固定处理，提交 `PROCESS`。
-6. 若当前位置有高价值任务，且任务分未到 90，提交 `CLAIM_TASK`。
-7. 若当前位置有优先资源，提交 `CLAIM_RESOURCE`。
-8. 否则按路线向 S14 / S15 移动。
-9. 无法判断时提交 `WAIT` 或空动作心跳。
+## 当前基础策略
+
+每帧按以下优先级决策：
+
+1. 如果有本方参与的窗口争夺，提交一张窗口牌。
+2. 如果已交付、退赛、移动中或读条中，发送安全心跳，不打断当前过程。
+3. 鲜度过低且有冰鉴时，优先使用 `ICE_BOX`。
+4. 在 S15 且已验核时提交 `DELIVER`。
+5. 在 S14 且进入 `RUSH` 阶段时提交 `VERIFY_GATE`，可绑定 `BREAK_ORDER`。
+6. 当前站点有固定处理流程时，提交 `PROCESS` 或 `DOCK`。
+7. 当前站点有高价值任务时，提交 `CLAIM_TASK`，优先拿到 90 分普通任务门槛。
+8. 当前站点有高价值资源时，提交 `CLAIM_RESOURCE`。
+9. 在不危及交付的前提下，轻微绕路拿 30 分任务或关键资源。
+10. 否则按加权最短路前往 S14/S15 完成交付。
+
+## 设计参考
+
+框架参考了 RTS bot 的常见分层：
+
+- 类似 `WorkerData`：`models.py` 只做状态记账和安全读取。
+- 类似 `WorkerManager`：`strategy.py` 每帧调度一个合法动作。
+- 类似资源点/扩张点管理器：`route_planner.py` 维护地图图和路线成本。
+
+这种拆分能让后续策略增强集中在策略层，而不反复改协议和解析代码。
 
 ## 后续增强方向
 
-- 用真实地图/样例消息做端到端联调。
-- 增强任务收益评估，优先凑够 90 分任务。
-- 增强固定处理是否已完成的判断，避免重复 `PROCESS`。
-- 增强资源使用策略：冰鉴、马、情报。
-- 增强窗口出牌策略。
-- 增强小分队探路、清障策略。
-- 增强终局急策：疾行令、护果令、破关令。
-- 添加 replay 记录和离线复盘。
+- 更精确的天气预测与路线耗时模拟。
+- 对任务做滚动收益评估，动态选择 60/90/110 分节点。
+- 为资源窗口、任务窗口、宫门窗口分别训练或配置出牌策略。
+- 引入对手路线预测，在 S10/S11/S14 等关键节点做设卡/削弱。
+- 用小分队提前探路关键处理点，或清除必经障碍。
+- 增加 replay 日志，离线复盘每帧决策原因。
