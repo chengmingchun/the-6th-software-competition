@@ -97,15 +97,33 @@ python main.py 1001
 LIZHI_DEBUG=1       # 默认开启 stderr 日志
 LIZHI_DEBUG=0       # 关闭策略日志
 LIZHI_FILE_LOG=1    # 同时写入 logs/<playerId>.jsonl
+LIZHI_RAW_LOG=1     # 默认开启，记录 start/inquire/ready/action 的截断预览
+LIZHI_RAW_LOG=0     # 只记录摘要，不打印原始 payload 预览
+LIZHI_PLAYER_NAME=你的队伍名  # 覆盖 registration.playerName
+LIZHI_VERSION=1.0   # 覆盖 registration.version
 ```
+
+推荐排障启动方式：
+
+```bash
+LIZHI_DEBUG=1 LIZHI_RAW_LOG=1 LIZHI_FILE_LOG=1 ./start.sh 2779 7.225.86.238 6001
+```
+
+如果看到 `start` 后立刻 `server_closed`，重点检查 `send_message` 里 `msgName=ready` 的 `msgData`、`bodyBytes`、`payloadPreview`，以及 `server_closed` 里的 `sentReady/startReceived/lastRound`。
 
 关键日志事件：
 
 | event | 含义 |
 |---|---|
-| `recv_message` | 收到服务端消息，记录 round、phase、任务数、窗口数、事件数 |
-| `send_message` | 发给服务端的消息，记录本帧 actions |
+| `connect` | Socket 连接目标、玩家 ID 和连接模式 |
+| `send_message` | 发给服务端的完整消息摘要，包含 `msgData`、`bodyBytes`、`frameBytes`、`payloadPreview` |
+| `recv_message` | 收到服务端消息，记录 keys、round、phase、任务数、窗口数、事件数、payload 预览 |
+| `start_detail` | start 包里的 matchId、duration、players、nodes、edges、roles、gameplay keys |
+| `inquire_detail` | 每轮我方 player 状态、tasks、contests、events、actionResults |
+| `handle_message` | 当前消息进入哪个协议分支处理 |
+| `server_closed` | 服务端断开连接时的上下文，判断是否死在 ready/action 后 |
 | `state_snapshot` | 每帧状态机快照，包含位置、状态类、分数、资源、鲜度、任务数、窗口数和到门/终点估计成本 |
+| `strategy_step` | 策略命中的关键分支，例如窗口出牌或终局保护 |
 | `task_eval_station` | 当前站点可处理任务候选及排序 |
 | `resource_eval_station` | 当前站点可领取资源候选及优先级 |
 | `task_eval_reachable` | 可绕路任务候选、估值和最终选择 |
