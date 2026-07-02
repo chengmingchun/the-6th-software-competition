@@ -20,11 +20,12 @@ set "DEFAULT_RED_PLAYER_ID=2765"
 set "DEFAULT_BLUE_PLAYER_ID=2779"
 set "DEFAULT_HOST=127.0.0.1"
 set "DEFAULT_PORT=30000"
+set "DEFAULT_PLAYER_NAME=嘉然在送荔枝"
 
 set "LIZHI_DEBUG=1"
 set "LIZHI_RAW_LOG=1"
 set "LIZHI_FILE_LOG=1"
-if not defined LIZHI_PLAYER_NAME set "LIZHI_PLAYER_NAME=lizhi-python-baseline"
+if not defined LIZHI_PLAYER_NAME set "LIZHI_PLAYER_NAME=%DEFAULT_PLAYER_NAME%"
 if not defined LIZHI_VERSION set "LIZHI_VERSION=1.0"
 
 where python >nul 2>nul
@@ -50,6 +51,7 @@ echo 一骑红尘：荔枝争运战 - Windows 本地调试启动器
 echo ============================================================
 echo 当前目录: %CD%
 echo Python: %PYTHON_CMD%
+echo 默认队名: %LIZHI_PLAYER_NAME%
 echo 默认本地服务端: %DEFAULT_HOST%:%DEFAULT_PORT%
 echo 日志: stderr + logs\^<playerId^>.jsonl
 echo.
