@@ -45,6 +45,7 @@ WINDOW_REJECT_CODES = {
 }
 WINDOW_TERMINAL_STATUSES = {"SUPPRESSED", "RESOLVED", "FINISHED", "FINISH", "ENDED", "END", "CLOSED", "COMPLETED", "COMPLETE", "SETTLED"}
 WINDOW_HARD_MAX_SENDS = 3
+SCOUT_PATH_LOOKAHEAD = 3
 
 
 @dataclass(frozen=True)
@@ -528,7 +529,14 @@ class BaselineStrategy:
         return ActionBundle(main=MainAction(MainActionType.VERIFY_GATE, target=state.gate_node, rush_tactic=rush))
 
     def _freshness_action(self, state: GameState) -> ActionBundle | None:
-        if state.me.freshness <= self.config.critical_freshness_threshold and state.me.has_resource("ICE_BOX"):
+        me = state.me
+        if not me.has_resource("ICE_BOX"):
+            return None
+        if me.freshness <= self.config.critical_freshness_threshold:
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="critical_freshness", freshness=me.freshness)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        if me.freshness <= self.config.low_freshness_threshold and (me.task_score_base >= self.config.target_task_score // 2 or self._need_endgame(state)):
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_scoring_run", freshness=me.freshness, taskScore=me.task_score_base)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         return None
 
@@ -537,9 +545,14 @@ class BaselineStrategy:
         if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED"):
             return None
         if me.has_resource("FAST_HORSE"):
+            self.logger.info("resource_use", resourceType="FAST_HORSE", reason="moving_speedup")
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="FAST_HORSE"))
-        if me.has_resource("SHORT_HORSE") and state.turns_left < 160:
-            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="SHORT_HORSE"))
+        if me.has_resource("SHORT_HORSE"):
+            delivery_target = state.terminal_node if me.verified else state.gate_node
+            remaining_cost = self.route_planner.estimate_frames(state, me.station, delivery_target) if me.station else 10**9
+            if state.turns_left < 360 or remaining_cost >= 4 or me.task_score_base >= self.config.target_task_score:
+                self.logger.info("resource_use", resourceType="SHORT_HORSE", reason="moving_speedup", turnsLeft=state.turns_left, remainingCost=remaining_cost)
+                return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="SHORT_HORSE"))
         return None
 
     def _fixed_process_action(self, state: GameState) -> ActionBundle | None:
@@ -657,7 +670,14 @@ class BaselineStrategy:
     def _squad_scout_action(self, state: GameState) -> SquadAction | None:
         if state.phase in RUSH_PHASES or state.me.squad_available <= 0 or state.me.station is None:
             return None
-        forbidden = {state.me.station, state.start_node, state.gate_node, state.terminal_node, *map(str, state.roles.get("safeZoneNodeIds", []) or [])}
+        forbidden = self._scout_forbidden(state)
+        objective = self._scout_objective(state)
+        path_candidates = self._scout_path_candidates(state, objective, forbidden)
+        for target in path_candidates:
+            self.logger.info("squad_eval", action="SQUAD_SCOUT", target=target, reason="route_path_scout", objective=objective, candidates=path_candidates)
+            return SquadAction(SquadActionType.SQUAD_SCOUT, target)
+
+        fallback_candidates: list[str] = []
         for target in self.config.scout_targets:
             if target in forbidden:
                 self.logger.info("squad_eval_skip", target=target, reason="forbidden_scout_target")
@@ -665,10 +685,41 @@ class BaselineStrategy:
             if target in self._scout_dispatched or self._has_own_scout_marker(state, target):
                 continue
             if self.route_planner.estimate_frames(state, state.me.station, target) < 10**8:
-                self.logger.info("squad_eval", action="SQUAD_SCOUT", target=target, reason="preferred_scout_target")
-                return SquadAction(SquadActionType.SQUAD_SCOUT, target)
-        self.logger.info("squad_eval", action=None, reason="no_available_scout_target")
+                fallback_candidates.append(target)
+        if fallback_candidates:
+            target = min(fallback_candidates, key=lambda node: self.route_planner.estimate_frames(state, state.me.station, node))
+            self.logger.info("squad_eval", action="SQUAD_SCOUT", target=target, reason="fallback_nearest_config_target", objective=objective, candidates=fallback_candidates)
+            return SquadAction(SquadActionType.SQUAD_SCOUT, target)
+        self.logger.info("squad_eval", action=None, reason="no_available_scout_target", objective=objective)
         return None
+
+    def _scout_forbidden(self, state: GameState) -> set[str]:
+        return {state.me.station or "", state.start_node, state.gate_node, state.terminal_node, *map(str, state.roles.get("safeZoneNodeIds", []) or [])}
+
+    def _scout_objective(self, state: GameState) -> str:
+        me = state.me
+        if self._need_endgame(state) or self._opponent_pressure(state) or me.task_score_base >= self.config.target_task_score:
+            return state.terminal_node if me.verified else state.gate_node
+        route_task = self._best_reachable_task(state)
+        if route_task is not None:
+            return route_task.target
+        route_resource = self._best_reachable_resource(state)
+        if route_resource is not None:
+            return route_resource.station
+        return state.terminal_node if me.verified else state.gate_node
+
+    def _scout_path_candidates(self, state: GameState, objective: str, forbidden: set[str]) -> list[str]:
+        plan = self.route_planner.plan(state, state.me.station, objective)
+        if plan is None:
+            return []
+        result: list[str] = []
+        for node in plan.path[1 : 1 + SCOUT_PATH_LOOKAHEAD]:
+            if node in forbidden:
+                continue
+            if node in self._scout_dispatched or self._has_own_scout_marker(state, node):
+                continue
+            result.append(node)
+        return result
 
     def _has_own_scout_marker(self, state: GameState, target: str) -> bool:
         station = state.station(target)
