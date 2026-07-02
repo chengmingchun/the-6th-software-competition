@@ -32,6 +32,19 @@ RUSH_PHASES = {"RUSH", "BANQUET", "ENDGAME", "FINAL", "宫宴冲刺"}
 PLANNING_STATES = {ConvoyStatus.IDLE, ConvoyStatus.WAITING, ConvoyStatus.UNKNOWN, ConvoyStatus.COST_BANKRUPT}
 PROCESS_RETRY_CODES = {"PROCESS_REQUIRED", "PROCESS_INTERRUPTED", "INTERRUPTED"}
 PROCESS_HARD_REJECT_CODES = {"PROCESS_NOT_AVAILABLE", "NOT_AT_TARGET_NODE", "INVALID_TARGET"}
+WINDOW_REJECT_CODES = {
+    "WINDOW_NOT_ACTIVE",
+    "WINDOW_NOT_AVAILABLE",
+    "WINDOW_NOT_YOUR_TURN",
+    "WINDOW_CARD_INVALID",
+    "WINDOW_DRAW_RETRY_LIMIT",
+    "CONTEST_NOT_ACTIVE",
+    "CONTEST_NOT_FOUND",
+    "INVALID_CONTEST",
+    "INVALID_ACTION",
+}
+WINDOW_TERMINAL_STATUSES = {"SUPPRESSED", "RESOLVED", "FINISHED", "FINISH", "ENDED", "END", "CLOSED", "COMPLETED", "COMPLETE", "SETTLED"}
+WINDOW_HARD_MAX_SENDS = 3
 
 
 @dataclass(frozen=True)
@@ -135,6 +148,7 @@ class BaselineStrategy:
         self._station_escape_until: dict[str, int] = {}
         self._object_cooldown_until: dict[str, int] = {}
         self._window_seen: dict[str, int] = {}
+        self._suppressed_window_keys: set[str] = set()
         self._completed_fixed_process_nodes: set[str] = set()
         self._rejected_fixed_process_nodes: set[str] = set()
         self._forced_process_nodes: set[str] = set()
@@ -178,21 +192,33 @@ class BaselineStrategy:
         window = state.active_window()
         if window is None:
             return None, None
-        object_key = self._window_object_key(window)
-        if object_key is not None:
-            self._window_seen[object_key] = self._window_seen.get(object_key, 0) + 1
-        should_abstain = object_key is not None and (
-            self._is_object_on_cooldown(state, object_key)
-            or self._is_station_escape_active(state, window.target or state.me.station)
-            or (self._window_seen.get(object_key, 0) > self.config.max_window_rounds_before_abstain and window.window_type not in {"GATE", "PASS"})
-        )
-        if should_abstain:
-            self._cooldown_object(state, object_key or f"WINDOW:{window.id}", "window_stall")
-            self.logger.info("stall_breaker", kind="window", station=window.target or state.me.station, objectKey=object_key, action="ABSTAIN", reason="窗口重复出现：只对窗口弃争，不阻塞主车队动作")
-            return WindowAction(window.id, WindowCard.ABSTAIN), f"window_stall:{object_key}"
+        object_key = self._window_object_key(window) or f"WINDOW:{window.id}"
+        status = str(window.status or "").upper()
+        seen = self._window_seen.get(object_key, 0) + 1
+        self._window_seen[object_key] = seen
+
+        # Hard safety rule: repeated or stale contests must not keep emitting
+        # WINDOW_CARD/ABSTAIN.  ABSTAIN is still a WINDOW_CARD and can itself be
+        # invalid when the server says it is not our card beat.  Once suppressed,
+        # this object is silent; the main convoy continues PROCESS/MOVE.
+        if object_key in self._suppressed_window_keys or status in WINDOW_TERMINAL_STATUSES:
+            self.logger.info("stall_breaker", kind="window", station=window.target or state.me.station, objectKey=object_key, action="SUPPRESS", reason="窗口已熔断/已结束，不再发送 WINDOW_CARD")
+            return None, None
+        if seen > WINDOW_HARD_MAX_SENDS or window.round_index > 3:
+            self._suppress_window(object_key, state, f"window_repeated:{seen}:roundIndex={window.round_index}")
+            return None, None
+        if self._is_object_on_cooldown(state, object_key) or self._is_station_escape_active(state, window.target or state.me.station):
+            self._suppress_window(object_key, state, "window_on_cooldown_or_station_escape")
+            return None, None
+
         choice = self.window_strategy.choose(state, window, self.config)
         self.logger.info("strategy_step", step="window_card", contestId=window.id, contestType=window.window_type, target=window.target, resourceType=window.resource_type, taskId=window.task_id, roundIndex=window.round_index, chosenCard=choice.card.value, windowStyle=choice.style, choiceReason=choice.reason, roll=choice.roll)
         return WindowAction(window.id, choice.card), f"window:{window.window_type}:{choice.card.value}"
+
+    def _suppress_window(self, object_key: str, state: GameState, reason: str) -> None:
+        self._suppressed_window_keys.add(object_key)
+        self._cooldown_object(state, object_key, reason)
+        self.logger.info("stall_breaker", kind="window", station=state.me.station, objectKey=object_key, action="SUPPRESS", reason=f"窗口熔断：{reason}；后续不再发送 WINDOW_CARD/ABSTAIN")
 
     def _attach_window(self, bundle: ActionBundle, window: WindowAction | None) -> ActionBundle:
         if window is None or bundle.window is not None:
@@ -243,8 +269,6 @@ class BaselineStrategy:
         if fixed_process is not None:
             return done(fixed_process, "fixed_process")
 
-        # Delivery-first safety net. If we already have a score floor, or the
-        # clock says the gate trip is tight, stop taking optional detours.
         if self._need_endgame(state) or self._opponent_pressure(state) or me.task_score_base >= self.config.target_task_score:
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_deadline_delivery_first")
             return done(self._move_towards_delivery(state), "delivery_guard")
@@ -294,7 +318,7 @@ class BaselineStrategy:
             if event_type in {"WINDOW_CONTEST_DRAW", "WINDOW_CONTEST_REPEAT_SUPPRESSED", "CONTEST_DRAW"}:
                 object_key = self._event_object_key(event)
                 if object_key is not None:
-                    self._cooldown_object(state, object_key, f"event:{event_type}")
+                    self._suppress_window(object_key, state, f"event:{event_type}")
 
         for result in state.action_results:
             if not isinstance(result, dict):
@@ -312,6 +336,11 @@ class BaselineStrategy:
             resource_type = result.get("resourceType")
             self.logger.info("action_result", action=action, accepted=accepted, success=success, code=code, nodeId=node_id, taskId=task_id, resourceType=resource_type, raw=result)
             failed = accepted is False or success is False or effective is False or bool(code)
+            if action == "WINDOW_CARD" and (failed or code in WINDOW_REJECT_CODES):
+                contest_id = str(result.get("contestId") or result.get("windowId") or result.get("id") or "")
+                if contest_id:
+                    self._suppress_window(f"WINDOW:{contest_id}", state, f"reject:{code or 'WINDOW_CARD_FAILED'}")
+                continue
             if failed:
                 self._learn_error_code(state, action, code, node_id, task_id, resource_type, result)
             elif action == "PROCESS" and node_id:
@@ -444,6 +473,7 @@ class BaselineStrategy:
             forcedProcessNodes=list(sorted(self._forced_process_nodes))[:5],
             completedProcessNodes=list(sorted(self._completed_fixed_process_nodes))[:5],
             pendingProcessNodes=dict(sorted(self._pending_process_until.items())),
+            suppressedWindows=list(sorted(self._suppressed_window_keys))[:5],
             stationStay=self._station_stay_frames(state),
             stationEscapeUntil=self._station_escape_until.get(me.station or ""),
         )
