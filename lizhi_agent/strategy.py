@@ -172,6 +172,9 @@ class BaselineStrategy:
         for event in state.events:
             if not isinstance(event, dict):
                 continue
+            if not self._record_belongs_to_me(state, event):
+                self.logger.info("feedback_ignore", reason="opponent_event", eventPreview=str(event)[:300])
+                continue
             event_type = str(event.get("event") or event.get("eventType") or event.get("type") or "").upper()
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
             node_id = event.get("targetNodeId") or event.get("nodeId") or payload.get("targetNodeId") or payload.get("nodeId")
@@ -194,6 +197,9 @@ class BaselineStrategy:
         for result in state.action_results:
             if not isinstance(result, dict):
                 continue
+            if not self._record_belongs_to_me(state, result):
+                self.logger.info("feedback_ignore", reason="opponent_action_result", resultPreview=str(result)[:300])
+                continue
             action = str(result.get("action") or result.get("actionType") or result.get("type") or "").upper()
             accepted = result.get("accepted")
             success = result.get("success")
@@ -201,9 +207,28 @@ class BaselineStrategy:
             node_id = result.get("targetNodeId") or result.get("nodeId")
             task_id = result.get("taskId")
             resource_type = result.get("resourceType")
+            self.logger.info("action_result", action=action, accepted=accepted, success=success, code=code, nodeId=node_id, taskId=task_id, resourceType=resource_type, raw=result)
             failed = accepted is False or success is False or bool(code)
             if failed:
                 self._learn_error_code(state, action, code, node_id, task_id, resource_type, result)
+
+    def _record_belongs_to_me(self, state: GameState, record: dict[str, Any]) -> bool:
+        payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
+        player_values = [
+            record.get("playerId"), record.get("actorPlayerId"), record.get("sourcePlayerId"), record.get("ownerPlayerId"),
+            payload.get("playerId"), payload.get("actorPlayerId"), payload.get("sourcePlayerId"), payload.get("ownerPlayerId"),
+        ]
+        explicit_players = [value for value in player_values if value not in (None, "")]
+        if explicit_players:
+            return any(str(value) == str(state.player_id) for value in explicit_players)
+        team_values = [
+            record.get("teamId"), record.get("actorTeamId"), record.get("sourceTeamId"), record.get("ownerTeamId"),
+            payload.get("teamId"), payload.get("actorTeamId"), payload.get("sourceTeamId"), payload.get("ownerTeamId"),
+        ]
+        explicit_teams = [value for value in team_values if value not in (None, "")]
+        if explicit_teams and state.me.team_id is not None:
+            return any(str(value) == str(state.me.team_id) for value in explicit_teams)
+        return True
 
     def _learn_error_code(self, state: GameState, action: str, code: str, node_id: Any, task_id: Any, resource_type: Any, raw: dict[str, Any]) -> None:
         if not code:
@@ -213,6 +238,7 @@ class BaselineStrategy:
             if node:
                 self._forced_process_nodes.add(node)
                 self._rejected_fixed_process_nodes.discard(node)
+                self._completed_fixed_process_nodes.discard(node)
                 self._station_escape_until.pop(node, None)
                 self.logger.info("feedback_learn", learned="process_required", nodeId=node, code=code, result=raw)
             return
@@ -273,6 +299,7 @@ class BaselineStrategy:
             rejectedTasks=list(sorted(self._rejected_task_ids))[:5],
             rejectedProcessNodes=list(sorted(self._rejected_fixed_process_nodes))[:5],
             forcedProcessNodes=list(sorted(self._forced_process_nodes))[:5],
+            completedProcessNodes=list(sorted(self._completed_fixed_process_nodes))[:5],
             stationStay=self._station_stay_frames(state),
             stationEscapeUntil=self._station_escape_until.get(me.station or ""),
         )
@@ -334,13 +361,9 @@ class BaselineStrategy:
                 return Decision(wait("at_gate_before_rush", active=False), "at_gate_before_rush")
             return Decision(self._move_to(state, state.terminal_node), "gate_to_terminal")
 
-        # Hard guard: if the server ever says PROCESS_REQUIRED, or the map says
-        # this station has a fixed process, PROCESS outranks all local tasks,
-        # resources, escape logic and delivery movement.  MOVE before this will
-        # be rejected and only drops freshness.
-        forced_process = self._fixed_process_action(state)
-        if forced_process is not None:
-            return Decision(forced_process, "fixed_process")
+        fixed_process = self._fixed_process_action(state)
+        if fixed_process is not None:
+            return Decision(fixed_process, "fixed_process")
 
         if self._need_endgame(state) or self._opponent_pressure(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="rush_deadline_or_opponent_pressure")
