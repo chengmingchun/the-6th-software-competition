@@ -210,7 +210,7 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
 
-    def test_competitive_score_locks_delivery(self) -> None:
+    def test_competitive_score_still_chases_high_value_task(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
             frame=180,
@@ -218,6 +218,26 @@ class StrategyRouteResourceTest(unittest.TestCase):
             player_id="1001",
             roles={"gateNodeId": "S14"},
             me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=130),
+            edges=[
+                RouteEdge(id="E1", start="S01", end="S02", distance=1),
+                RouteEdge(id="E2", start="S02", end="S03", distance=1),
+                RouteEdge(id="E3", start="S03", end="S14", distance=1),
+                RouteEdge(id="E4", start="S01", end="S14", distance=2),
+            ],
+            tasks=[TaskInstance(id="rich-task", template="T08", target="S03", score=45, process_frames=4)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_greed_score_locks_delivery(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=180),
             edges=[
                 RouteEdge(id="E1", start="S01", end="S02", distance=1),
                 RouteEdge(id="E2", start="S02", end="S03", distance=1),
@@ -244,6 +264,21 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
         self.assertEqual(action.main.to_action()["resourceType"], "FAST_HORSE")
 
+    def test_station_task_takes_priority_over_pre_move_horse(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=130, resources={"FAST_HORSE": 1}),
+            edges=[RouteEdge(id="E1", start="S03", end="S14", distance=6)],
+            tasks=[TaskInstance(id="station-task", template="T08", target="S03", score=45, process_frames=4)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.CLAIM_TASK)
+        self.assertEqual(action.main.to_action()["taskId"], "station-task")
+
     def test_pre_move_horse_does_not_skip_fixed_process(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
@@ -257,6 +292,25 @@ class StrategyRouteResourceTest(unittest.TestCase):
         )
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.PROCESS)
+
+    def test_high_score_uses_ice_box_before_quality_drops_too_far(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=260,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S03",
+                freshness=89,
+                task_score_base=170,
+                resources={"ICE_BOX": 1},
+            ),
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
+        self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
 
     def test_intel_scouts_valuable_route_target_when_squad_unavailable(self) -> None:
         strategy = self.make_strategy()

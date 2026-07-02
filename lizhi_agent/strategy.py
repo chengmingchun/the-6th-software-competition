@@ -300,13 +300,7 @@ class BaselineStrategy:
         rush_tactic = self._rush_tactic_action(state)
         if rush_tactic is not None:
             return done(rush_tactic, "use_rush_tactic")
-        intel_action = self._intel_action(state)
-        if intel_action is not None:
-            return done(intel_action, "use_intel")
-        pre_move_resource = self._pre_move_resource_action(state)
-        if pre_move_resource is not None:
-            return done(pre_move_resource, "use_route_resource")
-        if self._need_endgame(state) or self._opponent_pressure(state) or self._should_lock_delivery(state):
+        if self._need_endgame(state) or self._opponent_pressure(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_deadline_delivery_first")
             scout = self._squad_scout_action(state)
             return done(self._move_towards_delivery(state, squad=scout), "delivery_guard")
@@ -322,6 +316,16 @@ class BaselineStrategy:
         if station_resource is not None:
             scout = self._squad_scout_action(state, after_current_action=True)
             return done(self._claim_resource(station_resource, squad=scout), f"claim_resource:{station_resource.resource_type}")
+        intel_action = self._intel_action(state)
+        if intel_action is not None:
+            return done(intel_action, "use_intel")
+        pre_move_resource = self._pre_move_resource_action(state)
+        if pre_move_resource is not None:
+            return done(pre_move_resource, "use_route_resource")
+        if self._should_lock_delivery(state):
+            self.logger.info("strategy_step", step="delivery_guard", reason="score_or_quality_delivery_first")
+            scout = self._squad_scout_action(state)
+            return done(self._move_towards_delivery(state, squad=scout), "delivery_guard")
         scout = self._squad_scout_action(state)
         route_task = self._best_reachable_task(state)
         if route_task is not None:
@@ -593,6 +597,9 @@ class BaselineStrategy:
         if me.freshness <= 82 and (me.task_score_base >= self.config.target_task_score or state.turns_left < 320):
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_quality_before_delivery", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        if me.freshness <= 90 and me.task_score_base >= self.config.competitive_task_score:
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_high_score_quality", freshness=me.freshness, taskScore=me.task_score_base)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         return None
 
     def _pre_move_resource_action(self, state: GameState) -> ActionBundle | None:
@@ -828,7 +835,7 @@ class BaselineStrategy:
 
     def _should_lock_delivery(self, state: GameState) -> bool:
         me = state.me
-        if me.task_score_base >= self.config.competitive_task_score:
+        if me.task_score_base >= self.config.greed_task_score:
             return True
         if me.good_fruit < 78 or me.freshness < 68:
             return me.task_score_base >= self.config.target_task_score

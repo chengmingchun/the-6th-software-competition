@@ -6,8 +6,8 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class StrategyConfig:
     target_task_score: int = 90
-    competitive_task_score: int = 130
-    greed_task_score: int = 150
+    competitive_task_score: int = 170
+    greed_task_score: int = 180
     endgame_buffer_frames: int = 45
     max_task_detour_frames: int = 18
     max_competitive_task_detour_frames: int = 34
