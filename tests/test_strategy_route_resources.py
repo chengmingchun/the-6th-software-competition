@@ -410,6 +410,37 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
 
+    def test_document_resource_is_claimed_only_when_already_at_station(self) -> None:
+        strategy = self.make_strategy()
+        at_station = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=120),
+            resources=[ResourceStock(station="S03", resource_type="PASS_TOKEN", amount=1, claim_frames=2)],
+        )
+        claim = strategy.decide(at_station)
+        self.assertEqual(claim.main.action, MainActionType.CLAIM_RESOURCE)
+        self.assertEqual(claim.main.to_action()["resourceType"], "PASS_TOKEN")
+
+        off_route = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=120),
+            edges=[
+                RouteEdge(id="D", start="S01", end="S14", distance=2),
+                RouteEdge(id="R1", start="S01", end="S03", distance=1),
+                RouteEdge(id="R2", start="S03", end="S14", distance=4),
+            ],
+            resources=[ResourceStock(station="S03", resource_type="PASS_TOKEN", amount=1, claim_frames=2)],
+        )
+        move = strategy.decide(off_route)
+        self.assertEqual(move.main.action, MainActionType.MOVE)
+        self.assertEqual(move.main.to_action()["targetNodeId"], "S14")
+
     def test_squad_clear_handles_obstacle_before_spending_good_fruit(self) -> None:
         strategy = self.make_strategy()
         state = GameState(

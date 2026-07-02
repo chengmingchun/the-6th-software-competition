@@ -46,6 +46,7 @@ WINDOW_REJECT_CODES = {
 WINDOW_TERMINAL_STATUSES = {"SUPPRESSED", "RESOLVED", "FINISHED", "FINISH", "ENDED", "END", "CLOSED", "COMPLETED", "COMPLETE", "SETTLED"}
 WINDOW_HARD_MAX_SENDS = 3
 SCOUT_PATH_LOOKAHEAD = 3
+ROUTE_RESOURCE_TYPES = {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE", "INTEL"}
 
 
 @dataclass(frozen=True)
@@ -79,9 +80,9 @@ class WindowStrategy:
             return WindowChoice(card, "OPENING_MIX", f"开局窗口混合策略，候选={self._options_text(options)}", roll)
         if high_value and me.guard_points > 0:
             return WindowChoice(WindowCard.BING_ZHENG, "FIXED_VALUE", "高价值窗口且有护卫点")
-        if me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT"):
+        if high_value and (me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT")):
             return WindowChoice(WindowCard.YAN_DIE, "FIXED_RESOURCE", "有通行类资源")
-        if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE"):
+        if high_value and (me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")):
             return WindowChoice(WindowCard.QIANG_XING, "FIXED_SPEED", "有速度资源/增益")
         if high_value and me.freshness >= 85 and me.good_fruit >= 80:
             return WindowChoice(WindowCard.XIAN_GONG, "FIXED_FRUIT", "高价值窗口且果况健康")
@@ -103,11 +104,11 @@ class WindowStrategy:
         options: list[tuple[WindowCard, int]] = []
         if me.guard_points > 0:
             options.append((WindowCard.BING_ZHENG, 42 if high_value else 30))
-        if me.freshness >= 86 and me.good_fruit >= 82:
+        if high_value and me.freshness >= 86 and me.good_fruit >= 82:
             options.append((WindowCard.XIAN_GONG, 34 if high_value else 24))
-        if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE"):
+        if high_value and (me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")):
             options.append((WindowCard.QIANG_XING, 28))
-        if me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT"):
+        if high_value and (me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT")):
             options.append((WindowCard.YAN_DIE, 26))
         if not high_value or me.freshness < 75 or me.good_fruit < 70:
             options.append((WindowCard.ABSTAIN, 18))
@@ -758,7 +759,7 @@ class BaselineStrategy:
                 continue
             if (stock.station, stock.resource_type) in self._rejected_resource_keys or self._is_object_on_cooldown(state, self._resource_object_key(stock.station, stock.resource_type)):
                 continue
-            if stock.resource_type not in self.config.resource_priority:
+            if stock.resource_type not in ROUTE_RESOURCE_TYPES:
                 continue
             to_res = self.route_planner.estimate_frames(state, state.me.station, stock.station)
             to_gate = self.route_planner.estimate_frames(state, stock.station, state.gate_node)
@@ -868,7 +869,7 @@ class BaselineStrategy:
         if task_score > 0:
             value += 70 + min(60, task_score)
             reasons.append("task")
-        resource_values = [self._resource_value(state, stock, detour=0) for stock in state.resources if stock.station == node and stock.amount > 0 and stock.resource_type in self.config.resource_priority]
+        resource_values = [self._resource_value(state, stock, detour=0) for stock in state.resources if stock.station == node and stock.amount > 0 and stock.resource_type in ROUTE_RESOURCE_TYPES]
         if resource_values:
             value += 45 + min(50, max(resource_values))
             reasons.append("resource")
