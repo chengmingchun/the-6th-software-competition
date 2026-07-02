@@ -197,11 +197,6 @@ class BaselineStrategy:
         status = str(window.status or "").upper()
         seen = self._window_seen.get(object_key, 0) + 1
         self._window_seen[object_key] = seen
-
-        # Hard safety rule: repeated or stale contests must not keep emitting
-        # WINDOW_CARD/ABSTAIN.  ABSTAIN is still a WINDOW_CARD and can itself be
-        # invalid when the server says it is not our card beat.  Once suppressed,
-        # this object is silent; the main convoy continues PROCESS/MOVE.
         if object_key in self._suppressed_window_keys or status in WINDOW_TERMINAL_STATUSES:
             self.logger.info("stall_breaker", kind="window", station=window.target or state.me.station, objectKey=object_key, action="SUPPRESS", reason="窗口已熔断/已结束，不再发送 WINDOW_CARD")
             return None, None
@@ -211,7 +206,6 @@ class BaselineStrategy:
         if self._is_object_on_cooldown(state, object_key) or self._is_station_escape_active(state, window.target or state.me.station):
             self._suppress_window(object_key, state, "window_on_cooldown_or_station_escape")
             return None, None
-
         choice = self.window_strategy.choose(state, window, self.config)
         self.logger.info("strategy_step", step="window_card", contestId=window.id, contestType=window.window_type, target=window.target, resourceType=window.resource_type, taskId=window.task_id, roundIndex=window.round_index, chosenCard=choice.card.value, windowStyle=choice.style, choiceReason=choice.reason, roll=choice.roll)
         return WindowAction(window.id, choice.card), f"window:{window.window_type}:{choice.card.value}"
@@ -245,56 +239,46 @@ class BaselineStrategy:
             return done(wait(f"moving:{me.status.value}", active=False), f"moving:{me.status.value}")
         if me.status in BUSY_STATES or me.current_process is not None:
             return done(wait(f"busy:{me.status.value}", active=False), f"busy:{me.status.value}")
-
         pending = self._pending_process_wait_action(state)
         if pending is not None:
             return done(pending, "wait_pending_process")
-
         fresh_action = self._freshness_action(state)
         if fresh_action is not None:
             return done(fresh_action, "use_ice_box")
-
         if me.station == state.terminal_node:
             if me.verified and me.good_fruit > 0 and me.freshness > 0:
                 return done(ActionBundle(main=MainAction(MainActionType.DELIVER)), "deliver")
             return done(self._move_to(state, state.gate_node), "leave_terminal_not_ready")
-
         if me.station == state.gate_node:
             if not me.verified:
                 if self._can_verify_gate(state):
                     return done(self._verify_action(state), "verify_gate")
                 return done(wait("at_gate_before_rush", active=False), "at_gate_before_rush")
             return done(self._move_to(state, state.terminal_node), "gate_to_terminal")
-
         fixed_process = self._fixed_process_action(state)
         if fixed_process is not None:
             return done(fixed_process, "fixed_process")
-
         if self._need_endgame(state) or self._opponent_pressure(state) or me.task_score_base >= self.config.target_task_score:
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_deadline_delivery_first")
-            return done(self._move_towards_delivery(state), "delivery_guard")
-
+            scout = self._squad_scout_action(state)
+            return done(self._move_towards_delivery(state, squad=scout), "delivery_guard")
         if self._is_station_escape_active(state):
             self.logger.info("stall_breaker", kind="station", station=me.station, stayFrames=self._station_stay_frames(state), escapeUntil=self._station_escape_until.get(me.station or ""), action="MOVE_MAINLINE", reason="当前站点停留过久，暂停本地任务资源，直奔主线")
-            return done(self._move_towards_delivery(state), "station_stall_escape")
-
+            scout = self._squad_scout_action(state)
+            return done(self._move_towards_delivery(state, squad=scout), "station_stall_escape")
         station_task = self._best_station_task(state)
         if station_task is not None:
             return done(self._claim_task(station_task), f"claim_task:{station_task.template}:{station_task.id}")
-
         station_resource = self._best_station_resource(state)
         if station_resource is not None:
             return done(self._claim_resource(station_resource), f"claim_resource:{station_resource.resource_type}")
-
         scout = self._squad_scout_action(state)
         route_task = self._best_reachable_task(state)
         if route_task is not None:
             return done(self._move_towards_node(state, route_task.target, squad=scout), f"move_to_task:{route_task.template}:{route_task.id}")
-
         route_resource = self._best_reachable_resource(state)
         if route_resource is not None:
             return done(self._move_towards_node(state, route_resource.station, squad=scout), f"move_to_resource:{route_resource.resource_type}")
-
         return done(self._move_towards_delivery(state, squad=scout), "move_towards_delivery")
 
     def _learn_from_feedback(self, state: GameState) -> None:
@@ -320,7 +304,6 @@ class BaselineStrategy:
                 object_key = self._event_object_key(event)
                 if object_key is not None:
                     self._suppress_window(object_key, state, f"event:{event_type}")
-
         for result in state.action_results:
             if not isinstance(result, dict):
                 continue
@@ -587,12 +570,10 @@ class BaselineStrategy:
             return None
         if state.me.task_score_base >= self.config.greed_task_score and not self._need_endgame(state):
             return None
-
         def score(task: TaskInstance) -> tuple[int, int]:
             threshold_bonus = 100 if state.me.task_score_base < self.config.target_task_score and task.score >= 30 else 0
             clear_bonus = 20 if task.template == "T04" else 0
             return threshold_bonus + clear_bonus + task.score, -task.process_frames
-
         best = max(tasks, key=score)
         self.logger.info("task_eval_station", station=state.me.station, candidates=[{"taskId": t.id, "template": t.template, "score": t.score, "processFrames": t.process_frames, "rank": score(t)} for t in tasks], chosen=best.id)
         if state.me.task_score_base < self.config.target_task_score:
@@ -676,7 +657,6 @@ class BaselineStrategy:
         for target in path_candidates:
             self.logger.info("squad_eval", action="SQUAD_SCOUT", target=target, reason="route_path_scout", objective=objective, candidates=path_candidates)
             return SquadAction(SquadActionType.SQUAD_SCOUT, target)
-
         fallback_candidates: list[str] = []
         for target in self.config.scout_targets:
             if target in forbidden:
