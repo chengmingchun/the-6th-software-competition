@@ -316,10 +316,12 @@ class BaselineStrategy:
             return done(self._move_towards_delivery(state, squad=scout), "station_stall_escape")
         station_task = self._best_station_task(state)
         if station_task is not None:
-            return done(self._claim_task(station_task), f"claim_task:{station_task.template}:{station_task.id}")
+            scout = self._squad_scout_action(state, after_current_action=True)
+            return done(self._claim_task(station_task, squad=scout), f"claim_task:{station_task.template}:{station_task.id}")
         station_resource = self._best_station_resource(state)
         if station_resource is not None:
-            return done(self._claim_resource(station_resource), f"claim_resource:{station_resource.resource_type}")
+            scout = self._squad_scout_action(state, after_current_action=True)
+            return done(self._claim_resource(station_resource, squad=scout), f"claim_resource:{station_resource.resource_type}")
         scout = self._squad_scout_action(state)
         route_task = self._best_reachable_task(state)
         if route_task is not None:
@@ -625,8 +627,8 @@ class BaselineStrategy:
     def _intel_target(self, state: GameState) -> str | None:
         forbidden = self._scout_forbidden(state)
         objective = self._current_route_objective(state)
-        candidates = self._scout_path_candidates(state, objective, forbidden)
-        return candidates[0] if candidates else None
+        target, _ = self._priority_scout_target(state, objective, forbidden)
+        return target
 
     def _moving_horse_action(self, state: GameState) -> ActionBundle | None:
         me = state.me
@@ -704,12 +706,14 @@ class BaselineStrategy:
         self.logger.info("resource_eval_station", station=state.me.station, candidates=[{"resourceType": s.resource_type, "amount": s.amount, "value": self._resource_value(state, s, detour=0)} for s in stocks], chosen=chosen.resource_type)
         return chosen
 
-    def _best_reachable_task(self, state: GameState) -> TaskInstance | None:
+    def _best_reachable_task(self, state: GameState, *, exclude_current_station: bool = False) -> TaskInstance | None:
         if state.me.task_score_base >= self.config.greed_task_score or state.me.station is None:
             return None
         direct = self.route_planner.estimate_frames(state, state.me.station, state.gate_node)
         candidates: list[tuple[int, TaskInstance, int, int, int]] = []
         for task in state.tasks:
+            if exclude_current_station and task.target == state.me.station:
+                continue
             if task.id in self._rejected_task_ids or self._is_object_on_cooldown(state, self._task_object_key(task.id)):
                 continue
             if not task.available_for(state.player_id) or task.score <= 0:
@@ -734,7 +738,7 @@ class BaselineStrategy:
         self.logger.info("task_eval_reachable", directToGate=direct, candidates=[{"taskId": t.id, "template": t.template, "target": t.target, "score": t.score, "value": v, "detour": d, "toTask": tt, "toGate": tg} for v, t, d, tt, tg in sorted(candidates, key=lambda item: item[0], reverse=True)[:5]], chosen=chosen.id, chosenValue=chosen_value, chosenDetour=chosen_detour, chosenToTask=chosen_to_task, chosenToGate=chosen_to_gate)
         return chosen
 
-    def _best_reachable_resource(self, state: GameState) -> ResourceStock | None:
+    def _best_reachable_resource(self, state: GameState, *, exclude_current_station: bool = False) -> ResourceStock | None:
         if state.me.station is None:
             return None
         if self._opponent_pressure(state):
@@ -743,6 +747,8 @@ class BaselineStrategy:
         direct = self.route_planner.estimate_frames(state, state.me.station, state.gate_node)
         candidates: list[tuple[int, ResourceStock, int]] = []
         for stock in state.resources:
+            if exclude_current_station and stock.station == state.me.station:
+                continue
             if (stock.station, stock.resource_type) in self._rejected_resource_keys or self._is_object_on_cooldown(state, self._resource_object_key(stock.station, stock.resource_type)):
                 continue
             if stock.resource_type not in self.config.resource_priority:
@@ -782,42 +788,29 @@ class BaselineStrategy:
             base += 18 if not me.verified else 6
         return base - max(0, detour * 2)
 
-    def _squad_scout_action(self, state: GameState) -> SquadAction | None:
+    def _squad_scout_action(self, state: GameState, *, after_current_action: bool = False) -> SquadAction | None:
         if state.phase in RUSH_PHASES or state.me.squad_available <= 0 or state.me.station is None:
             return None
         forbidden = self._scout_forbidden(state)
-        objective = self._scout_objective(state)
-        path_candidates = self._scout_path_candidates(state, objective, forbidden)
-        for target in path_candidates:
-            self.logger.info("squad_eval", action="SQUAD_SCOUT", target=target, reason="route_path_scout", objective=objective, candidates=path_candidates)
+        objective = self._scout_objective(state, exclude_current_station=after_current_action)
+        target, candidates = self._priority_scout_target(state, objective, forbidden)
+        if target is not None:
+            self.logger.info("squad_eval", action="SQUAD_SCOUT", target=target, reason="valuable_route_scout", objective=objective, candidates=candidates)
             return SquadAction(SquadActionType.SQUAD_SCOUT, target)
-        fallback_candidates: list[str] = []
-        for target in self.config.scout_targets:
-            if target in forbidden:
-                self.logger.info("squad_eval_skip", target=target, reason="forbidden_scout_target")
-                continue
-            if target in self._scout_dispatched or self._has_own_scout_marker(state, target):
-                continue
-            if self.route_planner.estimate_frames(state, state.me.station, target) < 10**8:
-                fallback_candidates.append(target)
-        if fallback_candidates:
-            target = min(fallback_candidates, key=lambda node: self.route_planner.estimate_frames(state, state.me.station, node))
-            self.logger.info("squad_eval", action="SQUAD_SCOUT", target=target, reason="fallback_nearest_config_target", objective=objective, candidates=fallback_candidates)
-            return SquadAction(SquadActionType.SQUAD_SCOUT, target)
-        self.logger.info("squad_eval", action=None, reason="no_available_scout_target", objective=objective)
+        self.logger.info("squad_eval", action=None, reason="no_valuable_route_scout_target", objective=objective, candidates=candidates)
         return None
 
     def _scout_forbidden(self, state: GameState) -> set[str]:
         return {state.me.station or "", state.start_node, state.gate_node, state.terminal_node, *map(str, state.roles.get("safeZoneNodeIds", []) or [])}
 
-    def _scout_objective(self, state: GameState) -> str:
+    def _scout_objective(self, state: GameState, *, exclude_current_station: bool = False) -> str:
         me = state.me
         if self._need_endgame(state) or self._opponent_pressure(state) or self._should_lock_delivery(state):
             return state.terminal_node if me.verified else state.gate_node
-        route_task = self._best_reachable_task(state)
+        route_task = self._best_reachable_task(state, exclude_current_station=exclude_current_station)
         if route_task is not None:
             return route_task.target
-        route_resource = self._best_reachable_resource(state)
+        route_resource = self._best_reachable_resource(state, exclude_current_station=exclude_current_station)
         if route_resource is not None:
             return route_resource.station
         return state.terminal_node if me.verified else state.gate_node
@@ -841,18 +834,49 @@ class BaselineStrategy:
             return me.task_score_base >= self.config.target_task_score
         return False
 
-    def _scout_path_candidates(self, state: GameState, objective: str, forbidden: set[str]) -> list[str]:
+    def _priority_scout_target(self, state: GameState, objective: str, forbidden: set[str]) -> tuple[str | None, list[dict[str, int | str]]]:
         plan = self.route_planner.plan(state, state.me.station, objective)
         if plan is None:
-            return []
-        result: list[str] = []
-        for node in plan.path[1 : 1 + SCOUT_PATH_LOOKAHEAD]:
-            if node in forbidden:
+            return None, []
+        scored: list[tuple[int, int, str, str]] = []
+        details: list[dict[str, int | str]] = []
+        for index, node in enumerate(plan.path[1 : 1 + SCOUT_PATH_LOOKAHEAD], start=1):
+            if node in forbidden or node in self._scout_dispatched or self._has_own_scout_marker(state, node):
                 continue
-            if node in self._scout_dispatched or self._has_own_scout_marker(state, node):
+            score, reason = self._scout_target_value(state, node, objective)
+            details.append({"target": node, "value": score, "reason": reason, "hop": index})
+            if score <= 0:
                 continue
-            result.append(node)
-        return result
+            scored.append((score, -index, node, reason))
+        if not scored:
+            return None, details
+        _, _, target, _ = max(scored)
+        return target, details
+
+    def _scout_target_value(self, state: GameState, node: str, objective: str) -> tuple[int, str]:
+        station = state.station(node)
+        reasons: list[str] = []
+        value = 0
+        task_score = sum(task.score for task in state.tasks if task.target == node and task.available_for(state.player_id) and task.id not in self._rejected_task_ids)
+        if task_score > 0:
+            value += 70 + min(60, task_score)
+            reasons.append("task")
+        resource_values = [self._resource_value(state, stock, detour=0) for stock in state.resources if stock.station == node and stock.amount > 0 and stock.resource_type in self.config.resource_priority]
+        if resource_values:
+            value += 45 + min(50, max(resource_values))
+            reasons.append("resource")
+        if station is not None and station.process_type and station.process_round > 0 and station.process_type != "VERIFY":
+            value += 35 + min(20, station.process_round)
+            reasons.append("process")
+        if station is not None and station.has_obstacle:
+            value += 28
+            reasons.append("obstacle")
+        if station is not None and station.has_enemy_guard(state.me.team_id):
+            value += 28 + station.guard_defense * 4
+            reasons.append("enemy_guard")
+        if node == objective and reasons:
+            value += 20
+        return value, "+".join(reasons) if reasons else "pass_through"
 
     def _has_own_scout_marker(self, state: GameState, target: str) -> bool:
         station = state.station(target)
@@ -863,11 +887,11 @@ class BaselineStrategy:
             return False
         return any(isinstance(marker, dict) and marker.get("teamId") == state.me.team_id and marker.get("remainingTriggers", 1) for marker in markers)
 
-    def _claim_task(self, task: TaskInstance) -> ActionBundle:
-        return ActionBundle(main=MainAction(MainActionType.CLAIM_TASK, task_id=task.id))
+    def _claim_task(self, task: TaskInstance, squad: SquadAction | None = None) -> ActionBundle:
+        return ActionBundle(main=MainAction(MainActionType.CLAIM_TASK, task_id=task.id), squad=squad)
 
-    def _claim_resource(self, resource: ResourceStock) -> ActionBundle:
-        return ActionBundle(main=MainAction(MainActionType.CLAIM_RESOURCE, target=resource.station, resource_type=resource.resource_type))
+    def _claim_resource(self, resource: ResourceStock, squad: SquadAction | None = None) -> ActionBundle:
+        return ActionBundle(main=MainAction(MainActionType.CLAIM_RESOURCE, target=resource.station, resource_type=resource.resource_type), squad=squad)
 
     def _update_station_tracking(self, state: GameState) -> None:
         station = state.me.station
