@@ -28,9 +28,8 @@ if not "%~2"=="" set "BLUE_PLAYER_ID=%~2"
 if not "%~3"=="" set "HOST=%~3"
 if not "%~4"=="" set "PORT=%~4"
 
-rem Keep playerName distinct because some local debug servers deduplicate by name.
-set "RED_PLAYER_NAME=%TEAM_NAME%-%RED_PLAYER_ID%"
-set "BLUE_PLAYER_NAME=%TEAM_NAME%-%BLUE_PLAYER_ID%"
+set "RED_PLAYER_NAME=%TEAM_NAME%"
+set "BLUE_PLAYER_NAME=%TEAM_NAME%"
 
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>nul
 
