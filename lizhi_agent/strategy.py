@@ -323,9 +323,6 @@ class BaselineStrategy:
         pre_move_resource = self._pre_move_resource_action(state)
         if pre_move_resource is not None:
             return done(pre_move_resource, "use_route_resource")
-        contest_action = self._opportunistic_guard_action(state)
-        if contest_action is not None:
-            return done(contest_action, "opportunistic_guard")
         if self._should_lock_delivery(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_quality_delivery_first")
             scout = self._squad_scout_action(state)
@@ -337,6 +334,9 @@ class BaselineStrategy:
         route_resource = self._best_reachable_resource(state)
         if route_resource is not None:
             return done(self._move_towards_node(state, route_resource.station, squad=scout), f"move_to_resource:{route_resource.resource_type}")
+        contest_action = self._opportunistic_guard_action(state)
+        if contest_action is not None:
+            return done(contest_action, "opportunistic_guard")
         return done(self._move_towards_delivery(state, squad=scout), "move_towards_delivery")
 
     def _learn_from_feedback(self, state: GameState) -> None:

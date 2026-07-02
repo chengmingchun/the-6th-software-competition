@@ -488,6 +488,30 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.squad.action, SquadActionType.SQUAD_REINFORCE)
         self.assertEqual(action.squad.to_action()["targetNodeId"], "S03")
 
+    def test_guard_trap_does_not_preempt_reachable_task(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S03", task_score_base=120, good_fruit=95),
+            opponent=PlayerState(player_id="2002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S02", task_score_base=90),
+            edges=[
+                RouteEdge(id="O1", start="S02", end="S03", distance=1),
+                RouteEdge(id="O2", start="S03", end="S14", distance=4),
+                RouteEdge(id="T1", start="S03", end="S05", distance=1),
+                RouteEdge(id="T2", start="S05", end="S14", distance=2),
+                RouteEdge(id="M1", start="S03", end="S04", distance=1),
+                RouteEdge(id="M2", start="S04", end="S14", distance=1),
+            ],
+            stations={"S03": Station(id="S03")},
+            tasks=[TaskInstance(id="rich-task", template="T08", target="S05", score=45, process_frames=4)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S05")
+
     def test_guard_trap_skips_endgame(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
