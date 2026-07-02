@@ -6,10 +6,13 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class StrategyConfig:
     target_task_score: int = 90
-    greed_task_score: int = 110
+    competitive_task_score: int = 130
+    greed_task_score: int = 150
     endgame_buffer_frames: int = 45
     max_task_detour_frames: int = 18
+    max_competitive_task_detour_frames: int = 34
     max_resource_detour_frames: int = 8
+    max_valuable_resource_detour_frames: int = 18
     station_stall_frames: int = 18
     station_escape_frames: int = 36
     object_cooldown_frames: int = 30

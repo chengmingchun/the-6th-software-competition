@@ -257,7 +257,7 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
 
-    def test_repeated_window_abstains_after_short_fight(self) -> None:
+    def test_repeated_window_suppresses_after_hard_limit(self) -> None:
         window = WindowState(
             id="contest-1",
             window_type="TASK",
@@ -276,7 +276,8 @@ class BaselineStrategyTest(unittest.TestCase):
         )
         self.assertNotEqual(self.strategy.decide(base).window.card, WindowCard.ABSTAIN)
         self.assertNotEqual(self.strategy.decide(base).window.card, WindowCard.ABSTAIN)
-        self.assertEqual(self.strategy.decide(base).window.card, WindowCard.ABSTAIN)
+        self.assertIsNotNone(self.strategy.decide(base).window)
+        self.assertIsNone(self.strategy.decide(base).window)
 
     def test_opening_window_uses_mixed_cards(self) -> None:
         cards = set()

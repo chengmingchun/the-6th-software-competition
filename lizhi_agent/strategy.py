@@ -258,7 +258,10 @@ class BaselineStrategy:
         fixed_process = self._fixed_process_action(state)
         if fixed_process is not None:
             return done(fixed_process, "fixed_process")
-        if self._need_endgame(state) or self._opponent_pressure(state) or me.task_score_base >= self.config.target_task_score:
+        pre_move_resource = self._pre_move_resource_action(state)
+        if pre_move_resource is not None:
+            return done(pre_move_resource, "use_route_resource")
+        if self._need_endgame(state) or self._opponent_pressure(state) or self._should_lock_delivery(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_deadline_delivery_first")
             scout = self._squad_scout_action(state)
             return done(self._move_towards_delivery(state, squad=scout), "delivery_guard")
@@ -521,6 +524,25 @@ class BaselineStrategy:
         if me.freshness <= self.config.low_freshness_threshold and (me.task_score_base >= self.config.target_task_score // 2 or self._need_endgame(state)):
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_scoring_run", freshness=me.freshness, taskScore=me.task_score_base)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        if me.freshness <= 82 and (me.task_score_base >= self.config.target_task_score or state.turns_left < 320):
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_quality_before_delivery", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        return None
+
+    def _pre_move_resource_action(self, state: GameState) -> ActionBundle | None:
+        me = state.me
+        if me.status not in PLANNING_STATES or me.station is None:
+            return None
+        if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED"):
+            return None
+        target = self._current_route_objective(state)
+        remaining_cost = self.route_planner.estimate_frames(state, me.station, target)
+        if remaining_cost >= 6 and me.has_resource("FAST_HORSE"):
+            self.logger.info("resource_use", resourceType="FAST_HORSE", reason="pre_move_long_route", target=target, remainingCost=remaining_cost)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="FAST_HORSE"))
+        if remaining_cost >= 4 and me.has_resource("SHORT_HORSE") and (me.task_score_base >= self.config.target_task_score or state.turns_left < 360):
+            self.logger.info("resource_use", resourceType="SHORT_HORSE", reason="pre_move_medium_route", target=target, remainingCost=remaining_cost)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="SHORT_HORSE"))
         return None
 
     def _moving_horse_action(self, state: GameState) -> ActionBundle | None:
@@ -578,7 +600,9 @@ class BaselineStrategy:
         self.logger.info("task_eval_station", station=state.me.station, candidates=[{"taskId": t.id, "template": t.template, "score": t.score, "processFrames": t.process_frames, "rank": score(t)} for t in tasks], chosen=best.id)
         if state.me.task_score_base < self.config.target_task_score:
             return best
-        if best.score >= 30 and not self._need_endgame(state):
+        if state.me.task_score_base < self.config.competitive_task_score and best.score >= 30 and not self._need_endgame(state):
+            return best
+        if best.score >= 45 and best.process_frames <= 6 and not self._need_endgame(state):
             return best
         return None
 
@@ -599,7 +623,7 @@ class BaselineStrategy:
         return chosen
 
     def _best_reachable_task(self, state: GameState) -> TaskInstance | None:
-        if state.me.task_score_base >= self.config.target_task_score or state.me.station is None:
+        if state.me.task_score_base >= self.config.greed_task_score or state.me.station is None:
             return None
         direct = self.route_planner.estimate_frames(state, state.me.station, state.gate_node)
         candidates: list[tuple[int, TaskInstance, int, int, int]] = []
@@ -612,8 +636,14 @@ class BaselineStrategy:
             to_gate = self.route_planner.estimate_frames(state, task.target, state.gate_node)
             detour = to_task + task.process_frames + to_gate - direct
             max_detour = self.config.max_task_detour_frames + (12 if task.score >= 30 else 0)
+            if state.me.task_score_base >= self.config.target_task_score and task.score >= 30:
+                max_detour = max(max_detour, self.config.max_competitive_task_detour_frames)
             if detour <= max_detour:
-                value = task.score * 4 - max(0, detour) + (40 if task.score >= 30 else 0)
+                value = task.score * 4 - max(0, detour)
+                if task.score >= 30:
+                    value += 40
+                if state.me.task_score_base >= self.config.target_task_score:
+                    value += 20
                 candidates.append((value, task, detour, to_task, to_gate))
         if not candidates:
             self.logger.info("task_eval_reachable", directToGate=direct, candidates=[])
@@ -639,7 +669,10 @@ class BaselineStrategy:
             to_res = self.route_planner.estimate_frames(state, state.me.station, stock.station)
             to_gate = self.route_planner.estimate_frames(state, stock.station, state.gate_node)
             detour = to_res + stock.claim_frames + to_gate - direct
-            if detour <= self.config.max_resource_detour_frames:
+            max_detour = self.config.max_resource_detour_frames
+            if stock.resource_type in {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE"}:
+                max_detour = max(max_detour, self.config.max_valuable_resource_detour_frames)
+            if detour <= max_detour:
                 candidates.append((100 - priority[stock.resource_type] * 10 - max(0, detour), stock, detour))
         if not candidates:
             self.logger.info("resource_eval_reachable", directToGate=direct, candidates=[])
@@ -678,7 +711,7 @@ class BaselineStrategy:
 
     def _scout_objective(self, state: GameState) -> str:
         me = state.me
-        if self._need_endgame(state) or self._opponent_pressure(state) or me.task_score_base >= self.config.target_task_score:
+        if self._need_endgame(state) or self._opponent_pressure(state) or self._should_lock_delivery(state):
             return state.terminal_node if me.verified else state.gate_node
         route_task = self._best_reachable_task(state)
         if route_task is not None:
@@ -687,6 +720,25 @@ class BaselineStrategy:
         if route_resource is not None:
             return route_resource.station
         return state.terminal_node if me.verified else state.gate_node
+
+    def _current_route_objective(self, state: GameState) -> str:
+        if self._need_endgame(state) or self._opponent_pressure(state) or self._should_lock_delivery(state):
+            return state.terminal_node if state.me.verified else state.gate_node
+        route_task = self._best_reachable_task(state)
+        if route_task is not None:
+            return route_task.target
+        route_resource = self._best_reachable_resource(state)
+        if route_resource is not None:
+            return route_resource.station
+        return state.terminal_node if state.me.verified else state.gate_node
+
+    def _should_lock_delivery(self, state: GameState) -> bool:
+        me = state.me
+        if me.task_score_base >= self.config.competitive_task_score:
+            return True
+        if me.good_fruit < 78 or me.freshness < 68:
+            return me.task_score_base >= self.config.target_task_score
+        return False
 
     def _scout_path_candidates(self, state: GameState, objective: str, forbidden: set[str]) -> list[str]:
         plan = self.route_planner.plan(state, state.me.station, objective)
