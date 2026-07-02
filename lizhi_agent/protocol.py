@@ -5,6 +5,7 @@ import os
 import socket
 import sys
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, BinaryIO, Protocol
 
 from lizhi_agent.actions import ActionBundle, wait
@@ -44,6 +45,14 @@ def _raw_payload_logging_enabled() -> bool:
 
 def _fixture_logging_enabled() -> bool:
     return os.environ.get("LIZHI_FIXTURE_LOG", "1") != "0"
+
+
+def _fixture_log_path(player_id: str) -> str:
+    explicit = os.environ.get("LIZHI_FIXTURE_LOG_PATH")
+    if explicit:
+        return explicit
+    log_dir = os.environ.get("LIZHI_LOG_DIR", "logs")
+    return os.path.join(log_dir, f"{player_id}.fixtures.jsonl")
 
 
 @dataclass
@@ -285,15 +294,23 @@ class CompetitionClient:
         if not _fixture_logging_enabled():
             return
         response_data = response.get("msg_data") if isinstance(response.get("msg_data"), dict) else {}
-        self.logger.info(
-            "fixture_frame",
-            round=inquire_data.get("round"),
-            playerId=self.context.player_id,
-            matchId=self.context.match_id,
-            startData=self.context.start_data,
-            inquireData=inquire_data,
-            expectedActions=response_data.get("actions", []),
-        )
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event": "fixture_frame",
+            "round": inquire_data.get("round"),
+            "playerId": self.context.player_id,
+            "matchId": self.context.match_id,
+            "startData": self.context.start_data,
+            "inquireData": inquire_data,
+            "expectedActions": response_data.get("actions", []),
+        }
+        path = _fixture_log_path(self.context.player_id)
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fixture_file:
+                fixture_file.write(json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str) + "\n")
+        except Exception as exc:
+            self.logger.info("fixture_log_error", error=repr(exc), path=path, round=inquire_data.get("round"))
 
     def _log_inbound(self, payload: dict[str, Any]) -> None:
         msg_name = payload.get("msg_name") or payload.get("type")
