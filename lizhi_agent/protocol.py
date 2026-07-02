@@ -42,6 +42,10 @@ def _raw_payload_logging_enabled() -> bool:
     return os.environ.get("LIZHI_RAW_LOG", "1") != "0"
 
 
+def _fixture_logging_enabled() -> bool:
+    return os.environ.get("LIZHI_FIXTURE_LOG", "1") != "0"
+
+
 @dataclass
 class ProtocolContext:
     """State learned from protocol messages and reused for every frame."""
@@ -255,7 +259,9 @@ class CompetitionClient:
             state = parse_game_state(self.context.player_id, self.context.start_data, msg_data)
             self.context.last_round = state.frame
             bundle = self.strategy.decide(state)
-            return self._action_message(bundle)
+            response = self._action_message(bundle)
+            self._log_replay_fixture(msg_data, response)
+            return response
 
         if msg_name == "over":
             self.logger.info("over", result=msg_data, payloadPreview=_preview(payload, 3000))
@@ -274,6 +280,20 @@ class CompetitionClient:
             self.context.sent_ready = True
         elif msg_name == "action":
             self.context.sent_actions += 1
+
+    def _log_replay_fixture(self, inquire_data: dict[str, Any], response: dict[str, Any]) -> None:
+        if not _fixture_logging_enabled():
+            return
+        response_data = response.get("msg_data") if isinstance(response.get("msg_data"), dict) else {}
+        self.logger.info(
+            "fixture_frame",
+            round=inquire_data.get("round"),
+            playerId=self.context.player_id,
+            matchId=self.context.match_id,
+            startData=self.context.start_data,
+            inquireData=inquire_data,
+            expectedActions=response_data.get("actions", []),
+        )
 
     def _log_inbound(self, payload: dict[str, Any]) -> None:
         msg_name = payload.get("msg_name") or payload.get("type")
@@ -378,20 +398,3 @@ class CompetitionClient:
                 "actions": bundle.to_actions(),
             },
         }
-
-
-class _Duplex:
-    """Expose one read/write object for LengthPrefixedCodec tests."""
-
-    def __init__(self, reader: BinaryIO, writer: BinaryIO) -> None:
-        self.reader = reader
-        self.writer = writer
-
-    def read(self, size: int) -> bytes:
-        return self.reader.read(size)
-
-    def write(self, data: bytes) -> int:
-        return self.writer.write(data)
-
-    def flush(self) -> None:
-        self.writer.flush()
