@@ -22,6 +22,8 @@ class DecisionLogger:
         self.file_enabled = os.environ.get("LIZHI_FILE_LOG", "0") == "1"
         self.style = os.environ.get("LIZHI_LOG_STYLE", "pretty").lower()
         self.stage_banner_enabled = os.environ.get("LIZHI_STAGE_BANNER", "1") != "0"
+        self.received_detail_enabled = os.environ.get("LIZHI_RECEIVED_DETAIL", "1") != "0"
+        self.full_payload_enabled = os.environ.get("LIZHI_FULL_RECV_LOG", "0") == "1"
         self._file = None
         self._last_round: Any = None
         self._last_stage: str | None = None
@@ -126,10 +128,13 @@ class DecisionLogger:
         return f"[报名] 提交队伍身份 playerId={fields.get('playerId')}"
 
     def _fmt_recv_message(self, fields: dict[str, Any]) -> str:
-        return (
+        base = (
             f"[收信] 收到 {fields.get('msgName')} | 阶段={fields.get('phase')} "
             f"任务={fields.get('tasks')} 窗口={fields.get('contests')} 事件={fields.get('events')}"
         )
+        if self.full_payload_enabled and fields.get("payloadPreview"):
+            return base + "\n    [原始入包预览] " + self._json_short(fields.get("payloadPreview"), 12000)
+        return base
 
     def _fmt_send_message(self, fields: dict[str, Any]) -> str:
         actions = fields.get("actions") or []
@@ -160,11 +165,27 @@ class DecisionLogger:
         player = fields.get("myPlayer")
         node = player.get("currentNodeId") if isinstance(player, dict) else None
         state = player.get("state") if isinstance(player, dict) else None
-        return (
+        tasks = fields.get("tasks") or []
+        contests = fields.get("contests") or []
+        events = fields.get("events") or []
+        action_results = fields.get("actionResults") or []
+        lines = [
             f"[局势] 我方状态={state} 位置={node} "
-            f"任务={len(fields.get('tasks') or [])} 窗口={len(fields.get('contests') or [])} "
-            f"事件={len(fields.get('events') or [])} 结果={len(fields.get('actionResults') or [])}"
-        )
+            f"任务={len(tasks) if isinstance(tasks, list) else tasks} "
+            f"窗口={len(contests) if isinstance(contests, list) else contests} "
+            f"事件={len(events) if isinstance(events, list) else events} "
+            f"结果={len(action_results) if isinstance(action_results, list) else action_results}"
+        ]
+        if self.received_detail_enabled:
+            if isinstance(player, dict):
+                lines.append("    [收到.myPlayer] " + self._json_short(player, 3000))
+            if isinstance(action_results, list) and action_results:
+                lines.append("    [收到.actionResults] " + self._json_short(action_results, 6000))
+            if isinstance(events, list) and events:
+                lines.append("    [收到.events] " + self._json_short(events, 6000))
+            if isinstance(contests, list) and contests:
+                lines.append("    [收到.contests] " + self._json_short(contests, 4000))
+        return "\n".join(lines)
 
     def _fmt_handle_message(self, fields: dict[str, Any]) -> str:
         return f"[分拣] 处理 {fields.get('msgName')}，字段={fields.get('msgDataKeys')}"
@@ -174,6 +195,14 @@ class DecisionLogger:
 
     def _fmt_state_snapshot(self, fields: dict[str, Any]) -> str:
         resources = fields.get("resources") or {}
+        extras = []
+        if fields.get("forcedProcessNodes"):
+            extras.append(f"强制处理={fields.get('forcedProcessNodes')}")
+        if fields.get("completedProcessNodes"):
+            extras.append(f"已处理={fields.get('completedProcessNodes')}")
+        if fields.get("rejectedProcessNodes"):
+            extras.append(f"处理拒绝={fields.get('rejectedProcessNodes')}")
+        extra_text = " | " + " ".join(extras) if extras else ""
         return (
             f"[车队] 状态={fields.get('status')}({fields.get('stateClass')}) "
             f"位置={fields.get('station')} 目标={fields.get('target')} "
@@ -183,12 +212,15 @@ class DecisionLogger:
             f"库存={self._stock_text(resources)} | "
             f"任务={fields.get('tasks')} 资源点={fields.get('resourcesOnMap')} 窗口={fields.get('windows')} | "
             f"到宫门≈{self._cost(fields.get('gateCost'))}帧 剩余={fields.get('turnsLeft')}帧"
+            f"{extra_text}"
         )
 
     def _fmt_feedback_learn(self, fields: dict[str, Any]) -> str:
         learned = fields.get("learned")
+        if learned == "process_required":
+            return f"[回执] 服务端要求先固定处理：{fields.get('nodeId')} code={fields.get('code')}，下一帧强制 PROCESS"
         if learned == "fixed_process_completed":
-            return f"[回执] 固定处理完成：{fields.get('nodeId')}，本次到站不再重复 PROCESS"
+            return f"[回执] 我方固定处理完成：{fields.get('nodeId')}，本次到站不再重复 PROCESS"
         if learned == "fixed_process_rejected":
             return f"[回执] 固定处理被拒：{fields.get('nodeId')} code={fields.get('code')}，加入跳过列表"
         if learned == "task_rejected":
@@ -197,8 +229,22 @@ class DecisionLogger:
             return f"[回执] 资源领取被拒：{fields.get('nodeId')} {fields.get('resourceType')} code={fields.get('code')}，加入冷却"
         return f"[回执] learned={learned} | {self._short(fields)}"
 
+    def _fmt_feedback_ignore(self, fields: dict[str, Any]) -> str:
+        reason = fields.get("reason")
+        preview = fields.get("eventPreview") or fields.get("resultPreview") or ""
+        return f"[回执] 忽略非我方反馈 reason={reason} | {preview}"
+
+    def _fmt_action_result(self, fields: dict[str, Any]) -> str:
+        return (
+            f"[收到.actionResult] action={fields.get('action')} accepted={fields.get('accepted')} "
+            f"success={fields.get('success')} code={fields.get('code')} "
+            f"node={fields.get('nodeId')} task={fields.get('taskId')} resource={fields.get('resourceType')} | "
+            f"raw={self._json_short(fields.get('raw'), 4000)}"
+        )
+
     def _fmt_fixed_process_eval(self, fields: dict[str, Any]) -> str:
-        return f"[处理] 当前站 {fields.get('station')} 需要 {fields.get('processType')}，准备提交 {fields.get('action')}"
+        reason = f" 原因={fields.get('reason')}" if fields.get("reason") else ""
+        return f"[处理] 当前站 {fields.get('station')} 需要 {fields.get('processType')}，准备提交 {fields.get('action')}{reason}"
 
     def _fmt_fixed_process_skip(self, fields: dict[str, Any]) -> str:
         return f"[处理] 跳过 {fields.get('station')} 的 {fields.get('processType')}，原因={fields.get('reason')}"
@@ -350,3 +396,13 @@ class DecisionLogger:
     def _short(self, value: Any) -> str:
         text = str(value)
         return text if len(text) <= 240 else text[:237] + "..."
+
+    def _json_short(self, value: Any, limit: int = 3000) -> str:
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+            except Exception:
+                text = str(value)
+        return text if len(text) <= limit else text[:limit] + f"...<truncated {len(text) - limit} chars>"
