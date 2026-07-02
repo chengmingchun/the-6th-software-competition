@@ -44,10 +44,16 @@ Windows 本地调试可以使用：
 start.bat <playerId> <host> <port>
 ```
 
+例如连接本地调试服务端：
+
+```bat
+start.bat 2779 127.0.0.1 30000
+```
+
 也可以直接双击 `start.bat`，进入菜单：
 
-1. 手动输入 `playerId / host / port` 连接远程服务端。
-2. 用默认参数 `2779 / 7.225.86.238 / 6001` 连接远程服务端。
+1. 连接本地调试服务端：默认 `2779 / 127.0.0.1 / 30000`。
+2. 手动输入 `playerId / host / port` 连接。
 3. 跑本地 fixture，不连服务端，只验证 `start -> ready -> inquire -> action`。
 4. 跑单元测试。
 
@@ -131,7 +137,7 @@ LIZHI_VERSION=1.0   # 覆盖 registration.version
 推荐排障启动方式：
 
 ```bash
-LIZHI_DEBUG=1 LIZHI_RAW_LOG=1 LIZHI_FILE_LOG=1 ./start.sh 2779 7.225.86.238 6001
+LIZHI_DEBUG=1 LIZHI_RAW_LOG=1 LIZHI_FILE_LOG=1 ./start.sh 2779 127.0.0.1 30000
 ```
 
 如果看到 `start` 后立刻 `server_closed`，重点检查 `send_message` 里 `msgName=ready` 的 `msgData`、`bodyBytes`、`payloadPreview`，以及 `server_closed` 里的 `sentReady/startReceived/lastRound`。
