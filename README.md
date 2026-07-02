@@ -13,7 +13,10 @@
 ```text
 .
 ├── start.sh
+├── start.bat
 ├── main.py
+├── fixtures/
+│   └── minimal_start_inquire.jsonl
 ├── lizhi_agent/
 │   ├── actions.py        # 官方 actions[] 动作结构
 │   ├── config.py         # 策略阈值和资源优先级
@@ -41,6 +44,28 @@ Windows 本地调试可以使用：
 start.bat <playerId> <host> <port>
 ```
 
+也可以直接双击 `start.bat`，进入菜单：
+
+1. 手动输入 `playerId / host / port` 连接远程服务端。
+2. 用默认参数 `2779 / 7.225.86.238 / 6001` 连接远程服务端。
+3. 跑本地 fixture，不连服务端，只验证 `start -> ready -> inquire -> action`。
+4. 跑单元测试。
+
+双击菜单模式会默认开启：
+
+```bat
+LIZHI_DEBUG=1
+LIZHI_RAW_LOG=1
+LIZHI_FILE_LOG=1
+LIZHI_VERSION=1.0
+```
+
+日志会输出到窗口，也会写入：
+
+```text
+logs/<playerId>.jsonl
+```
+
 本地可以运行单元测试：
 
 ```bash
@@ -50,7 +75,7 @@ python -m unittest
 也可以用 JSON Lines 走本地调试入口：
 
 ```bash
-python main.py 1001
+python main.py 1001 < fixtures/minimal_start_inquire.jsonl
 ```
 
 正式比赛时必须传入 `host` 和 `port`，客户端会使用官方格式：
