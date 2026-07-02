@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 import unittest
 
-from lizhi_agent.actions import MainActionType
+from lizhi_agent.actions import MainActionType, WindowCard
 from lizhi_agent.config import StrategyConfig
 from lizhi_agent.logger import DecisionLogger
-from lizhi_agent.models import GameState, PlayerState, RouteEdge, TaskInstance, ResourceStock, ConvoyStatus
+from lizhi_agent.models import GameState, PlayerState, RouteEdge, TaskInstance, ResourceStock, ConvoyStatus, WindowState
+from lizhi_agent.protocol import FrameCodec
 from lizhi_agent.strategy import BaselineStrategy
 
 
@@ -24,20 +26,22 @@ class BaselineStrategyTest(unittest.TestCase):
     def test_deliver_when_at_s15_verified(self) -> None:
         state = GameState(
             frame=500,
-            phase="ENDGAME",
+            phase="RUSH",
             me=PlayerState(player_id="p0", status=ConvoyStatus.IDLE, station="S15", verified=True),
         )
         action = self.strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.DELIVER)
+        self.assertEqual(action.to_actions(), [{"action": "DELIVER"}])
 
     def test_verify_when_at_s14(self) -> None:
         state = GameState(
             frame=430,
-            phase="ENDGAME",
+            phase="RUSH",
             me=PlayerState(player_id="p0", status=ConvoyStatus.IDLE, station="S14", verified=False),
         )
         action = self.strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.VERIFY_GATE)
+        self.assertEqual(action.to_actions(), [{"action": "VERIFY_GATE", "targetNodeId": "S14"}])
 
     def test_claim_valuable_task_before_90_score(self) -> None:
         state = GameState(
@@ -48,7 +52,7 @@ class BaselineStrategyTest(unittest.TestCase):
         )
         action = self.strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.CLAIM_TASK)
-        self.assertEqual(action.main.task_id, "task-1")
+        self.assertEqual(action.to_actions(), [{"action": "CLAIM_TASK", "taskId": "task-1"}])
 
     def test_claim_priority_resource(self) -> None:
         state = GameState(
@@ -62,7 +66,18 @@ class BaselineStrategyTest(unittest.TestCase):
         )
         action = self.strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.CLAIM_RESOURCE)
-        self.assertEqual(action.main.resource_type, "ICE_BOX")
+        self.assertEqual(action.to_actions(), [{"action": "CLAIM_RESOURCE", "targetNodeId": "S03", "resourceType": "ICE_BOX"}])
+
+    def test_window_card_protocol_action(self) -> None:
+        state = GameState(
+            frame=120,
+            phase="NORMAL",
+            me=PlayerState(player_id="p0", status=ConvoyStatus.IDLE, station="S03", guard_points=1),
+            windows=[WindowState(id="C1", window_type="RESOURCE", target="S03", active=True, my_turn=True)],
+        )
+        action = self.strategy.decide(state)
+        self.assertEqual(action.window.card, WindowCard.BING_ZHENG)
+        self.assertEqual(action.to_actions(), [{"action": "WINDOW_CARD", "contestId": "C1", "card": "BING_ZHENG"}])
 
     def test_move_towards_s14(self) -> None:
         state = GameState(
@@ -73,7 +88,17 @@ class BaselineStrategyTest(unittest.TestCase):
         )
         action = self.strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.MOVE)
-        self.assertEqual(action.main.target, "S02")
+        self.assertEqual(action.to_actions(), [{"action": "MOVE", "targetNodeId": "S02"}])
+
+
+class FrameCodecTest(unittest.TestCase):
+    def test_length_prefixed_round_trip(self) -> None:
+        payload = {"msg_name": "action", "msg_data": {"matchId": "m1", "round": 1, "playerId": 1001, "actions": []}}
+        encoded = FrameCodec.encode(payload)
+        self.assertEqual(len(encoded[:5]), 5)
+        self.assertTrue(encoded[:5].isdigit())
+        decoded = FrameCodec.read(io.BytesIO(encoded))
+        self.assertEqual(decoded, payload)
 
 
 if __name__ == "__main__":
