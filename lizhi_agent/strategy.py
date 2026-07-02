@@ -68,6 +68,11 @@ class WindowStrategy:
     def choose(self, state: GameState, window: WindowState, config: StrategyConfig) -> WindowChoice:
         me = state.me
         high_value = window.window_type in {"GATE", "TASK", "PASS"} or window.resource_type in {"FAST_HORSE", "ICE_BOX"}
+        opponent_card = self._opponent_revealed_card(state, window)
+        if opponent_card is not None:
+            counter = self._counter_card(state, opponent_card, high_value)
+            if counter is not None:
+                return WindowChoice(counter, "COUNTER_LAST_CARD", f"counter previous opponent card {opponent_card.value}")
         if self._is_opening_fight(state, window, config):
             options = self._opening_options(state, high_value)
             card, roll = self._weighted_pick(state, window, options)
@@ -131,6 +136,40 @@ class WindowStrategy:
 
     def _options_text(self, options: list[tuple[WindowCard, int]]) -> str:
         return ",".join(f"{card.value}:{weight}" for card, weight in options)
+
+    def _opponent_revealed_card(self, state: GameState, window: WindowState) -> WindowCard | None:
+        cards = window.raw.get("cards")
+        if not isinstance(cards, dict) or not cards:
+            return None
+        my_team = str(state.me.team_id or "")
+        for owner, card_value in cards.items():
+            if my_team and str(owner) == my_team:
+                continue
+            try:
+                return WindowCard(str(card_value))
+            except ValueError:
+                continue
+        return None
+
+    def _counter_card(self, state: GameState, opponent_card: WindowCard, high_value: bool) -> WindowCard | None:
+        me = state.me
+        if opponent_card == WindowCard.YAN_DIE:
+            if me.guard_points > 0:
+                return WindowCard.BING_ZHENG
+            if high_value and me.freshness >= 82 and me.good_fruit >= 75:
+                return WindowCard.XIAN_GONG
+        if opponent_card == WindowCard.QIANG_XING:
+            if me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT"):
+                return WindowCard.YAN_DIE
+            if me.guard_points > 0:
+                return WindowCard.BING_ZHENG
+        if opponent_card == WindowCard.XIAN_GONG:
+            if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE"):
+                return WindowCard.QIANG_XING
+        if opponent_card == WindowCard.BING_ZHENG:
+            if high_value and me.freshness >= 85 and me.good_fruit >= 85:
+                return WindowCard.XIAN_GONG
+        return None
 
 
 class BaselineStrategy:

@@ -304,6 +304,52 @@ class BaselineStrategyTest(unittest.TestCase):
         )
         self.assertEqual(self.strategy.decide(state).window.card, WindowCard.BING_ZHENG)
 
+    def test_window_counters_revealed_bing_zheng_with_xian_gong(self) -> None:
+        state = GameState(
+            frame=90,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S02", good_fruit=95, freshness=95),
+            windows=[
+                WindowState(
+                    id="contest-counter",
+                    window_type="TASK",
+                    target="S02",
+                    active=True,
+                    my_turn=True,
+                    round_index=2,
+                    raw={"cards": {"RED": "BING_ZHENG", "BLUE": "BING_ZHENG"}},
+                )
+            ],
+        )
+        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.XIAN_GONG)
+
+    def test_window_uses_document_to_counter_qiang_xing(self) -> None:
+        state = GameState(
+            frame=90,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(
+                player_id="1001",
+                team_id="RED",
+                status=ConvoyStatus.IDLE,
+                station="S02",
+                resources={"PASS_TOKEN": 1},
+            ),
+            windows=[
+                WindowState(
+                    id="contest-counter-doc",
+                    window_type="PASS",
+                    target="S02",
+                    active=True,
+                    my_turn=True,
+                    round_index=2,
+                    raw={"cards": {"RED": "BING_ZHENG", "BLUE": "QIANG_XING"}},
+                )
+            ],
+        )
+        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.YAN_DIE)
+
 
 class ProtocolCodecTest(unittest.TestCase):
     def test_length_prefixed_codec_roundtrip(self) -> None:
