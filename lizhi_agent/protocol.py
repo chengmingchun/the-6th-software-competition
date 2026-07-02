@@ -13,6 +13,8 @@ from lizhi_agent.logger import DecisionLogger
 from lizhi_agent.models import parse_game_state
 from lizhi_agent.strategy import BaselineStrategy
 
+DEFAULT_PLAYER_NAME = "嘉然在送荔枝"
+
 
 def _player_id_value(player_id: str) -> int | str:
     try:
@@ -390,7 +392,7 @@ class CompetitionClient:
             "msg_name": "registration",
             "msg_data": {
                 "playerId": _player_id_value(self.context.player_id),
-                "playerName": os.environ.get("LIZHI_PLAYER_NAME", "lizhi-python-baseline"),
+                "playerName": os.environ.get("LIZHI_PLAYER_NAME", DEFAULT_PLAYER_NAME),
                 "version": os.environ.get("LIZHI_VERSION", "1.0"),
             },
         }
