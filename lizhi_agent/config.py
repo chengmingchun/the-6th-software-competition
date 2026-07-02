@@ -21,7 +21,10 @@ class StrategyConfig:
         "OFFICIAL_PERMIT",
         "BOAT_RIGHT",
     )
-    scout_targets: tuple[str, ...] = ("S14", "S13", "S11", "S10", "S08")
+    # Scout only mid/late route information nodes. Do not put gate/terminal
+    # here: S14/S15 are mandatory and usually already known, so scouting them
+    # on round 1 wastes a scarce squad action.
+    scout_targets: tuple[str, ...] = ("S08", "S10", "S11", "S13", "S07")
 
     @staticmethod
     def default() -> "StrategyConfig":
