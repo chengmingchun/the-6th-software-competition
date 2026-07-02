@@ -1,12 +1,12 @@
 # 一骑红尘：荔枝争运战 Python Baseline
 
-这是一个面向《一骑红尘：荔枝争运战》的基础参赛客户端。目标不是一次写满所有博弈策略，而是先提供一个稳定、可解释、可继续迭代的框架：
+这是一个面向《一骑红尘：荔枝争运战》的基础参赛客户端。目标是先做一个稳定、可解释、可继续迭代的框架：
 
 - 按官方 TCP 协议接入比赛服务端。
 - 每帧可靠回包，避免失联退赛。
 - 本地解析地图、状态、任务、资源、窗口和事件。
 - 使用动态路线规划和保守策略完成验核、交付、顺路任务与资源获取。
-- 代码按层拆分，方便后续增强抢资源、设卡、窗口博弈和小分队策略。
+- 日志尽量像“比赛复盘旁白”，方便根据比赛日志继续调策略。
 
 ## 文件结构
 
@@ -14,9 +14,12 @@
 .
 ├── start.sh
 ├── start.bat
+├── start_local_dual.bat
 ├── main.py
 ├── fixtures/
 │   └── minimal_start_inquire.jsonl
+├── tools/
+│   └── protocol_self_check.py
 ├── lizhi_agent/
 │   ├── actions.py        # 官方 actions[] 动作结构
 │   ├── config.py         # 策略阈值和资源优先级
@@ -44,58 +47,68 @@ Windows 本地调试可以使用：
 start.bat <playerId> <host> <port>
 ```
 
-例如连接本地调试服务端：
+也可以直接双击 `start.bat` 进入菜单：
 
-```bat
-start.bat 2779 127.0.0.1 30000
-```
-
-也可以直接双击 `start.bat`，进入菜单：
-
-1. 连接本地调试服务端：默认 `2779 / 127.0.0.1 / 30000`。
-2. 手动输入 `playerId / host / port` 连接。
-3. 跑本地 fixture，不连服务端，只验证 `start -> ready -> inquire -> action`。
+1. 连接本地调试服务端，默认 `2779 / 127.0.0.1 / 30000`。
+2. 手动输入 `playerId / host / port`。
+3. 跑本地 fixture，只验证 `start -> ready -> inquire -> action`。
 4. 跑单元测试。
 
-双击菜单模式会默认开启：
+双开本地调试可以用：
 
 ```bat
-LIZHI_DEBUG=1
-LIZHI_RAW_LOG=1
-LIZHI_FILE_LOG=1
-LIZHI_VERSION=1.0
+start_local_dual.bat
 ```
 
-日志会输出到窗口，也会写入：
-
-```text
-logs/<playerId>.jsonl
-```
-
-本地可以运行单元测试：
-
-```bash
-python -m unittest
-```
-
-也可以用 JSON Lines 走本地调试入口：
+本地跑 fixture：
 
 ```bash
 python main.py 1001 < fixtures/minimal_start_inquire.jsonl
 ```
 
-正式比赛时必须传入 `host` 和 `port`，客户端会使用官方格式：
+协议自检：
+
+```bash
+python tools/protocol_self_check.py
+```
+
+单元测试：
+
+```bash
+python -m unittest
+```
+
+## 官方协议
+
+正式比赛使用：
 
 ```text
+TCP Socket
 5 位十进制长度前缀 + UTF-8 JSON body
+registration -> start -> ready -> inquire/action -> over
 ```
+
+客户端连接后会自动发送 `registration`，收到 `start` 后缓存 `matchId / nodes / edges / resources / taskTemplates / map.gameplay`，随后发送 `ready`。每次收到 `inquire.round=N` 后，会发送 `action.round=N`。
+
+## 地图信息读取
+
+策略不硬编码地图，而是读取服务端下发的开局和每帧状态：
+
+- `start.nodes[]` / `inquire.nodes[]`：站点、处理点、障碍、设卡、资源库存。
+- `start.edges[]` / `inquire.edges[]`：路线端点、路线类型、距离、是否双向。
+- `start.map.gameplay.roles`：起点、宫门、终点。
+- `start.map.gameplay.resources`：资源点和领取帧数。
+- `inquire.tasks[]`：当前活跃皇榜任务。
+- `inquire.contests[]`：窗口争夺。
+
+`route_planner.py` 用路线类型和距离估算移动成本；遇到障碍或敌方设卡，会给路线增加惩罚，尽量绕开麻烦点。
 
 ## 当前基础策略
 
 每帧按以下优先级决策：
 
 1. 如果有本方参与的窗口争夺，提交一张窗口牌。
-2. 如果已交付、退赛、移动中或读条中，发送安全心跳，不打断当前过程。
+2. 如果已交付、退赛、移动中或读条中，发送安全心跳，不乱打断。
 3. 鲜度过低且有冰鉴时，优先使用 `ICE_BOX`。
 4. 在 S15 且已验核时提交 `DELIVER`。
 5. 在 S14 且进入 `RUSH` 阶段时提交 `VERIFY_GATE`，可绑定 `BREAK_ORDER`。
@@ -109,8 +122,6 @@ python main.py 1001 < fixtures/minimal_start_inquire.jsonl
 
 当前策略是“状态机守卫 + 优先级调度”。
 
-状态机守卫先按主车队状态决定是否允许主动规划：
-
 | 状态类 | 原始状态 | 策略行为 |
 |---|---|---|
 | `TERMINAL_GUARD` | `DELIVERED` / `RETIRED` | 只发空动作心跳，不再主动操作 |
@@ -118,20 +129,28 @@ python main.py 1001 < fixtures/minimal_start_inquire.jsonl
 | `BUSY_GUARD` | `PROCESSING` / `VERIFYING` / `RESTING` / `FORCED_PASSING` / `CONTESTING` | 不打断读条、休整或强制通行，只发空动作心跳 |
 | `PLANNING` | `IDLE` / `UNKNOWN` / `COST_BANKRUPT` | 进入完整策略调度，评估交付、处理、任务、资源和路线 |
 
-进入 `PLANNING` 后，再按“交付优先、90 分任务门槛、顺路资源、终局保护”的优先级选择动作。
-
 ## 日志说明
 
-默认会向 `stderr` 输出 JSON Lines 日志，便于从比赛日志里复盘。可以用环境变量控制：
+默认会向 `stderr` 输出中文可读日志，便于直接从比赛日志里复盘。示例：
+
+```text
+[第42帧] [车队] 状态=IDLE(PLANNING) 位置=S07 目标=None 验核=否 交付=否 | 好果=98 坏果=0 鲜度=93.4 任务分=60 总分=60 | 库存=ICE_BOXx1 | 任务=4 资源点=2 窗口=0 | 到宫门≈38帧 剩余=558帧
+[第42帧] [算盘] 当前站任务候选：T02_42@S07:(130, -4) | 选 T02_42
+[第42帧] [定策] 原因=claim_task:T02:T02_42 | 最终动作=CLAIM_TASK->S07 (taskId=T02_42)
+```
+
+环境变量：
 
 ```bash
-LIZHI_DEBUG=1       # 默认开启 stderr 日志
-LIZHI_DEBUG=0       # 关闭策略日志
-LIZHI_FILE_LOG=1    # 同时写入 logs/<playerId>.jsonl
-LIZHI_RAW_LOG=1     # 默认开启，记录 start/inquire/ready/action 的截断预览
-LIZHI_RAW_LOG=0     # 只记录摘要，不打印原始 payload 预览
-LIZHI_PLAYER_NAME=你的队伍名  # 覆盖 registration.playerName
-LIZHI_VERSION=1.0   # 覆盖 registration.version
+LIZHI_DEBUG=1             # 默认开启 stderr 日志
+LIZHI_DEBUG=0             # 关闭策略日志
+LIZHI_FILE_LOG=1          # 同时写入 logs/<playerId>.log 或 .jsonl
+LIZHI_LOG_STYLE=pretty    # 默认中文可读日志
+LIZHI_LOG_STYLE=json      # 切回 JSON Lines，方便脚本分析
+LIZHI_RAW_LOG=1           # 记录 start/inquire/ready/action 的截断预览
+LIZHI_RAW_LOG=0           # 只记录摘要，不打印原始 payload 预览
+LIZHI_PLAYER_NAME=队伍名  # 覆盖 registration.playerName
+LIZHI_VERSION=1.0         # 覆盖 registration.version
 ```
 
 推荐排障启动方式：
@@ -140,21 +159,17 @@ LIZHI_VERSION=1.0   # 覆盖 registration.version
 LIZHI_DEBUG=1 LIZHI_RAW_LOG=1 LIZHI_FILE_LOG=1 ./start.sh 2779 127.0.0.1 30000
 ```
 
-如果看到 `start` 后立刻 `server_closed`，重点检查 `send_message` 里 `msgName=ready` 的 `msgData`、`bodyBytes`、`payloadPreview`，以及 `server_closed` 里的 `sentReady/startReceived/lastRound`。
-
 关键日志事件：
 
 | event | 含义 |
 |---|---|
 | `connect` | Socket 连接目标、玩家 ID 和连接模式 |
-| `send_message` | 发给服务端的完整消息摘要，包含 `msgData`、`bodyBytes`、`frameBytes`、`payloadPreview` |
-| `recv_message` | 收到服务端消息，记录 keys、round、phase、任务数、窗口数、事件数、payload 预览 |
+| `send_message` | 发给服务端的消息摘要，包含动作、字节数和 payload 预览 |
+| `recv_message` | 收到服务端消息，记录 round、phase、任务数、窗口数、事件数和 payload 预览 |
 | `start_detail` | start 包里的 matchId、duration、players、nodes、edges、roles、gameplay keys |
 | `inquire_detail` | 每轮我方 player 状态、tasks、contests、events、actionResults |
-| `handle_message` | 当前消息进入哪个协议分支处理 |
-| `server_closed` | 服务端断开连接时的上下文，判断是否死在 ready/action 后 |
-| `state_snapshot` | 每帧状态机快照，包含位置、状态类、分数、资源、鲜度、任务数、窗口数和到门/终点估计成本 |
-| `strategy_step` | 策略命中的关键分支，例如窗口出牌或终局保护 |
+| `server_closed` | 服务端断开连接时的上下文 |
+| `state_snapshot` | 每帧状态机快照 |
 | `task_eval_station` | 当前站点可处理任务候选及排序 |
 | `resource_eval_station` | 当前站点可领取资源候选及优先级 |
 | `task_eval_reachable` | 可绕路任务候选、估值和最终选择 |
@@ -164,21 +179,11 @@ LIZHI_DEBUG=1 LIZHI_RAW_LOG=1 LIZHI_FILE_LOG=1 ./start.sh 2779 127.0.0.1 30000
 | `squad_eval` | 小分队探路目标选择 |
 | `decision` | 本帧最终动作和最终原因 |
 
-## 设计参考
-
-框架参考了 RTS bot 的常见分层：
-
-- 类似 `WorkerData`：`models.py` 只做状态记账和安全读取。
-- 类似 `WorkerManager`：`strategy.py` 每帧调度一个合法动作。
-- 类似资源点/扩张点管理器：`route_planner.py` 维护地图图和路线成本。
-
-这种拆分能让后续策略增强集中在策略层，而不反复改协议和解析代码。
-
 ## 后续增强方向
 
 - 更精确的天气预测与路线耗时模拟。
 - 对任务做滚动收益评估，动态选择 60/90/110 分节点。
-- 为资源窗口、任务窗口、宫门窗口分别训练或配置出牌策略。
+- 为资源窗口、任务窗口、宫门窗口分别配置出牌策略。
 - 引入对手路线预测，在 S10/S11/S14 等关键节点做设卡/削弱。
 - 用小分队提前探路关键处理点，或清除必经障碍。
 - 增加 replay 日志，离线复盘每帧决策原因。
