@@ -105,6 +105,27 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.RUSH_PROTECT)
 
+    def test_rush_protect_does_not_skip_fixed_process(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=430,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S11",
+                freshness=82,
+                task_score_base=120,
+                rush_tactic_used_count=0,
+            ),
+            stations={"S11": Station(id="S11", process_type="PASS_TRANSFER", process_round=4)},
+            edges=[RouteEdge(id="E1", start="S11", end="S14", distance=3)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.PROCESS)
+
     def test_gate_verify_keeps_break_order_priority(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
@@ -192,6 +213,56 @@ class StrategyRouteResourceTest(unittest.TestCase):
         )
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.PROCESS)
+
+    def test_intel_scouts_route_when_squad_unavailable(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S01",
+                task_score_base=90,
+                resources={"INTEL": 1},
+                squad_available=0,
+            ),
+            edges=[
+                RouteEdge(id="E1", start="S01", end="S02", distance=1),
+                RouteEdge(id="E2", start="S02", end="S14", distance=1),
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
+        self.assertEqual(action.main.to_action()["resourceType"], "INTEL")
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_intel_keeps_available_squad_for_normal_scouting(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S01",
+                task_score_base=90,
+                resources={"INTEL": 1},
+                squad_available=1,
+            ),
+            edges=[
+                RouteEdge(id="E1", start="S01", end="S02", distance=1),
+                RouteEdge(id="E2", start="S02", end="S14", distance=1),
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertIsNotNone(action.squad)
+        self.assertEqual(action.squad.action, SquadActionType.SQUAD_SCOUT)
 
     def test_valuable_resource_allows_larger_detour(self) -> None:
         strategy = self.make_strategy()

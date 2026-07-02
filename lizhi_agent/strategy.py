@@ -284,9 +284,6 @@ class BaselineStrategy:
         fresh_action = self._freshness_action(state)
         if fresh_action is not None:
             return done(fresh_action, "use_ice_box")
-        rush_tactic = self._rush_tactic_action(state)
-        if rush_tactic is not None:
-            return done(rush_tactic, "use_rush_tactic")
         if me.station == state.terminal_node:
             if me.verified and me.good_fruit > 0 and me.freshness > 0:
                 return done(ActionBundle(main=MainAction(MainActionType.DELIVER)), "deliver")
@@ -300,6 +297,12 @@ class BaselineStrategy:
         fixed_process = self._fixed_process_action(state)
         if fixed_process is not None:
             return done(fixed_process, "fixed_process")
+        rush_tactic = self._rush_tactic_action(state)
+        if rush_tactic is not None:
+            return done(rush_tactic, "use_rush_tactic")
+        intel_action = self._intel_action(state)
+        if intel_action is not None:
+            return done(intel_action, "use_intel")
         pre_move_resource = self._pre_move_resource_action(state)
         if pre_move_resource is not None:
             return done(pre_move_resource, "use_route_resource")
@@ -605,6 +608,25 @@ class BaselineStrategy:
             self.logger.info("resource_use", resourceType="SHORT_HORSE", reason="pre_move_medium_route", target=target, remainingCost=remaining_cost)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="SHORT_HORSE"))
         return None
+
+    def _intel_action(self, state: GameState) -> ActionBundle | None:
+        me = state.me
+        if not me.has_resource("INTEL") or me.status not in PLANNING_STATES or me.station is None:
+            return None
+        if me.squad_available > 0 and state.phase not in RUSH_PHASES:
+            return None
+        target = self._intel_target(state)
+        if target is None:
+            self.logger.info("resource_use_skip", resourceType="INTEL", reason="no_route_scout_target")
+            return None
+        self.logger.info("resource_use", resourceType="INTEL", reason="route_intel_scout", target=target)
+        return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, target=target, resource_type="INTEL"))
+
+    def _intel_target(self, state: GameState) -> str | None:
+        forbidden = self._scout_forbidden(state)
+        objective = self._current_route_objective(state)
+        candidates = self._scout_path_candidates(state, objective, forbidden)
+        return candidates[0] if candidates else None
 
     def _moving_horse_action(self, state: GameState) -> ActionBundle | None:
         me = state.me
