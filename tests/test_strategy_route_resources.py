@@ -5,7 +5,7 @@ import unittest
 from lizhi_agent.actions import MainActionType, SquadActionType
 from lizhi_agent.config import StrategyConfig
 from lizhi_agent.logger import DecisionLogger
-from lizhi_agent.models import ConvoyStatus, GameState, PlayerState, RouteEdge, Station, TaskInstance
+from lizhi_agent.models import ConvoyStatus, GameState, PlayerState, ResourceStock, RouteEdge, Station, TaskInstance
 from lizhi_agent.strategy import BaselineStrategy
 
 
@@ -152,6 +152,59 @@ class StrategyRouteResourceTest(unittest.TestCase):
         )
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.PROCESS)
+
+    def test_valuable_resource_allows_larger_detour(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=90, freshness=84),
+            edges=[
+                RouteEdge(id="D", start="S01", end="S14", distance=3),
+                RouteEdge(id="R1", start="S01", end="S02", distance=4),
+                RouteEdge(id="R2", start="S02", end="S14", distance=4),
+            ],
+            resources=[ResourceStock(station="S02", resource_type="ICE_BOX", amount=1, claim_frames=2)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_squad_clear_handles_obstacle_before_spending_good_fruit(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=200,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=130, squad_available=1, good_fruit=80),
+            stations={"S02": Station(id="S02", has_obstacle=True)},
+            edges=[RouteEdge(id="E1", start="S01", end="S02", distance=1), RouteEdge(id="E2", start="S02", end="S14", distance=1)],
+        )
+        action = strategy.decide(state)
+        self.assertIsNone(action.main)
+        self.assertIsNotNone(action.squad)
+        self.assertEqual(action.squad.action, SquadActionType.SQUAD_CLEAR)
+        self.assertEqual(action.squad.to_action()["targetNodeId"], "S02")
+
+    def test_squad_weaken_handles_enemy_guard_before_forced_pass(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=200,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=130, squad_available=1, good_fruit=80),
+            stations={"S02": Station(id="S02", guard_owner="BLUE", guard_defense=2)},
+            edges=[RouteEdge(id="E1", start="S01", end="S02", distance=1), RouteEdge(id="E2", start="S02", end="S14", distance=1)],
+        )
+        action = strategy.decide(state)
+        self.assertIsNone(action.main)
+        self.assertIsNotNone(action.squad)
+        self.assertEqual(action.squad.action, SquadActionType.SQUAD_WEAKEN)
+        self.assertEqual(action.squad.to_action()["targetNodeId"], "S02")
 
 
 if __name__ == "__main__":
