@@ -168,6 +168,58 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertNotEqual(self.strategy.decide(base).window.card, WindowCard.ABSTAIN)
         self.assertEqual(self.strategy.decide(base).window.card, WindowCard.ABSTAIN)
 
+    def test_opening_window_uses_mixed_cards(self) -> None:
+        cards = set()
+        for index in range(8):
+            strategy = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger())
+            state = GameState(
+                frame=30,
+                phase="NORMAL",
+                player_id="1001",
+                me=PlayerState(
+                    player_id="1001",
+                    status=ConvoyStatus.IDLE,
+                    station="S02",
+                    guard_points=4,
+                    good_fruit=100,
+                    freshness=100,
+                ),
+                windows=[
+                    WindowState(
+                        id=f"contest-{index}",
+                        window_type="TASK",
+                        target="S02",
+                        task_id="task-open",
+                        active=True,
+                        my_turn=True,
+                        round_index=1,
+                    )
+                ],
+            )
+            cards.add(strategy.decide(state).window.card)
+        self.assertIn(WindowCard.BING_ZHENG, cards)
+        self.assertIn(WindowCard.XIAN_GONG, cards)
+
+    def test_late_high_value_window_keeps_stable_card(self) -> None:
+        state = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=4),
+            windows=[
+                WindowState(
+                    id="contest-late",
+                    window_type="TASK",
+                    target="S02",
+                    task_id="task-late",
+                    active=True,
+                    my_turn=True,
+                    round_index=1,
+                )
+            ],
+        )
+        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.BING_ZHENG)
+
 
 class ProtocolCodecTest(unittest.TestCase):
     def test_length_prefixed_codec_roundtrip(self) -> None:

@@ -156,9 +156,13 @@ class DecisionLogger:
     def _fmt_strategy_step(self, fields: dict[str, Any]) -> str:
         step = fields.get("step")
         if step == "window_card":
+            style = fields.get("windowStyle")
+            reason = fields.get("choiceReason")
+            tail = f" | {style}：{reason}" if style or reason else ""
+            roll = f" roll={fields.get('roll')}" if fields.get("roll") is not None else ""
             return (
                 f"[出牌] 窗口={fields.get('contestType')} 目标={fields.get('target')} "
-                f"第{fields.get('roundIndex')}拍，出 {fields.get('chosenCard')}"
+                f"第{fields.get('roundIndex')}拍，出 {fields.get('chosenCard')}{roll}{tail}"
             )
         if step in {"endgame_guard", "delivery_guard"}:
             return "[急行] 已触发终局保护，暂停贪心，优先奔向宫门/终点"

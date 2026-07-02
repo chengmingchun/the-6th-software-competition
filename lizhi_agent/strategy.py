@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -37,26 +38,96 @@ class Decision:
     reason: str
 
 
-class WindowStrategy:
-    """Low-regret fixed policy for 3-card contest windows.
+@dataclass(frozen=True)
+class WindowChoice:
+    card: WindowCard
+    style: str
+    reason: str
+    roll: int | None = None
 
-    The card matrix has no universally dominant card.  This baseline spends
-    scarce resources only on high-value windows and otherwise prefers cheap
-    cards or abstention to avoid fruit/freshness damage.
+
+class WindowStrategy:
+    """Low-regret mixed policy for contest windows.
+
+    The card matrix has no universally dominant card.  Opening fights are
+    deliberately mixed with a deterministic hash so opponents cannot exploit a
+    single fixed card, while logs and local replays remain reproducible.
     """
 
-    def choose_card(self, state: GameState, window: WindowState) -> WindowCard:
+    def choose(self, state: GameState, window: WindowState, config: StrategyConfig) -> WindowChoice:
         me = state.me
         high_value = window.window_type in {"GATE", "TASK", "PASS"} or window.resource_type in {"FAST_HORSE", "ICE_BOX"}
+        if self._is_opening_fight(state, window, config):
+            options = self._opening_options(state, high_value)
+            card, roll = self._weighted_pick(state, window, options)
+            return WindowChoice(
+                card=card,
+                style="OPENING_MIX",
+                reason=f"开局首站抢点，按权重出奇制胜，候选={self._options_text(options)}",
+                roll=roll,
+            )
         if high_value and me.guard_points > 0:
-            return WindowCard.BING_ZHENG
+            return WindowChoice(WindowCard.BING_ZHENG, "FIXED_VALUE", "高价值窗口且有护卫点，稳出秉正")
         if me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT"):
-            return WindowCard.YAN_DIE
+            return WindowChoice(WindowCard.YAN_DIE, "FIXED_RESOURCE", "有通行类资源，走雁牒")
         if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE"):
-            return WindowCard.QIANG_XING
+            return WindowChoice(WindowCard.QIANG_XING, "FIXED_SPEED", "有速度资源/增益，抢行")
         if high_value and me.freshness >= 85 and me.good_fruit >= 80:
-            return WindowCard.XIAN_GONG
-        return WindowCard.ABSTAIN
+            return WindowChoice(WindowCard.XIAN_GONG, "FIXED_FRUIT", "高价值窗口且果况健康，鲜贡换主动")
+        return WindowChoice(WindowCard.ABSTAIN, "SAVE_FRUIT", "价值不够或资源不足，弃争保主线")
+
+    def choose_card(self, state: GameState, window: WindowState) -> WindowCard:
+        return self.choose(state, window, StrategyConfig.default()).card
+
+    def _is_opening_fight(self, state: GameState, window: WindowState, config: StrategyConfig) -> bool:
+        if state.frame > config.opening_window_mix_frames:
+            return False
+        target = window.target or state.me.station
+        if target in {None, state.start_node, state.gate_node, state.terminal_node}:
+            return False
+        return window.window_type in {"TASK", "RESOURCE", "PASS", "UNKNOWN"} or window.resource_type is not None
+
+    def _opening_options(self, state: GameState, high_value: bool) -> list[tuple[WindowCard, int]]:
+        me = state.me
+        options: list[tuple[WindowCard, int]] = []
+        if me.guard_points > 0:
+            options.append((WindowCard.BING_ZHENG, 42 if high_value else 30))
+        if me.freshness >= 86 and me.good_fruit >= 82:
+            options.append((WindowCard.XIAN_GONG, 34 if high_value else 24))
+        if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE"):
+            options.append((WindowCard.QIANG_XING, 28))
+        if me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT"):
+            options.append((WindowCard.YAN_DIE, 26))
+        if not high_value or me.freshness < 75 or me.good_fruit < 70:
+            options.append((WindowCard.ABSTAIN, 18))
+        if not options:
+            options.append((WindowCard.ABSTAIN, 100))
+        return options
+
+    def _weighted_pick(self, state: GameState, window: WindowState, options: list[tuple[WindowCard, int]]) -> tuple[WindowCard, int]:
+        total = sum(weight for _, weight in options)
+        seed = "|".join(
+            [
+                state.player_id,
+                str(window.id),
+                str(window.target or state.me.station),
+                str(window.task_id or ""),
+                str(window.resource_type or ""),
+                str(window.round_index),
+                str(state.frame // 3),
+            ]
+        )
+        digest = hashlib.blake2s(seed.encode("utf-8"), digest_size=4).digest()
+        roll = int.from_bytes(digest, "big") % total
+        cursor = 0
+        for card, weight in options:
+            cursor += weight
+            if roll < cursor:
+                return card, roll
+        return options[-1][0], roll
+
+    def _options_text(self, options: list[tuple[WindowCard, int]]) -> str:
+        return ",".join(f"{card.value}:{weight}" for card, weight in options)
 
 
 class BaselineStrategy:
@@ -244,7 +315,7 @@ class BaselineStrategy:
                     reason="争抢窗口重复出现，停止加码，保留荔枝继续主线",
                 )
                 return Decision(ActionBundle(window=WindowAction(window.id, WindowCard.ABSTAIN)), f"window_stall:{object_key}")
-            card = self.window_strategy.choose_card(state, window)
+            choice = self.window_strategy.choose(state, window, self.config)
             self.logger.info(
                 "strategy_step",
                 step="window_card",
@@ -254,9 +325,12 @@ class BaselineStrategy:
                 resourceType=window.resource_type,
                 taskId=window.task_id,
                 roundIndex=window.round_index,
-                chosenCard=card.value,
+                chosenCard=choice.card.value,
+                windowStyle=choice.style,
+                choiceReason=choice.reason,
+                roll=choice.roll,
             )
-            return Decision(ActionBundle(window=WindowAction(window.id, card)), f"window:{window.window_type}:{card.value}")
+            return Decision(ActionBundle(window=WindowAction(window.id, choice.card)), f"window:{window.window_type}:{choice.card.value}")
 
         if me.delivered or me.status == ConvoyStatus.DELIVERED:
             return Decision(wait("already_delivered", active=False), "already_delivered")

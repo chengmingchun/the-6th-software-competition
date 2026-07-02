@@ -14,6 +14,7 @@ class StrategyConfig:
     station_escape_frames: int = 36
     object_cooldown_frames: int = 30
     max_window_rounds_before_abstain: int = 2
+    opening_window_mix_frames: int = 120
     low_freshness_threshold: float = 75.0
     critical_freshness_threshold: float = 55.0
     resource_priority: tuple[str, ...] = (
