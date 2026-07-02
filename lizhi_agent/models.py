@@ -253,6 +253,20 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "active", "open"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "inactive", "closed"}:
+            return False
+    if value is None:
+        return default
+    return bool(value)
+
+
 def _as_status(value: Any) -> ConvoyStatus:
     if isinstance(value, str):
         try:
@@ -294,9 +308,9 @@ def parse_player_state(player_id: str, data: dict[str, Any]) -> PlayerState:
         task_score_base=_as_int(_first_present(data, "taskScore", "taskScoreBase", default=0), 0),
         bounty_score=_as_int(_first_present(data, "bountyScore", default=0), 0),
         total_score=_as_int(_first_present(data, "totalScore", default=0), 0),
-        delivered=bool(_first_present(data, "delivered", default=False)),
-        verified=bool(_first_present(data, "verified", default=False)),
-        retired=bool(_first_present(data, "retired", default=False)),
+        delivered=_as_bool(_first_present(data, "delivered", default=False), False),
+        verified=_as_bool(_first_present(data, "verified", default=False), False),
+        retired=_as_bool(_first_present(data, "retired", default=False), False),
         resources={str(k): _as_int(v) for k, v in resources.items()},
         squad_available=_as_int(_first_present(data, "squadAvailable", "squadMembers", default=8), 8),
         squad_in_flight=_as_int(_first_present(data, "squadInFlight", default=0), 0),
@@ -357,32 +371,84 @@ def parse_game_state(player_id: str, start_data: dict[str, Any], inquire_data: d
     )
 
 
+def _parse_process_nodes(start_data: dict[str, Any]) -> dict[str, tuple[str | None, int, dict[str, Any]]]:
+    """Return nodeId -> (processType, processRound, raw) from gameplay.processNodes.
+
+    The judge uses map.gameplay.processNodes as the authoritative fixed-process
+    definition.  Some start packets do not copy processType/processRound onto
+    nodes[], so relying only on nodes[] makes the strategy skip PROCESS and then
+    get PROCESS_REQUIRED when it tries to MOVE.
+    """
+
+    raw_process_nodes = _gameplay(start_data).get("processNodes")
+    result: dict[str, tuple[str | None, int, dict[str, Any]]] = {}
+    if isinstance(raw_process_nodes, dict):
+        iterable = raw_process_nodes.items()
+        for key, value in iterable:
+            if isinstance(value, dict):
+                node_id = _first_present(value, "nodeId", "targetNodeId", "id", default=key)
+                process_type = _first_present(value, "processType", "type")
+                process_round = _as_int(_first_present(value, "processRound", "round", "costRound", "duration", default=0), 0)
+                result[str(node_id)] = (str(process_type) if process_type else None, process_round, value)
+            else:
+                result[str(key)] = (str(value) if value else None, 0, {"nodeId": key, "processType": value})
+    elif isinstance(raw_process_nodes, list):
+        for item in raw_process_nodes:
+            if isinstance(item, str):
+                result[item] = (None, 1, {"nodeId": item})
+                continue
+            if not isinstance(item, dict):
+                continue
+            node_id = _first_present(item, "nodeId", "targetNodeId", "id", "station", "stationId")
+            if not node_id:
+                continue
+            process_type = _first_present(item, "processType", "type")
+            process_round = _as_int(_first_present(item, "processRound", "round", "costRound", "duration", default=0), 0)
+            result[str(node_id)] = (str(process_type) if process_type else None, process_round, item)
+    return result
+
+
 def _parse_stations(start_data: dict[str, Any], inquire_data: dict[str, Any]) -> dict[str, Station]:
     raw_nodes = inquire_data.get("nodes") or start_data.get("nodes") or []
     stations: dict[str, Station] = {}
+    process_nodes = _parse_process_nodes(start_data)
     if not isinstance(raw_nodes, list):
-        return stations
+        raw_nodes = []
     for item in raw_nodes:
         if not isinstance(item, dict):
             continue
         node_id = _first_present(item, "nodeId", "id")
         if not node_id:
             continue
+        node_id = str(node_id)
         guard = item.get("guard") if isinstance(item.get("guard"), dict) else {}
         stock = item.get("resourceStock") if isinstance(item.get("resourceStock"), dict) else {}
-        stations[str(node_id)] = Station(
-            id=str(node_id),
+        gameplay_process_type, gameplay_process_round, gameplay_process_raw = process_nodes.get(node_id, (None, 0, {}))
+        process_type = _first_present(item, "processType", default=gameplay_process_type)
+        process_round = _as_int(_first_present(item, "processRound", default=gameplay_process_round), gameplay_process_round)
+        stations[node_id] = Station(
+            id=node_id,
             name=str(_first_present(item, "name", default="")),
             node_type=str(_first_present(item, "nodeType", "type", default="")),
-            process_type=_first_present(item, "processType"),
-            process_round=_as_int(_first_present(item, "processRound", default=0), 0),
-            has_obstacle=bool(_first_present(item, "hasObstacle", default=False)),
+            process_type=str(process_type) if process_type else None,
+            process_round=process_round,
+            has_obstacle=_as_bool(_first_present(item, "hasObstacle", default=False), False),
             guard_owner=_first_present(guard, "ownerTeamId"),
             guard_defense=_as_int(_first_present(guard, "defense", default=0), 0),
-            can_window=bool(_first_present(item, "canWindow", default=False)),
+            can_window=_as_bool(_first_present(item, "canWindow", default=False), False),
             resource_stock={str(k): _as_int(v) for k, v in stock.items()},
-            raw=item,
+            raw={**gameplay_process_raw, **item},
         )
+    # Some fixed-process nodes may be omitted from nodes[] in minimal or stale
+    # inquire packets.  Preserve them so strategy can still submit PROCESS.
+    for node_id, (process_type, process_round, raw) in process_nodes.items():
+        if node_id not in stations:
+            stations[node_id] = Station(
+                id=node_id,
+                process_type=process_type,
+                process_round=max(1, process_round),
+                raw=raw,
+            )
     return stations
 
 
@@ -399,7 +465,7 @@ def _parse_edges(start_data: dict[str, Any], inquire_data: dict[str, Any]) -> li
         if not start or not end:
             continue
         direction = str(_first_present(item, "direction", default="BIDIRECTIONAL")).upper()
-        bidirectional = bool(_first_present(item, "bidirectional", "twoWay", default=direction != "ONE_WAY"))
+        bidirectional = _as_bool(_first_present(item, "bidirectional", "twoWay", default=direction != "ONE_WAY"), direction != "ONE_WAY")
         edges.append(RouteEdge(
             id=str(_first_present(item, "edgeId", "id", default=f"{start}->{end}")),
             start=str(start),
@@ -454,9 +520,9 @@ def _parse_tasks(inquire_data: dict[str, Any]) -> list[TaskInstance]:
             process_frames=_as_int(_first_present(item, "processRound", default=0), 0),
             refresh_frame=_as_int(_first_present(item, "refreshRound", default=0), 0),
             expire_frame=_as_int(_first_present(item, "expireRound", default=0), 0),
-            active=bool(_first_present(item, "active", default=True)),
-            completed=bool(_first_present(item, "completed", default=False)),
-            failed=bool(_first_present(item, "failed", default=False)),
+            active=_as_bool(_first_present(item, "active", default=True), True),
+            completed=_as_bool(_first_present(item, "completed", default=False), False),
+            failed=_as_bool(_first_present(item, "failed", default=False), False),
             owner_player_id=_first_present(item, "ownerPlayerId"),
             protection_player_id=_first_present(item, "protectionPlayerId"),
             raw=item,
@@ -467,15 +533,25 @@ def _parse_tasks(inquire_data: dict[str, Any]) -> list[TaskInstance]:
 def _parse_windows(player_id: str, inquire_data: dict[str, Any]) -> list[WindowState]:
     raw_windows = inquire_data.get("contests") if isinstance(inquire_data.get("contests"), list) else []
     windows: list[WindowState] = []
+    closed_statuses = {"SUPPRESSED", "RESOLVED", "FINISHED", "FINISH", "ENDED", "END", "CLOSED", "COMPLETED", "COMPLETE", "SETTLED"}
+    active_statuses = {"", "ACTIVE", "OPEN", "PENDING", "RUNNING", "CONTESTING"}
     for item in raw_windows:
         if not isinstance(item, dict):
             continue
         contest_id = item.get("contestId")
         if not contest_id:
             continue
-        status = str(_first_present(item, "status", default=""))
-        active = not bool(item.get("resolved")) and status != "SUPPRESSED"
+        status = str(_first_present(item, "status", default="")).upper()
+        round_index = _as_int(_first_present(item, "roundIndex", "cardRound", "turnIndex", default=0), 0)
+        resolved = _as_bool(item.get("resolved"), False) or status in closed_statuses
+        plausible_round = round_index == 0 or 1 <= round_index <= 3
+        active = (not resolved) and status in active_statuses and plausible_round
         participant = str(item.get("redPlayerId")) == str(player_id) or str(item.get("bluePlayerId")) == str(player_id)
+        current_player = _first_present(item, "currentPlayerId", "turnPlayerId", "playerId", default=None)
+        if current_player is not None:
+            my_turn = active and str(current_player) == str(player_id)
+        else:
+            my_turn = active and participant
         windows.append(WindowState(
             id=str(contest_id),
             window_type=str(_first_present(item, "contestType", default="UNKNOWN")),
@@ -483,8 +559,8 @@ def _parse_windows(player_id: str, inquire_data: dict[str, Any]) -> list[WindowS
             resource_type=_first_present(item, "resourceType"),
             task_id=_first_present(item, "taskId"),
             active=active,
-            my_turn=active and participant,
-            round_index=_as_int(_first_present(item, "roundIndex", default=0), 0),
+            my_turn=my_turn,
+            round_index=round_index,
             red_point=_as_int(_first_present(item, "redPoint", default=0), 0),
             blue_point=_as_int(_first_present(item, "bluePoint", default=0), 0),
             status=status,
