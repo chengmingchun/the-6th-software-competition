@@ -16,7 +16,7 @@ from lizhi_agent.actions import (
 )
 from lizhi_agent.config import StrategyConfig
 from lizhi_agent.logger import DecisionLogger
-from lizhi_agent.models import ConvoyStatus, GameState, ResourceStock, TaskInstance, WindowState
+from lizhi_agent.models import ConvoyStatus, GameState, ResourceStock, Station, TaskInstance, WindowState
 from lizhi_agent.route_planner import RoutePlanner
 
 
@@ -323,6 +323,9 @@ class BaselineStrategy:
         pre_move_resource = self._pre_move_resource_action(state)
         if pre_move_resource is not None:
             return done(pre_move_resource, "use_route_resource")
+        contest_action = self._opportunistic_guard_action(state)
+        if contest_action is not None:
+            return done(contest_action, "opportunistic_guard")
         if self._should_lock_delivery(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_quality_delivery_first")
             scout = self._squad_scout_action(state)
@@ -841,6 +844,44 @@ class BaselineStrategy:
         if me.good_fruit < 78 or me.freshness < 68:
             return me.task_score_base >= self.config.target_task_score
         return False
+
+    def _opportunistic_guard_action(self, state: GameState) -> ActionBundle | None:
+        me = state.me
+        if state.phase in RUSH_PHASES or me.status not in PLANNING_STATES or me.station is None:
+            return None
+        if me.station in {state.start_node, state.gate_node, state.terminal_node}:
+            return None
+        if me.task_score_base < self.config.target_task_score or me.good_fruit < 88 or self._need_endgame(state):
+            return None
+        station = state.station(me.station)
+        if station is not None and station.has_obstacle:
+            return None
+        if self._is_my_mainline_next_hop(state, me.station):
+            return None
+        if self._opponent_next_hop_to_gate(state) != me.station:
+            return None
+        if station is not None and station.guard_owner == me.team_id and station.guard_defense > 0:
+            if me.squad_available > 0:
+                self.logger.info("squad_eval", action="SQUAD_REINFORCE", target=me.station, reason="reinforce_opponent_chokepoint")
+                return ActionBundle(squad=SquadAction(SquadActionType.SQUAD_REINFORCE, me.station))
+            return None
+        if station is not None and station.guard_owner not in (None, "", me.team_id) and station.guard_defense > 0:
+            return None
+        self.logger.info("blocker_decision", target=me.station, blocker="opponent_route", action="SET_GUARD", reason="zero_good_fruit_chokepoint")
+        return ActionBundle(main=MainAction(MainActionType.SET_GUARD, target=me.station, extra_good_fruit=0))
+
+    def _is_my_mainline_next_hop(self, state: GameState, station: str) -> bool:
+        target = state.terminal_node if state.me.verified else state.gate_node
+        return self.route_planner.next_hop_to_any(state, state.me.station, (target,)) == station
+
+    def _opponent_next_hop_to_gate(self, state: GameState) -> str | None:
+        if state.opponent is None or state.opponent.station is None:
+            return None
+        if state.opponent.verified:
+            target = state.terminal_node
+        else:
+            target = state.gate_node
+        return self.route_planner.next_hop_to_any(state, state.opponent.station, (target,))
 
     def _priority_scout_target(self, state: GameState, objective: str, forbidden: set[str]) -> tuple[str | None, list[dict[str, int | str]]]:
         plan = self.route_planner.plan(state, state.me.station, objective)

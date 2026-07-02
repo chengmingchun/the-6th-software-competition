@@ -441,6 +441,76 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(move.main.action, MainActionType.MOVE)
         self.assertEqual(move.main.to_action()["targetNodeId"], "S14")
 
+    def test_sets_zero_fruit_guard_on_opponent_next_hop(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S03", task_score_base=120, good_fruit=95),
+            opponent=PlayerState(player_id="2002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S02", task_score_base=90),
+            edges=[
+                RouteEdge(id="O1", start="S02", end="S03", distance=1),
+                RouteEdge(id="O2", start="S03", end="S14", distance=2),
+                RouteEdge(id="M1", start="S03", end="S04", distance=1),
+                RouteEdge(id="M2", start="S04", end="S14", distance=1),
+                RouteEdge(id="T", start="S14", end="S15", distance=1),
+            ],
+            stations={"S03": Station(id="S03")},
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.SET_GUARD)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S03")
+        self.assertEqual(action.main.to_action()["extraGoodFruit"], 0)
+
+    def test_reinforces_own_guard_on_opponent_next_hop(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S03", task_score_base=120, good_fruit=95, squad_available=1),
+            opponent=PlayerState(player_id="2002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S02", task_score_base=90),
+            edges=[
+                RouteEdge(id="O1", start="S02", end="S03", distance=1),
+                RouteEdge(id="O2", start="S03", end="S14", distance=2),
+                RouteEdge(id="M1", start="S03", end="S04", distance=1),
+                RouteEdge(id="M2", start="S04", end="S14", distance=1),
+                RouteEdge(id="T", start="S14", end="S15", distance=1),
+            ],
+            stations={"S03": Station(id="S03", guard_owner="RED", guard_defense=2)},
+        )
+        action = strategy.decide(state)
+        self.assertIsNone(action.main)
+        self.assertIsNotNone(action.squad)
+        self.assertEqual(action.squad.action, SquadActionType.SQUAD_REINFORCE)
+        self.assertEqual(action.squad.to_action()["targetNodeId"], "S03")
+
+    def test_guard_trap_skips_endgame(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=570,
+            phase="NORMAL",
+            max_frame=600,
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S03", task_score_base=120, good_fruit=95),
+            opponent=PlayerState(player_id="2002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S02", task_score_base=90),
+            edges=[
+                RouteEdge(id="O1", start="S02", end="S03", distance=1),
+                RouteEdge(id="O2", start="S03", end="S14", distance=2),
+                RouteEdge(id="M1", start="S03", end="S04", distance=1),
+                RouteEdge(id="M2", start="S04", end="S14", distance=1),
+                RouteEdge(id="T", start="S14", end="S15", distance=1),
+            ],
+            stations={"S03": Station(id="S03")},
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertNotEqual(action.main.action, MainActionType.SET_GUARD)
+
     def test_squad_clear_handles_obstacle_before_spending_good_fruit(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
