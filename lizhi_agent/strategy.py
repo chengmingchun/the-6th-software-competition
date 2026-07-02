@@ -55,16 +55,16 @@ class WindowStrategy:
         if self._is_opening_fight(state, window, config):
             options = self._opening_options(state, high_value)
             card, roll = self._weighted_pick(state, window, options)
-            return WindowChoice(card, "OPENING_MIX", f"开局首站抢点，候选={self._options_text(options)}", roll)
+            return WindowChoice(card, "OPENING_MIX", f"开局窗口混合策略，候选={self._options_text(options)}", roll)
         if high_value and me.guard_points > 0:
-            return WindowChoice(WindowCard.BING_ZHENG, "FIXED_VALUE", "高价值窗口且有护卫点，稳出秉正")
+            return WindowChoice(WindowCard.BING_ZHENG, "FIXED_VALUE", "高价值窗口且有护卫点")
         if me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT"):
-            return WindowChoice(WindowCard.YAN_DIE, "FIXED_RESOURCE", "有通行类资源，走雁牒")
+            return WindowChoice(WindowCard.YAN_DIE, "FIXED_RESOURCE", "有通行类资源")
         if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE"):
-            return WindowChoice(WindowCard.QIANG_XING, "FIXED_SPEED", "有速度资源/增益，抢行")
+            return WindowChoice(WindowCard.QIANG_XING, "FIXED_SPEED", "有速度资源/增益")
         if high_value and me.freshness >= 85 and me.good_fruit >= 80:
-            return WindowChoice(WindowCard.XIAN_GONG, "FIXED_FRUIT", "高价值窗口且果况健康，鲜贡换主动")
-        return WindowChoice(WindowCard.ABSTAIN, "SAVE_FRUIT", "价值不够或资源不足，弃争保主线")
+            return WindowChoice(WindowCard.XIAN_GONG, "FIXED_FRUIT", "高价值窗口且果况健康")
+        return WindowChoice(WindowCard.ABSTAIN, "SAVE_FRUIT", "价值不够或资源不足")
 
     def choose_card(self, state: GameState, window: WindowState) -> WindowCard:
         return self.choose(state, window, StrategyConfig.default()).card
@@ -118,7 +118,7 @@ class WindowStrategy:
 
 
 class BaselineStrategy:
-    """Conservative baseline: protocol-correct, no repeated invalid actions, secure delivery first."""
+    """Conservative baseline: first be legal, then move, then optimize."""
 
     def __init__(self, player_id: str, config: StrategyConfig, logger: DecisionLogger) -> None:
         self.player_id = player_id
@@ -149,7 +149,6 @@ class BaselineStrategy:
         if state.me.station != self._last_station and state.me.station is not None:
             self._completed_fixed_process_nodes.discard(state.me.station)
         self._last_station = state.me.station
-
         self._log_state_snapshot(state)
         decision = self._decide(state)
         if decision.bundle.squad is not None and decision.bundle.squad.action == SquadActionType.SQUAD_SCOUT:
@@ -168,6 +167,118 @@ class BaselineStrategy:
         )
         return decision.bundle
 
+    def _optional_window_action(self, state: GameState) -> tuple[WindowAction | None, str | None]:
+        window = state.active_window()
+        if window is None:
+            return None, None
+        object_key = self._window_object_key(window)
+        if object_key is not None:
+            self._window_seen[object_key] = self._window_seen.get(object_key, 0) + 1
+        should_abstain = object_key is not None and (
+            self._is_object_on_cooldown(state, object_key)
+            or self._is_station_escape_active(state, window.target or state.me.station)
+            or (self._window_seen.get(object_key, 0) > self.config.max_window_rounds_before_abstain and window.window_type not in {"GATE", "PASS"})
+        )
+        if should_abstain:
+            self._cooldown_object(state, object_key or f"WINDOW:{window.id}", "window_stall")
+            self.logger.info(
+                "stall_breaker",
+                kind="window",
+                station=window.target or state.me.station,
+                objectKey=object_key,
+                action="ABSTAIN",
+                reason="窗口重复出现：只对窗口弃争，不阻塞主车队动作",
+            )
+            return WindowAction(window.id, WindowCard.ABSTAIN), f"window_stall:{object_key}"
+        choice = self.window_strategy.choose(state, window, self.config)
+        self.logger.info(
+            "strategy_step",
+            step="window_card",
+            contestId=window.id,
+            contestType=window.window_type,
+            target=window.target,
+            resourceType=window.resource_type,
+            taskId=window.task_id,
+            roundIndex=window.round_index,
+            chosenCard=choice.card.value,
+            windowStyle=choice.style,
+            choiceReason=choice.reason,
+            roll=choice.roll,
+        )
+        return WindowAction(window.id, choice.card), f"window:{window.window_type}:{choice.card.value}"
+
+    def _attach_window(self, bundle: ActionBundle, window: WindowAction | None) -> ActionBundle:
+        if window is None or bundle.window is not None:
+            return bundle
+        return ActionBundle(main=bundle.main, squad=bundle.squad, window=window, debug=bundle.debug)
+
+    def _decide(self, state: GameState) -> Decision:
+        me = state.me
+        window_action, window_reason = self._optional_window_action(state)
+
+        def done(bundle: ActionBundle, reason: str) -> Decision:
+            reason_text = reason if window_reason is None else f"{reason}+{window_reason}"
+            return Decision(self._attach_window(bundle, window_action), reason_text)
+
+        if me.delivered or me.status == ConvoyStatus.DELIVERED:
+            return done(wait("already_delivered", active=False), "already_delivered")
+        if me.retired or me.status == ConvoyStatus.RETIRED:
+            return done(wait("retired", active=False), "retired")
+        if me.status in MOVING_STATES:
+            horse = self._moving_horse_action(state)
+            if horse is not None:
+                return done(horse, "use_horse_while_moving")
+            return done(wait(f"moving:{me.status.value}", active=False), f"moving:{me.status.value}")
+        if me.status in BUSY_STATES:
+            return done(wait(f"busy:{me.status.value}", active=False), f"busy:{me.status.value}")
+
+        fresh_action = self._freshness_action(state)
+        if fresh_action is not None:
+            return done(fresh_action, "use_ice_box")
+
+        if me.station == state.terminal_node:
+            if me.verified and me.good_fruit > 0 and me.freshness > 0:
+                return done(ActionBundle(main=MainAction(MainActionType.DELIVER)), "deliver")
+            return done(self._move_to(state, state.gate_node), "leave_terminal_not_ready")
+
+        if me.station == state.gate_node:
+            if not me.verified:
+                if self._can_verify_gate(state):
+                    return done(self._verify_action(state), "verify_gate")
+                return done(wait("at_gate_before_rush", active=False), "at_gate_before_rush")
+            return done(self._move_to(state, state.terminal_node), "gate_to_terminal")
+
+        fixed_process = self._fixed_process_action(state)
+        if fixed_process is not None:
+            return done(fixed_process, "fixed_process")
+
+        if self._need_endgame(state) or self._opponent_pressure(state):
+            self.logger.info("strategy_step", step="delivery_guard", reason="rush_deadline_or_opponent_pressure")
+            return done(self._move_towards_delivery(state), "delivery_guard")
+
+        if self._is_station_escape_active(state):
+            self.logger.info("stall_breaker", kind="station", station=me.station, stayFrames=self._station_stay_frames(state), escapeUntil=self._station_escape_until.get(me.station or ""), action="MOVE_MAINLINE", reason="当前站点停留过久，暂停本地任务资源，直奔主线")
+            return done(self._move_towards_delivery(state), "station_stall_escape")
+
+        station_task = self._best_station_task(state)
+        if station_task is not None:
+            return done(self._claim_task(station_task), f"claim_task:{station_task.template}:{station_task.id}")
+
+        station_resource = self._best_station_resource(state)
+        if station_resource is not None:
+            return done(self._claim_resource(station_resource), f"claim_resource:{station_resource.resource_type}")
+
+        scout = self._squad_scout_action(state)
+        route_task = self._best_reachable_task(state)
+        if route_task is not None:
+            return done(self._move_towards_node(state, route_task.target, squad=scout), f"move_to_task:{route_task.template}:{route_task.id}")
+
+        route_resource = self._best_reachable_resource(state)
+        if route_resource is not None:
+            return done(self._move_towards_node(state, route_resource.station, squad=scout), f"move_to_resource:{route_resource.resource_type}")
+
+        return done(self._move_towards_delivery(state, squad=scout), "move_towards_delivery")
+
     def _learn_from_feedback(self, state: GameState) -> None:
         for event in state.events:
             if not isinstance(event, dict):
@@ -180,7 +291,7 @@ class BaselineStrategy:
             node_id = event.get("targetNodeId") or event.get("nodeId") or payload.get("targetNodeId") or payload.get("nodeId")
             task_id = event.get("taskId") or payload.get("taskId")
             error_code = str(event.get("errorCode") or payload.get("errorCode") or event.get("code") or "").upper()
-            self._learn_error_code(state, action=str(event.get("action") or payload.get("action") or "").upper(), code=error_code, node_id=node_id, task_id=task_id, resource_type=event.get("resourceType") or payload.get("resourceType"), raw=event)
+            self._learn_error_code(state, str(event.get("action") or payload.get("action") or "").upper(), error_code, node_id, task_id, event.get("resourceType") or payload.get("resourceType"), event)
             if event_type in {"PROCESS_COMPLETE", "FIXED_PROCESS_COMPLETE"} and node_id:
                 node = str(node_id)
                 self._completed_fixed_process_nodes.add(node)
@@ -208,26 +319,21 @@ class BaselineStrategy:
             task_id = result.get("taskId")
             resource_type = result.get("resourceType")
             self.logger.info("action_result", action=action, accepted=accepted, success=success, code=code, nodeId=node_id, taskId=task_id, resourceType=resource_type, raw=result)
-            failed = accepted is False or success is False or bool(code)
-            if failed:
+            if accepted is False or success is False or bool(code):
                 self._learn_error_code(state, action, code, node_id, task_id, resource_type, result)
 
     def _record_belongs_to_me(self, state: GameState, record: dict[str, Any]) -> bool:
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
-        player_values = [
-            record.get("playerId"), record.get("actorPlayerId"), record.get("sourcePlayerId"), record.get("ownerPlayerId"),
-            payload.get("playerId"), payload.get("actorPlayerId"), payload.get("sourcePlayerId"), payload.get("ownerPlayerId"),
-        ]
-        explicit_players = [value for value in player_values if value not in (None, "")]
+        player_values = [record.get(k) for k in ("playerId", "actorPlayerId", "sourcePlayerId", "ownerPlayerId")]
+        player_values += [payload.get(k) for k in ("playerId", "actorPlayerId", "sourcePlayerId", "ownerPlayerId")]
+        explicit_players = [v for v in player_values if v not in (None, "")]
         if explicit_players:
-            return any(str(value) == str(state.player_id) for value in explicit_players)
-        team_values = [
-            record.get("teamId"), record.get("actorTeamId"), record.get("sourceTeamId"), record.get("ownerTeamId"),
-            payload.get("teamId"), payload.get("actorTeamId"), payload.get("sourceTeamId"), payload.get("ownerTeamId"),
-        ]
-        explicit_teams = [value for value in team_values if value not in (None, "")]
+            return any(str(v) == str(state.player_id) for v in explicit_players)
+        team_values = [record.get(k) for k in ("teamId", "actorTeamId", "sourceTeamId", "ownerTeamId")]
+        team_values += [payload.get(k) for k in ("teamId", "actorTeamId", "sourceTeamId", "ownerTeamId")]
+        explicit_teams = [v for v in team_values if v not in (None, "")]
         if explicit_teams and state.me.team_id is not None:
-            return any(str(value) == str(state.me.team_id) for value in explicit_teams)
+            return any(str(v) == str(state.me.team_id) for v in explicit_teams)
         return True
 
     def _learn_error_code(self, state: GameState, action: str, code: str, node_id: Any, task_id: Any, resource_type: Any, raw: dict[str, Any]) -> None:
@@ -312,85 +418,6 @@ class BaselineStrategy:
         if status in {ConvoyStatus.DELIVERED, ConvoyStatus.RETIRED}:
             return "TERMINAL_GUARD"
         return "PLANNING"
-
-    def _decide(self, state: GameState) -> Decision:
-        me = state.me
-
-        window = state.active_window()
-        if window is not None:
-            object_key = self._window_object_key(window)
-            if object_key is not None:
-                self._window_seen[object_key] = self._window_seen.get(object_key, 0) + 1
-            if object_key is not None and (
-                self._is_object_on_cooldown(state, object_key)
-                or self._is_station_escape_active(state, window.target or state.me.station)
-                or (self._window_seen.get(object_key, 0) > self.config.max_window_rounds_before_abstain and window.window_type not in {"GATE", "PASS"})
-            ):
-                self._cooldown_object(state, object_key, "window_stall")
-                self.logger.info("stall_breaker", kind="window", station=window.target or state.me.station, objectKey=object_key, action="ABSTAIN", reason="争抢窗口重复出现，停止加码，保留荔枝继续主线")
-                return Decision(ActionBundle(window=WindowAction(window.id, WindowCard.ABSTAIN)), f"window_stall:{object_key}")
-            choice = self.window_strategy.choose(state, window, self.config)
-            self.logger.info("strategy_step", step="window_card", contestId=window.id, contestType=window.window_type, target=window.target, resourceType=window.resource_type, taskId=window.task_id, roundIndex=window.round_index, chosenCard=choice.card.value, windowStyle=choice.style, choiceReason=choice.reason, roll=choice.roll)
-            return Decision(ActionBundle(window=WindowAction(window.id, choice.card)), f"window:{window.window_type}:{choice.card.value}")
-
-        if me.delivered or me.status == ConvoyStatus.DELIVERED:
-            return Decision(wait("already_delivered", active=False), "already_delivered")
-        if me.retired or me.status == ConvoyStatus.RETIRED:
-            return Decision(wait("retired", active=False), "retired")
-        if me.status in MOVING_STATES:
-            horse = self._moving_horse_action(state)
-            if horse is not None:
-                return Decision(horse, "use_horse_while_moving")
-            return Decision(wait(f"moving:{me.status.value}", active=False), f"moving:{me.status.value}")
-        if me.status in BUSY_STATES:
-            return Decision(wait(f"busy:{me.status.value}", active=False), f"busy:{me.status.value}")
-
-        fresh_action = self._freshness_action(state)
-        if fresh_action is not None:
-            return Decision(fresh_action, "use_ice_box")
-
-        if me.station == state.terminal_node:
-            if me.verified and me.good_fruit > 0 and me.freshness > 0:
-                return Decision(ActionBundle(main=MainAction(MainActionType.DELIVER)), "deliver")
-            return Decision(self._move_to(state, state.gate_node), "leave_terminal_not_ready")
-
-        if me.station == state.gate_node:
-            if not me.verified:
-                if self._can_verify_gate(state):
-                    return Decision(self._verify_action(state), "verify_gate")
-                return Decision(wait("at_gate_before_rush", active=False), "at_gate_before_rush")
-            return Decision(self._move_to(state, state.terminal_node), "gate_to_terminal")
-
-        fixed_process = self._fixed_process_action(state)
-        if fixed_process is not None:
-            return Decision(fixed_process, "fixed_process")
-
-        if self._need_endgame(state) or self._opponent_pressure(state):
-            self.logger.info("strategy_step", step="delivery_guard", reason="rush_deadline_or_opponent_pressure")
-            return Decision(self._move_towards_delivery(state), "delivery_guard")
-
-        if self._is_station_escape_active(state):
-            self.logger.info("stall_breaker", kind="station", station=me.station, stayFrames=self._station_stay_frames(state), escapeUntil=self._station_escape_until.get(me.station or ""), action="MOVE_MAINLINE", reason="当前站点争抢/休整过久，暂停本地任务和资源，直奔主线")
-            return Decision(self._move_towards_delivery(state), "station_stall_escape")
-
-        station_task = self._best_station_task(state)
-        if station_task is not None:
-            return Decision(self._claim_task(station_task), f"claim_task:{station_task.template}:{station_task.id}")
-
-        station_resource = self._best_station_resource(state)
-        if station_resource is not None:
-            return Decision(self._claim_resource(station_resource), f"claim_resource:{station_resource.resource_type}")
-
-        scout = self._squad_scout_action(state)
-        route_task = self._best_reachable_task(state)
-        if route_task is not None:
-            return Decision(self._move_towards_node(state, route_task.target, squad=scout), f"move_to_task:{route_task.template}:{route_task.id}")
-
-        route_resource = self._best_reachable_resource(state)
-        if route_resource is not None:
-            return Decision(self._move_towards_node(state, route_resource.station, squad=scout), f"move_to_resource:{route_resource.resource_type}")
-
-        return Decision(self._move_towards_delivery(state, squad=scout), "move_towards_delivery")
 
     def _need_endgame(self, state: GameState) -> bool:
         me = state.me
