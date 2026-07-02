@@ -3,10 +3,10 @@ from __future__ import annotations
 import io
 import unittest
 
-from lizhi_agent.actions import MainActionType
+from lizhi_agent.actions import MainActionType, WindowCard
 from lizhi_agent.config import StrategyConfig
 from lizhi_agent.logger import DecisionLogger
-from lizhi_agent.models import ConvoyStatus, GameState, PlayerState, ResourceStock, RouteEdge, Station, TaskInstance
+from lizhi_agent.models import ConvoyStatus, GameState, PlayerState, ResourceStock, RouteEdge, Station, TaskInstance, WindowState
 from lizhi_agent.protocol import LengthPrefixedCodec
 from lizhi_agent.strategy import BaselineStrategy
 
@@ -121,6 +121,52 @@ class BaselineStrategyTest(unittest.TestCase):
         action = self.strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.CLAIM_TASK)
         self.assertEqual(action.main.to_action()["taskId"], "t04")
+
+    def test_station_stall_escapes_current_task_loop(self) -> None:
+        first = GameState(
+            frame=100,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=30),
+            edges=[RouteEdge(id="E1", start="S03", end="S14", distance=1)],
+            tasks=[TaskInstance(id="task-loop", template="T01", target="S03", score=30, process_frames=3)],
+        )
+        self.assertEqual(self.strategy.decide(first).main.action, MainActionType.CLAIM_TASK)
+
+        stalled = GameState(
+            frame=119,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=30),
+            edges=[RouteEdge(id="E1", start="S03", end="S14", distance=1)],
+            tasks=[TaskInstance(id="task-loop", template="T01", target="S03", score=30, process_frames=3)],
+        )
+        action = self.strategy.decide(stalled)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
+
+    def test_repeated_window_abstains_after_short_fight(self) -> None:
+        window = WindowState(
+            id="contest-1",
+            window_type="TASK",
+            target="S03",
+            task_id="task-loop",
+            active=True,
+            my_turn=True,
+            round_index=1,
+        )
+        base = GameState(
+            frame=100,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", guard_points=1),
+            windows=[window],
+        )
+        self.assertNotEqual(self.strategy.decide(base).window.card, WindowCard.ABSTAIN)
+        self.assertNotEqual(self.strategy.decide(base).window.card, WindowCard.ABSTAIN)
+        self.assertEqual(self.strategy.decide(base).window.card, WindowCard.ABSTAIN)
 
 
 class ProtocolCodecTest(unittest.TestCase):

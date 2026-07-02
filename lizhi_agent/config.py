@@ -10,6 +10,10 @@ class StrategyConfig:
     endgame_buffer_frames: int = 45
     max_task_detour_frames: int = 18
     max_resource_detour_frames: int = 8
+    station_stall_frames: int = 18
+    station_escape_frames: int = 36
+    object_cooldown_frames: int = 30
+    max_window_rounds_before_abstain: int = 2
     low_freshness_threshold: float = 75.0
     critical_freshness_threshold: float = 55.0
     resource_priority: tuple[str, ...] = (

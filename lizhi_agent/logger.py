@@ -160,7 +160,7 @@ class DecisionLogger:
                 f"[出牌] 窗口={fields.get('contestType')} 目标={fields.get('target')} "
                 f"第{fields.get('roundIndex')}拍，出 {fields.get('chosenCard')}"
             )
-        if step == "endgame_guard":
+        if step in {"endgame_guard", "delivery_guard"}:
             return "[急行] 已触发终局保护，暂停贪心，优先奔向宫门/终点"
         return f"[策略] {step} | {self._short(fields)}"
 
@@ -182,6 +182,25 @@ class DecisionLogger:
 
     def _fmt_move_decision(self, fields: dict[str, Any]) -> str:
         return f"[行军] 向 {fields.get('target')} 前进"
+
+    def _fmt_stall_breaker(self, fields: dict[str, Any]) -> str:
+        kind = fields.get("kind")
+        if kind == "station":
+            return (
+                f"[破局] {fields.get('station')} 停留 {fields.get('stayFrames', '?')} 帧，"
+                f"{fields.get('reason')}；动作={fields.get('action')}，冷却到第 {fields.get('escapeUntil')} 帧"
+            )
+        if kind == "window":
+            return (
+                f"[破局] 争抢窗口 {fields.get('objectKey')} 反复拉扯，"
+                f"{fields.get('reason')}；本拍出 {fields.get('action')}"
+            )
+        if kind == "object":
+            return (
+                f"[破局] 对象 {fields.get('objectKey')} 暂时放弃，"
+                f"原因={fields.get('reason')}，冷却到第 {fields.get('cooldownUntil')} 帧"
+            )
+        return f"[破局] {self._short(fields)}"
 
     def _fmt_decision(self, fields: dict[str, Any]) -> str:
         return f"[定策] 原因={fields.get('reason')} | 最终动作={self._actions_text(fields.get('actions') or [])}"

@@ -76,6 +76,10 @@ class BaselineStrategy:
         self._start_seen = False
         self._scout_dispatched: set[str] = set()
         self._last_station: str | None = None
+        self._station_since_frame: int | None = None
+        self._station_escape_until: dict[str, int] = {}
+        self._object_cooldown_until: dict[str, int] = {}
+        self._window_seen: dict[str, int] = {}
         self._completed_fixed_process_nodes: set[str] = set()
         self._rejected_fixed_process_nodes: set[str] = set()
         self._rejected_task_ids: set[str] = set()
@@ -91,6 +95,7 @@ class BaselineStrategy:
 
     def decide(self, state: GameState) -> ActionBundle:
         self._learn_from_feedback(state)
+        self._update_station_tracking(state)
         if state.me.station != self._last_station and state.me.station is not None:
             # Fixed processing must be redone when the convoy leaves and later
             # re-enters the same processing station.  Keep the completion mark
@@ -128,6 +133,10 @@ class BaselineStrategy:
                 self.logger.info("feedback_learn", learned="fixed_process_completed", nodeId=node_id, event=event)
             if event_type in {"TASK_COMPLETE", "CLAIM_TASK_COMPLETE"} and task_id:
                 self._rejected_task_ids.discard(str(task_id))
+            if event_type in {"WINDOW_CONTEST_DRAW", "WINDOW_CONTEST_REPEAT_SUPPRESSED", "CONTEST_DRAW"}:
+                object_key = self._event_object_key(event)
+                if object_key is not None:
+                    self._cooldown_object(state, object_key, f"event:{event_type}")
 
         for result in state.action_results:
             if not isinstance(result, dict):
@@ -155,9 +164,11 @@ class BaselineStrategy:
                 self.logger.info("feedback_learn", learned="fixed_process_rejected", nodeId=node_id, code=code, result=result)
             if action == "CLAIM_TASK" and task_id:
                 self._rejected_task_ids.add(str(task_id))
+                self._cooldown_object(state, self._task_object_key(str(task_id)), f"reject:{code}")
                 self.logger.info("feedback_learn", learned="task_rejected", taskId=task_id, code=code, result=result)
             if action == "CLAIM_RESOURCE" and node_id and resource_type:
                 self._rejected_resource_keys.add((str(node_id), str(resource_type)))
+                self._cooldown_object(state, self._resource_object_key(str(node_id), str(resource_type)), f"reject:{code}")
                 self.logger.info("feedback_learn", learned="resource_rejected", nodeId=node_id, resourceType=resource_type, code=code, result=result)
 
     def _log_state_snapshot(self, state: GameState) -> None:
@@ -197,6 +208,8 @@ class BaselineStrategy:
             turnsLeft=state.turns_left,
             rejectedTasks=list(sorted(self._rejected_task_ids))[:5],
             rejectedProcessNodes=list(sorted(self._rejected_fixed_process_nodes))[:5],
+            stationStay=self._station_stay_frames(state),
+            stationEscapeUntil=self._station_escape_until.get(me.station or ""),
         )
 
     def _state_class(self, status: ConvoyStatus) -> str:
@@ -213,6 +226,24 @@ class BaselineStrategy:
 
         window = state.active_window()
         if window is not None:
+            object_key = self._window_object_key(window)
+            if object_key is not None:
+                self._window_seen[object_key] = self._window_seen.get(object_key, 0) + 1
+            if object_key is not None and (
+                self._is_object_on_cooldown(state, object_key)
+                or self._is_station_escape_active(state, window.target or state.me.station)
+                or self._window_seen.get(object_key, 0) > self.config.max_window_rounds_before_abstain
+            ):
+                self._cooldown_object(state, object_key, "window_stall")
+                self.logger.info(
+                    "stall_breaker",
+                    kind="window",
+                    station=window.target or state.me.station,
+                    objectKey=object_key,
+                    action="ABSTAIN",
+                    reason="争抢窗口重复出现，停止加码，保留荔枝继续主线",
+                )
+                return Decision(ActionBundle(window=WindowAction(window.id, WindowCard.ABSTAIN)), f"window_stall:{object_key}")
             card = self.window_strategy.choose_card(state, window)
             self.logger.info(
                 "strategy_step",
@@ -265,6 +296,18 @@ class BaselineStrategy:
         fixed_process = self._fixed_process_action(state)
         if fixed_process is not None:
             return Decision(fixed_process, "fixed_process")
+
+        if self._is_station_escape_active(state):
+            self.logger.info(
+                "stall_breaker",
+                kind="station",
+                station=me.station,
+                stayFrames=self._station_stay_frames(state),
+                escapeUntil=self._station_escape_until.get(me.station or ""),
+                action="MOVE_MAINLINE",
+                reason="当前站点争抢/休整过久，暂停本地任务和资源，直奔主线",
+            )
+            return Decision(self._move_towards_delivery(state), "station_stall_escape")
 
         station_task = self._best_station_task(state)
         if station_task is not None:
@@ -358,7 +401,12 @@ class BaselineStrategy:
         return ActionBundle(main=MainAction(MainActionType.PROCESS, target=station.id))
 
     def _best_station_task(self, state: GameState) -> TaskInstance | None:
-        tasks = [task for task in state.station_tasks(state.me.station) if task.id not in self._rejected_task_ids]
+        tasks = [
+            task
+            for task in state.station_tasks(state.me.station)
+            if task.id not in self._rejected_task_ids
+            and not self._is_object_on_cooldown(state, self._task_object_key(task.id))
+        ]
         if not tasks:
             self.logger.info("task_eval_station", station=state.me.station, candidates=[])
             return None
@@ -393,7 +441,12 @@ class BaselineStrategy:
         return None
 
     def _best_station_resource(self, state: GameState) -> ResourceStock | None:
-        stocks = [stock for stock in state.station_resources(state.me.station) if (stock.station, stock.resource_type) not in self._rejected_resource_keys]
+        stocks = [
+            stock
+            for stock in state.station_resources(state.me.station)
+            if (stock.station, stock.resource_type) not in self._rejected_resource_keys
+            and not self._is_object_on_cooldown(state, self._resource_object_key(stock.station, stock.resource_type))
+        ]
         if not stocks:
             self.logger.info("resource_eval_station", station=state.me.station, candidates=[])
             return None
@@ -434,6 +487,8 @@ class BaselineStrategy:
         candidates: list[tuple[int, TaskInstance, int, int, int]] = []
         for task in state.tasks:
             if task.id in self._rejected_task_ids:
+                continue
+            if self._is_object_on_cooldown(state, self._task_object_key(task.id)):
                 continue
             if not task.available_for(state.player_id) or task.score <= 0:
                 continue
@@ -487,6 +542,8 @@ class BaselineStrategy:
         candidates: list[tuple[int, ResourceStock, int]] = []
         for stock in state.resources:
             if (stock.station, stock.resource_type) in self._rejected_resource_keys:
+                continue
+            if self._is_object_on_cooldown(state, self._resource_object_key(stock.station, stock.resource_type)):
                 continue
             if stock.resource_type not in priority:
                 continue
@@ -555,6 +612,109 @@ class BaselineStrategy:
 
     def _claim_resource(self, resource: ResourceStock) -> ActionBundle:
         return ActionBundle(main=MainAction(MainActionType.CLAIM_RESOURCE, target=resource.station, resource_type=resource.resource_type))
+
+    def _update_station_tracking(self, state: GameState) -> None:
+        station = state.me.station
+        if station is None:
+            self._station_since_frame = None
+            return
+        if station != self._last_station or self._station_since_frame is None:
+            self._station_since_frame = state.frame
+            return
+        if self._is_mainline_station(state, station):
+            return
+        stay_frames = self._station_stay_frames(state)
+        if stay_frames < self.config.station_stall_frames:
+            return
+        if self._is_station_escape_active(state, station):
+            return
+        until = state.frame + self.config.station_escape_frames
+        self._station_escape_until[station] = until
+        self.logger.info(
+            "stall_breaker",
+            kind="station",
+            station=station,
+            stayFrames=stay_frames,
+            escapeUntil=until,
+            action="ARM_ESCAPE",
+            reason="同一站点停留过久，疑似任务/资源争抢循环",
+        )
+
+    def _station_stay_frames(self, state: GameState) -> int:
+        if self._station_since_frame is None:
+            return 0
+        return max(0, state.frame - self._station_since_frame)
+
+    def _is_station_escape_active(self, state: GameState, station: str | None = None) -> bool:
+        station_id = station or state.me.station
+        if station_id is None:
+            return False
+        until = self._station_escape_until.get(station_id)
+        if until is None:
+            return False
+        if state.frame <= until:
+            return True
+        self._station_escape_until.pop(station_id, None)
+        return False
+
+    def _is_mainline_station(self, state: GameState, station: str) -> bool:
+        return station in {state.start_node, state.gate_node, state.terminal_node}
+
+    def _cooldown_object(self, state: GameState, object_key: str, reason: str) -> None:
+        until = state.frame + self.config.object_cooldown_frames
+        if self._object_cooldown_until.get(object_key, 0) >= until:
+            return
+        self._object_cooldown_until[object_key] = until
+        self.logger.info(
+            "stall_breaker",
+            kind="object",
+            objectKey=object_key,
+            cooldownUntil=until,
+            reason=reason,
+        )
+
+    def _is_object_on_cooldown(self, state: GameState, object_key: str) -> bool:
+        until = self._object_cooldown_until.get(object_key)
+        if until is None:
+            return False
+        if state.frame <= until:
+            return True
+        self._object_cooldown_until.pop(object_key, None)
+        return False
+
+    def _task_object_key(self, task_id: str) -> str:
+        return f"TASK:{task_id}"
+
+    def _resource_object_key(self, station: str, resource_type: str) -> str:
+        return f"RESOURCE:{station}:{resource_type}"
+
+    def _window_object_key(self, window: WindowState) -> str | None:
+        raw_key = window.raw.get("objectKey")
+        if raw_key:
+            return str(raw_key)
+        if window.task_id:
+            return self._task_object_key(window.task_id)
+        if window.target and window.resource_type:
+            return self._resource_object_key(str(window.target), str(window.resource_type))
+        if window.id:
+            return f"WINDOW:{window.id}"
+        return None
+
+    def _event_object_key(self, event: dict[str, Any]) -> str | None:
+        raw_key = event.get("objectKey")
+        if raw_key:
+            return str(raw_key)
+        task_id = event.get("taskId")
+        if task_id:
+            return self._task_object_key(str(task_id))
+        node_id = event.get("targetNodeId") or event.get("nodeId")
+        resource_type = event.get("resourceType")
+        if node_id and resource_type:
+            return self._resource_object_key(str(node_id), str(resource_type))
+        contest_id = event.get("contestId")
+        if contest_id:
+            return f"WINDOW:{contest_id}"
+        return None
 
     def _move_towards_delivery(self, state: GameState, squad: SquadAction | None = None) -> ActionBundle:
         target = state.terminal_node if state.me.verified else state.gate_node
