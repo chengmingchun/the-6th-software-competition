@@ -366,6 +366,9 @@ class WindowStrategy:
         return ",".join(f"{card.value}:{weight}" for card, weight in options)
 
     def _opponent_revealed_card(self, state: GameState, window: WindowState) -> WindowCard | None:
+        direct = self._opponent_card_from_direct_fields(state, window)
+        if direct is not None:
+            return direct
         cards = window.raw.get("cards")
         if not isinstance(cards, dict) or not cards:
             return None
@@ -375,6 +378,34 @@ class WindowStrategy:
                 continue
             try:
                 return WindowCard(str(card_value))
+            except ValueError:
+                continue
+        return None
+
+    def _opponent_card_from_direct_fields(self, state: GameState, window: WindowState) -> WindowCard | None:
+        raw = window.raw
+        my_team = str(state.me.team_id or "")
+        if not my_team:
+            red_pid = str(raw.get("redPlayerId") or "")
+            blue_pid = str(raw.get("bluePlayerId") or "")
+            if red_pid == str(state.player_id):
+                my_team = "RED"
+            elif blue_pid == str(state.player_id):
+                my_team = "BLUE"
+        candidates: list[Any] = []
+        if my_team == "RED":
+            candidates.extend([raw.get("blueCard"), raw.get("lastBlueCard"), raw.get("blueLastCard")])
+        elif my_team == "BLUE":
+            candidates.extend([raw.get("redCard"), raw.get("lastRedCard"), raw.get("redLastCard")])
+        for key in ("lastOpponentCard", "opponentCard"):
+            candidates.append(raw.get(key))
+        for value in candidates:
+            if isinstance(value, list) and value:
+                value = value[-1]
+            if value in (None, ""):
+                continue
+            try:
+                return WindowCard(str(value))
             except ValueError:
                 continue
         return None
@@ -427,6 +458,8 @@ class BaselineStrategy:
         self._task_approach_nodes: dict[str, str] = {}
         self._last_attempted_task: tuple[int, str] | None = None
         self._last_attempted_resource: tuple[int, str, str] | None = None
+        self._last_attempted_move: tuple[int, str] | None = None
+        self._blocked_guard_nodes: set[str] = set()
 
     def on_start(self, start_data: dict) -> None:
         self._start_seen = True
@@ -620,6 +653,10 @@ class BaselineStrategy:
             node_id = result.get("targetNodeId") or result.get("nodeId") or state.me.station
             task_id = result.get("taskId")
             resource_type = result.get("resourceType")
+            if action == "MOVE" and code == "MOVE_BLOCKED_BY_GUARD":
+                recent_move = self._recent_attempted_move(state)
+                if recent_move is not None:
+                    node_id = recent_move
             if action == "CLAIM_TASK" and not task_id:
                 task_id = self._recent_attempted_task(state)
             if action == "CLAIM_RESOURCE" and (not node_id or not resource_type):
@@ -683,6 +720,9 @@ class BaselineStrategy:
             self._rejected_resource_keys.add((str(node_id), str(resource_type)))
             self._cooldown_object(state, self._resource_object_key(str(node_id), str(resource_type)), f"reject:{code}")
             self.logger.info("feedback_learn", learned="resource_rejected", nodeId=node_id, resourceType=resource_type, code=code, result=raw)
+        if action == "MOVE" and code == "MOVE_BLOCKED_BY_GUARD" and node:
+            self._blocked_guard_nodes.add(node)
+            self.logger.info("feedback_learn", learned="move_blocked_by_guard", nodeId=node, code=code, result=raw)
 
     def _mark_process_pending(self, node: str, state: GameState, reason: str) -> None:
         station = state.station(node)
@@ -712,6 +752,8 @@ class BaselineStrategy:
             self._last_attempted_task = (state.frame, bundle.main.task_id)
         elif bundle.main.action == MainActionType.CLAIM_RESOURCE and bundle.main.target and bundle.main.resource_type:
             self._last_attempted_resource = (state.frame, bundle.main.target, bundle.main.resource_type)
+        elif bundle.main.action == MainActionType.MOVE and bundle.main.target:
+            self._last_attempted_move = (state.frame, bundle.main.target)
         elif bundle.main.action == MainActionType.USE_RESOURCE and bundle.main.resource_type == "INTEL" and bundle.main.target:
             self._scout_dispatched.add(bundle.main.target)
 
@@ -729,6 +771,14 @@ class BaselineStrategy:
         frame, node_id, resource_type = self._last_attempted_resource
         if state.frame - frame <= 3:
             return node_id, resource_type
+        return None
+
+    def _recent_attempted_move(self, state: GameState) -> str | None:
+        if self._last_attempted_move is None:
+            return None
+        frame, node_id = self._last_attempted_move
+        if state.frame - frame <= 3:
+            return node_id
         return None
 
     def _pending_process_wait_action(self, state: GameState) -> ActionBundle | None:
@@ -925,10 +975,10 @@ class BaselineStrategy:
             return None
         target = self._current_route_objective(state)
         remaining_cost = self.route_planner.estimate_frames(state, me.station, target)
-        if remaining_cost >= 6 and me.has_resource("FAST_HORSE"):
+        if remaining_cost >= 5 and me.has_resource("FAST_HORSE"):
             self.logger.info("resource_use", resourceType="FAST_HORSE", reason="pre_move_long_route", target=target, remainingCost=remaining_cost)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="FAST_HORSE"))
-        if remaining_cost >= 4 and me.has_resource("SHORT_HORSE") and (me.task_score_base >= self.config.target_task_score or state.turns_left < 360):
+        if remaining_cost >= 3 and me.has_resource("SHORT_HORSE") and (me.task_score_base >= 60 or state.turns_left < 420):
             self.logger.info("resource_use", resourceType="SHORT_HORSE", reason="pre_move_medium_route", target=target, remainingCost=remaining_cost)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="SHORT_HORSE"))
         return None
@@ -1292,7 +1342,7 @@ class BaselineStrategy:
         station = state.station(me.station)
         if station is not None and station.has_obstacle:
             return None
-        if self._is_my_mainline_next_hop(state, me.station):
+        if self._is_my_mainline_next_hop(state, me.station) and not self._is_key_chokepoint(me.station):
             return None
         if self._opponent_next_hop_to_gate(state) != me.station:
             return None
@@ -1305,6 +1355,9 @@ class BaselineStrategy:
             return None
         self.logger.info("blocker_decision", target=me.station, blocker="opponent_route", action="SET_GUARD", reason="zero_good_fruit_chokepoint")
         return ActionBundle(main=MainAction(MainActionType.SET_GUARD, target=me.station, extra_good_fruit=0))
+
+    def _is_key_chokepoint(self, station: str) -> bool:
+        return station in {"S09", "S10", "S11", "S13", "S14"}
 
     def _is_my_mainline_next_hop(self, state: GameState, station: str) -> bool:
         target = state.terminal_node if state.me.verified else state.gate_node
@@ -1328,8 +1381,12 @@ class BaselineStrategy:
         for index, node in enumerate(plan.path[1 : 1 + SCOUT_PATH_LOOKAHEAD], start=1):
             if node in forbidden or node in self._scout_dispatched or self._has_own_scout_marker(state, node):
                 continue
+            eta = self.route_planner.estimate_frames(state, state.me.station, node)
+            if eta > 38:
+                details.append({"target": node, "value": 0, "reason": "eta_too_late_for_marker", "hop": index})
+                continue
             score, reason = self._scout_target_value(state, node, objective)
-            details.append({"target": node, "value": score, "reason": reason, "hop": index})
+            details.append({"target": node, "value": score, "reason": reason, "hop": index, "eta": eta})
             if score <= 0:
                 continue
             scored.append((score, -index, node, reason))
@@ -1501,7 +1558,7 @@ class BaselineStrategy:
                 return ActionBundle(main=MainAction(MainActionType.CLEAR, target=target), squad=support)
             self.logger.info("blocker_decision", target=target, blocker="obstacle", action="FORCED_PASS", reason="save_good_fruit")
             return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=target), squad=support)
-        if station is not None and station.has_enemy_guard(state.me.team_id):
+        if self._has_enemy_guard_or_learned_block(state, target, station):
             bad_to_spend = self._bad_fruit_to_break_guard(state, station)
             if bad_to_spend > 0:
                 self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="BREAK_GUARD", reason="spend_bad_fruit_first", badFruit=bad_to_spend)
@@ -1518,19 +1575,26 @@ class BaselineStrategy:
         self.logger.info("move_decision", target=target, action="MOVE")
         return ActionBundle(main=MainAction(MainActionType.MOVE, target=target), squad=squad)
 
+    def _has_enemy_guard_or_learned_block(self, state: GameState, target: str, station: Station | None) -> bool:
+        if station is not None and station.has_enemy_guard(state.me.team_id):
+            return True
+        return target in self._blocked_guard_nodes
+
     def _should_spend_good_fruit_to_clear(self, state: GameState) -> bool:
         return self._need_endgame(state) and state.me.good_fruit >= 95
 
-    def _bad_fruit_to_break_guard(self, state: GameState, station: Station) -> int:
+    def _bad_fruit_to_break_guard(self, state: GameState, station: Station | None) -> int:
         if state.me.bad_fruit <= 0:
             return 0
-        needed = max(1, (station.guard_defense + 2) // 3)
+        defense = max(1, station.guard_defense if station is not None else 2)
+        needed = max(1, (defense + 2) // 3)
         if needed <= min(2, state.me.bad_fruit):
             return needed
         return 0
 
-    def _should_spend_good_fruit_to_break_guard(self, state: GameState, station: Station) -> bool:
-        return self._need_endgame(state) and state.me.good_fruit >= 98 and station.guard_defense <= 2
+    def _should_spend_good_fruit_to_break_guard(self, state: GameState, station: Station | None) -> bool:
+        defense = max(1, station.guard_defense if station is not None else 2)
+        return self._need_endgame(state) and state.me.good_fruit >= 98 and defense <= 2
 
     def _squad_blocker_action(self, state: GameState, target: str, blocker: str) -> SquadAction | None:
         if state.phase in RUSH_PHASES or state.me.squad_available <= 0:
