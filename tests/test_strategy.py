@@ -166,7 +166,7 @@ class BaselineStrategyTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95),
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, squad_available=0),
             stations={"S09": Station(id="S09")},
             edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
         )
@@ -194,7 +194,7 @@ class BaselineStrategyTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95),
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, squad_available=0),
             stations={"S09": Station(id="S09")},
             edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
         )
@@ -205,14 +205,15 @@ class BaselineStrategyTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, resources={"OFFICIAL_PERMIT": 1}),
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, resources={"OFFICIAL_PERMIT": 1}, squad_available=0),
             stations={"S09": Station(id="S09")},
             edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
             action_results=[{"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD"}],
         )
         action = self.strategy.decide(blocked)
-        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
-        self.assertEqual(action.main.to_action()["resourceType"], "OFFICIAL_PERMIT")
+        # OFFICIAL_PERMIT is a YAN_DIE window card cost, not a USE_RESOURCE.
+        # Guarded S09 is the only route — must FORCED_PASS through.
+        self.assertEqual(action.main.action, MainActionType.FORCED_PASS)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
 
     def test_uses_pass_token_when_no_official_permit(self) -> None:
@@ -221,7 +222,7 @@ class BaselineStrategyTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95),
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, squad_available=0),
             stations={"S09": Station(id="S09")},
             edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
         )
@@ -232,52 +233,42 @@ class BaselineStrategyTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, resources={"PASS_TOKEN": 1}),
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, resources={"PASS_TOKEN": 1}, squad_available=0),
             stations={"S09": Station(id="S09")},
             edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
             action_results=[{"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD"}],
         )
         action = self.strategy.decide(blocked)
-        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
-        self.assertEqual(action.main.to_action()["resourceType"], "PASS_TOKEN")
+        # PASS_TOKEN is a YAN_DIE window card cost, not a USE_RESOURCE.
+        self.assertEqual(action.main.action, MainActionType.FORCED_PASS)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
 
-    def test_unblock_resource_reject_cooldown(self) -> None:
+    def test_guard_block_sends_forced_pass_when_no_alternate(self) -> None:
         first = GameState(
             frame=100,
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95),
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, squad_available=0),
             stations={"S09": Station(id="S09")},
             edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
         )
         self.assertEqual(self.strategy.decide(first).main.action, MainActionType.MOVE)
 
-        use = GameState(
+        blocked = GameState(
             frame=101,
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, resources={"OFFICIAL_PERMIT": 1}),
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, squad_available=0),
             stations={"S09": Station(id="S09")},
             edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
             action_results=[{"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD"}],
         )
-        self.assertEqual(self.strategy.decide(use).main.to_action()["resourceType"], "OFFICIAL_PERMIT")
-
-        rejected = GameState(
-            frame=102,
-            phase="NORMAL",
-            player_id="1001",
-            roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, resources={"OFFICIAL_PERMIT": 1}, squad_available=0),
-            stations={"S09": Station(id="S09")},
-            edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
-            action_results=[{"playerId": "1001", "action": "USE_RESOURCE", "accepted": False, "code": "INVALID_ACTION"}],
-        )
-        action = self.strategy.decide(rejected)
-        self.assertNotEqual(action.main.to_action().get("resourceType"), "OFFICIAL_PERMIT")
+        action = self.strategy.decide(blocked)
+        self.assertEqual(action.main.action, MainActionType.FORCED_PASS)
+        self.assertEqual(action.main.action, MainActionType.FORCED_PASS)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
 
     def test_guard_block_prefers_alternate_route(self) -> None:
         first = GameState(
@@ -285,7 +276,7 @@ class BaselineStrategyTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95),
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, squad_available=0),
             stations={"S09": Station(id="S09"), "S10": Station(id="S10")},
             edges=[
                 RouteEdge(id="E1", start="S08", end="S09", distance=1),
@@ -301,7 +292,7 @@ class BaselineStrategyTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95),
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, squad_available=0),
             stations={"S09": Station(id="S09"), "S10": Station(id="S10")},
             edges=[
                 RouteEdge(id="E1", start="S08", end="S09", distance=1),

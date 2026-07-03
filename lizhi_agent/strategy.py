@@ -32,19 +32,8 @@ RUSH_PHASES = {"RUSH", "BANQUET", "ENDGAME", "FINAL", "宫宴冲刺"}
 PLANNING_STATES = {ConvoyStatus.IDLE, ConvoyStatus.WAITING, ConvoyStatus.UNKNOWN, ConvoyStatus.COST_BANKRUPT}
 PROCESS_RETRY_CODES = {"PROCESS_REQUIRED", "PROCESS_INTERRUPTED", "INTERRUPTED"}
 PROCESS_HARD_REJECT_CODES = {"PROCESS_NOT_AVAILABLE", "NOT_AT_TARGET_NODE", "INVALID_TARGET"}
-UNBLOCK_RESOURCE_TYPES = {"OFFICIAL_PERMIT", "PASS_TOKEN"}
-UNBLOCK_RESOURCE_REJECT_CODES = {
-    "INVALID_ACTION",
-    "RESOURCE_NOT_APPLICABLE",
-    "RESOURCE_TARGET_INVALID",
-    "RESOURCE_NOT_FOUND",
-    "RESOURCE_NOT_OWNED",
-    "INVALID_TARGET",
-    "NOT_AT_TARGET_NODE",
-}
 TASK_TEMPLATE_REJECT_CODES = {"TASK_CONDITION_NOT_MET", "TASK_REQUIREMENT_NOT_MET", "RESOURCE_REQUIRED", "NO_HORSE"}
 SHORT_BUSY_COOLDOWN_FRAMES = 5
-UNBLOCK_RESOURCE_COOLDOWN_FRAMES = 40
 LEARNED_GUARD_BLOCK_FRAMES = 999999  # permanent once learned
 WINDOW_REJECT_CODES = {
     "WINDOW_NOT_ACTIVE",
@@ -501,7 +490,6 @@ class BaselineStrategy:
         self._pending_process_started_at: dict[str, int] = {}
         self._rejected_task_ids: set[str] = set()
         self._rejected_resource_keys: set[tuple[str, str]] = set()
-        self._rejected_unblock_resource_until: dict[tuple[str, str], int] = {}
         self._rejected_task_templates_until: dict[str, int] = {}
         self._rejected_t04_targets_until: dict[str, int] = {}
         self._task_approach_nodes: dict[str, str] = {}
@@ -752,14 +740,9 @@ class BaselineStrategy:
             return
         node = str(node_id or state.me.station or "")
         resource_name = str(resource_type or "")
-        if action == "USE_RESOURCE" and resource_name in UNBLOCK_RESOURCE_TYPES and node and code in UNBLOCK_RESOURCE_REJECT_CODES:
-            until = state.frame + UNBLOCK_RESOURCE_COOLDOWN_FRAMES
-            self._rejected_unblock_resource_until[(resource_name, node)] = until
-            self.logger.info("feedback_learn", learned="unblock_resource_rejected", resourceType=resource_name, nodeId=node, code=code, cooldownUntil=until, result=raw)
-            return
         if action == "USE_RESOURCE" and resource_name == "INTEL" and node:
             key = self._intel_object_key(node)
-            self._cooldown_object_for(state, key, UNBLOCK_RESOURCE_COOLDOWN_FRAMES, f"reject:{code}")
+            self._cooldown_object_for(state, key, SHORT_BUSY_COOLDOWN_FRAMES, f"reject:{code}")
             self._scout_dispatched.discard(node)
             self.logger.info("feedback_learn", learned="intel_target_rejected", resourceType=resource_name, nodeId=node, code=code, result=raw)
             return
@@ -1248,7 +1231,7 @@ class BaselineStrategy:
         for stock in stocks:
             if stock.resource_type == "ICE_BOX" and (state.me.freshness <= 98 or state.me.task_score_base >= 45 or self._hot_weather_active(state) or self._weather_forecast(state, "HOT")):
                 urgent.append(stock)
-            elif stock.resource_type in UNBLOCK_RESOURCE_TYPES and (self._route_has_blocker_risk(state) or state.me.task_score_base >= self.config.target_task_score):
+            elif stock.resource_type in {"PASS_TOKEN", "OFFICIAL_PERMIT"} and (self._route_has_blocker_risk(state) or state.me.task_score_base >= self.config.target_task_score):
                 urgent.append(stock)
             elif stock.resource_type in {"FAST_HORSE", "SHORT_HORSE"} and self._remaining_delivery_cost(state) >= 8:
                 urgent.append(stock)
@@ -1845,10 +1828,6 @@ class BaselineStrategy:
             self.logger.info("blocker_decision", target=target, blocker="obstacle", action="FORCED_PASS", reason="save_good_fruit")
             return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=target), squad=support)
         if self._has_enemy_guard_or_learned_block(state, target, station):
-            blocker = "enemy_guard" if station is not None and station.has_enemy_guard(state.me.team_id) else "learned_guard_block"
-            unblock = self._route_unblock_resource_action(state, target, blocker)
-            if unblock is not None:
-                return unblock
             bad_to_spend = self._bad_fruit_to_break_guard(state, station)
             if bad_to_spend > 0:
                 self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="BREAK_GUARD", reason="spend_bad_fruit_first", badFruit=bad_to_spend)
@@ -1906,28 +1885,7 @@ class BaselineStrategy:
         candidates.sort()
         return candidates[0][1]
 
-    def _route_unblock_resource_action(self, state: GameState, target: str, blocker: str) -> ActionBundle | None:
-        for resource_type in ("OFFICIAL_PERMIT", "PASS_TOKEN"):
-            if not state.me.has_resource(resource_type):
-                continue
-            if self._is_unblock_resource_on_cooldown(state, resource_type, target):
-                continue
-            self.logger.info("resource_use", resourceType=resource_type, reason="unblock_route_guard_or_pass", target=target, blocker=blocker)
-            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, target=target, resource_type=resource_type))
-        return None
 
-    def _has_available_unblock_resource(self, state: GameState, target: str) -> bool:
-        return any(state.me.has_resource(resource_type) and not self._is_unblock_resource_on_cooldown(state, resource_type, target) for resource_type in ("OFFICIAL_PERMIT", "PASS_TOKEN"))
-
-    def _is_unblock_resource_on_cooldown(self, state: GameState, resource_type: str, target: str) -> bool:
-        key = (resource_type, target)
-        until = self._rejected_unblock_resource_until.get(key)
-        if until is None:
-            return False
-        if state.frame <= until:
-            return True
-        self._rejected_unblock_resource_until.pop(key, None)
-        return False
 
     def _should_spend_good_fruit_to_clear(self, state: GameState) -> bool:
         return self._need_endgame(state) and state.me.good_fruit >= 95
