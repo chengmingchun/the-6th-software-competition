@@ -135,9 +135,9 @@ class WindowStrategy:
         me = state.me
         options: list[tuple[WindowCard, int]] = []
         if me.guard_points > 0:
-            options.append((WindowCard.BING_ZHENG, 42 if high_value else 30))
-        if high_value and me.freshness >= 86 and me.good_fruit >= 82:
-            options.append((WindowCard.XIAN_GONG, 34 if high_value else 24))
+            options.append((WindowCard.BING_ZHENG, 30 if high_value else 22))
+        if (high_value or me.guard_points > 0) and me.freshness >= 82 and me.good_fruit >= 75:
+            options.append((WindowCard.XIAN_GONG, 42 if high_value else 28))
         if high_value and (me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")):
             options.append((WindowCard.QIANG_XING, 28))
         if high_value and (me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT")):
@@ -204,11 +204,6 @@ class WindowStrategy:
                 return [(WindowCard.ABSTAIN, 100)]
         if my_score > opp_score + remaining_after_this:
             return [(WindowCard.ABSTAIN, 100)]
-        if high_value and round_index == 1 and WindowCard.BING_ZHENG in affordable and WindowCard.XIAN_GONG in affordable:
-            if str(state.me.team_id or "") == "BLUE":
-                return [(WindowCard.XIAN_GONG, 100)]
-            return [(WindowCard.BING_ZHENG, 100)]
-
         opponent_weights = self._opponent_model(state, window, high_value)
         scored: list[tuple[int, WindowCard]] = []
         for card in affordable:
@@ -334,13 +329,13 @@ class WindowStrategy:
         team = str(state.me.team_id or "")
         if team == "BLUE":
             if card == WindowCard.XIAN_GONG:
-                return 42
+                return 12
             if card == WindowCard.BING_ZHENG:
-                return -8
+                return -4
         if card == WindowCard.BING_ZHENG:
-            return 42
+            return 4
         if card == WindowCard.XIAN_GONG:
-            return -8
+            return 8
         return 0
 
     def _weighted_pick(self, state: GameState, window: WindowState, options: list[tuple[WindowCard, int]]) -> tuple[WindowCard, int]:
@@ -425,6 +420,9 @@ class WindowStrategy:
         if opponent_card == WindowCard.XIAN_GONG:
             if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE"):
                 return WindowCard.QIANG_XING
+            if me.freshness >= 75 and me.good_fruit >= 70:
+                return WindowCard.XIAN_GONG
+            return WindowCard.ABSTAIN
         if opponent_card == WindowCard.BING_ZHENG:
             if high_value and me.freshness >= 85 and me.good_fruit >= 85:
                 return WindowCard.XIAN_GONG
@@ -938,6 +936,12 @@ class BaselineStrategy:
         me = state.me
         if not me.has_resource("ICE_BOX"):
             return None
+        if me.freshness <= 95 and (me.task_score_base >= self.config.target_task_score or state.phase in RUSH_PHASES or self._hot_weather_active(state) or self._weather_forecast(state, "HOT")):
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="preempt_score_quality_gap", freshness=me.freshness, taskScore=me.task_score_base, phase=state.phase, turnsLeft=state.turns_left)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        if me.freshness <= 92 and (me.task_score_base >= 45 or state.turns_left < 420):
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="early_freshness_protection", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         if me.freshness <= self.config.critical_freshness_threshold:
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="critical_freshness", freshness=me.freshness)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
@@ -1194,8 +1198,11 @@ class BaselineStrategy:
             max_detour = self.config.max_resource_detour_frames
             if stock.resource_type in {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE"}:
                 max_detour = max(max_detour, self.config.max_valuable_resource_detour_frames)
-            if stock.resource_type == "ICE_BOX" and self._freshness_pressure(state) >= 1:
-                max_detour = max(max_detour, 72)
+            if stock.resource_type == "ICE_BOX":
+                if state.me.task_score_base >= self.config.target_task_score or state.me.freshness <= 94 or self._freshness_pressure(state) >= 1:
+                    max_detour = max(max_detour, 72)
+                else:
+                    max_detour = max(max_detour, self.config.max_valuable_resource_detour_frames + 10)
             elif self._freshness_pressure(state) >= 2 and stock.resource_type not in {"ICE_BOX", "FAST_HORSE"}:
                 max_detour = min(max_detour, 4)
             if detour <= max_detour:
@@ -1208,19 +1215,28 @@ class BaselineStrategy:
         return chosen
 
     def _best_reachable_ice_box(self, state: GameState) -> ResourceStock | None:
-        if state.me.station is None or not self._should_lock_delivery(state):
+        me = state.me
+        wants_ice = (
+            self._should_lock_delivery(state)
+            or (me.task_score_base >= self.config.target_task_score and me.freshness <= 96)
+            or (not me.has_resource("ICE_BOX") and me.freshness <= 99)
+            or me.freshness <= 88
+            or self._hot_weather_active(state)
+            or self._weather_forecast(state, "HOT")
+        )
+        if me.station is None or not wants_ice:
             return None
-        direct = self.route_planner.estimate_frames(state, state.me.station, state.gate_node)
+        direct = self.route_planner.estimate_frames(state, me.station, state.gate_node)
         candidates: list[tuple[int, ResourceStock, int]] = []
         for stock in state.resources:
             if stock.resource_type != "ICE_BOX":
                 continue
             if (stock.station, stock.resource_type) in self._rejected_resource_keys or self._is_object_on_cooldown(state, self._resource_object_key(stock.station, stock.resource_type)):
                 continue
-            to_res = self.route_planner.estimate_frames(state, state.me.station, stock.station)
+            to_res = self.route_planner.estimate_frames(state, me.station, stock.station)
             to_gate = self.route_planner.estimate_frames(state, stock.station, state.gate_node)
             detour = to_res + stock.claim_frames + to_gate - direct
-            if detour <= 24:
+            if detour <= 48:
                 candidates.append((self._resource_value(state, stock, detour=detour), stock, detour))
         if not candidates:
             self.logger.info("resource_eval_pressure_ice", directToGate=direct, candidates=[])
@@ -1234,9 +1250,11 @@ class BaselineStrategy:
         base = 100 - priority.get(stock.resource_type, 999) * 8
         me = state.me
         if stock.resource_type == "ICE_BOX":
-            base += 75 if me.freshness <= 82 else (55 if me.freshness <= 90 else 28)
+            base += 95 if me.freshness <= 82 else (78 if me.freshness <= 90 else (60 if me.freshness <= 96 else 36))
             if me.task_score_base >= self.config.target_task_score:
-                base += 40
+                base += 70
+            elif me.task_score_base >= self.config.target_task_score // 2:
+                base += 35
             if self._hot_weather_active(state) or self._weather_forecast(state, "HOT"):
                 base += 22
         elif stock.resource_type == "FAST_HORSE":

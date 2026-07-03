@@ -433,6 +433,65 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
         self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
 
+    def test_target_score_uses_ice_box_before_freshness_gap_opens(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S03",
+                freshness=95,
+                task_score_base=90,
+                resources={"ICE_BOX": 1},
+            ),
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
+        self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
+
+    def test_reachable_ice_box_allows_quality_detour_at_target_score(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=90, freshness=95),
+            edges=[
+                RouteEdge(id="D", start="S01", end="S14", distance=3),
+                RouteEdge(id="R1", start="S01", end="S02", distance=12),
+                RouteEdge(id="R2", start="S02", end="S14", distance=12),
+            ],
+            resources=[ResourceStock(station="S02", resource_type="ICE_BOX", amount=1, claim_frames=2)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_early_route_prefers_nearby_ice_box_before_freshness_collapses(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=80,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=30, freshness=98),
+            edges=[
+                RouteEdge(id="D", start="S01", end="S14", distance=6),
+                RouteEdge(id="R1", start="S01", end="S02", distance=1),
+                RouteEdge(id="R2", start="S02", end="S03", distance=1),
+                RouteEdge(id="R3", start="S03", end="S14", distance=6),
+            ],
+            resources=[ResourceStock(station="S03", resource_type="ICE_BOX", amount=1, claim_frames=2)],
+            tasks=[TaskInstance(id="task-side", template="T08", target="S14", score=30, process_frames=4)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
     def test_hot_weather_uses_ice_box_before_quality_gap_opens(self) -> None:
         strategy = self.make_strategy()
         state = GameState(

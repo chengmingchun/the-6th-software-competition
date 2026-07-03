@@ -469,7 +469,7 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertIn(WindowCard.BING_ZHENG, cards)
         self.assertIn(WindowCard.XIAN_GONG, cards)
 
-    def test_late_high_value_window_keeps_stable_card(self) -> None:
+    def test_late_high_value_window_no_longer_forces_bing_zheng(self) -> None:
         state = GameState(
             frame=220,
             phase="NORMAL",
@@ -477,7 +477,7 @@ class BaselineStrategyTest(unittest.TestCase):
             me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=4),
             windows=[WindowState(id="contest-late", window_type="TASK", target="S02", task_id="task-late", active=True, my_turn=True, round_index=1)],
         )
-        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.BING_ZHENG)
+        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.XIAN_GONG)
 
     def test_window_counters_revealed_bing_zheng_with_xian_gong(self) -> None:
         state = GameState(
@@ -524,6 +524,55 @@ class BaselineStrategyTest(unittest.TestCase):
             ],
         )
         self.assertEqual(self.strategy.decide(state).window.card, WindowCard.YAN_DIE)
+
+    def test_window_draws_revealed_xian_gong_when_no_qiang_xing(self) -> None:
+        state = GameState(
+            frame=150,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S02", good_fruit=95, freshness=95, guard_points=4),
+            windows=[
+                WindowState(
+                    id="contest-counter-xian",
+                    window_type="TASK",
+                    target="S02",
+                    active=True,
+                    my_turn=True,
+                    round_index=2,
+                    raw={"cards": {"RED": "BING_ZHENG", "BLUE": "XIAN_GONG"}},
+                )
+            ],
+        )
+        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.XIAN_GONG)
+
+    def test_window_uses_qiang_xing_to_counter_xian_gong_when_available(self) -> None:
+        state = GameState(
+            frame=150,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(
+                player_id="1001",
+                team_id="RED",
+                status=ConvoyStatus.IDLE,
+                station="S02",
+                good_fruit=95,
+                freshness=95,
+                guard_points=4,
+                resources={"FAST_HORSE": 1},
+            ),
+            windows=[
+                WindowState(
+                    id="contest-counter-xian-horse",
+                    window_type="TASK",
+                    target="S02",
+                    active=True,
+                    my_turn=True,
+                    round_index=2,
+                    raw={"cards": {"RED": "BING_ZHENG", "BLUE": "XIAN_GONG"}},
+                )
+            ],
+        )
+        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.QIANG_XING)
 
     def test_window_counters_direct_last_card_fields(self) -> None:
         state = GameState(
@@ -596,8 +645,9 @@ class BaselineStrategyTest(unittest.TestCase):
         )
         red_card = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger()).decide(red).window.card
         blue_card = BaselineStrategy("1002", StrategyConfig.default(), SilentLogger()).decide(blue).window.card
-        self.assertNotEqual(red_card, blue_card)
         self.assertNotIn(WindowCard.ABSTAIN, {red_card, blue_card})
+        self.assertIn(red_card, {WindowCard.BING_ZHENG, WindowCard.XIAN_GONG, WindowCard.QIANG_XING, WindowCard.YAN_DIE})
+        self.assertIn(blue_card, {WindowCard.BING_ZHENG, WindowCard.XIAN_GONG, WindowCard.QIANG_XING, WindowCard.YAN_DIE})
 
     def test_window_abstains_only_when_lead_is_mathematically_safe(self) -> None:
         state = GameState(
