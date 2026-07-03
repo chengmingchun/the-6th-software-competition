@@ -27,10 +27,10 @@ class RoutePlan:
 class RoutePlanner:
     """Weighted planner over the official node/edge graph.
 
-    This mirrors the resource-manager style used by RTS bots: the planner owns
-    graph costs, while strategy only asks for candidate next hops.  Costs are
-    intentionally conservative because weather and forced-pass taxes can change
-    frame by frame.
+    The planner scores routes by time plus a freshness-risk premium.  Pure WATER
+    shortcuts can arrive earlier but may burn enough freshness to lose score;
+    once a convoy has a real task score to protect, ROAD is allowed to beat a
+    faster risky route.
     """
 
     def plan(self, state: GameState, start: str | None, target: str) -> RoutePlan | None:
@@ -50,7 +50,7 @@ class RoutePlanner:
             if node == target:
                 return RoutePlan(path=self._rebuild_path(prev, target), estimated_frames=cost)
             for edge, nxt in self._out_edges(state, node):
-                next_cost = cost + self._edge_frames(edge) + self._node_penalty(state, nxt)
+                next_cost = cost + self._edge_frames(state, edge) + self._node_penalty(state, nxt)
                 if next_cost < dist.get(nxt, 10**12):
                     dist[nxt] = next_cost
                     prev[nxt] = node
@@ -79,15 +79,50 @@ class RoutePlanner:
                 result.append((edge, other))
         return result
 
-    def _edge_frames(self, edge: RouteEdge) -> int:
+    def _edge_frames(self, state: GameState, edge: RouteEdge) -> int:
         # Official packets and local fixtures are not perfectly consistent about
-        # route type casing.  Treat water/mountain/branch case-insensitively;
-        # otherwise lowercase "water" silently fell back to ROAD and made the
-        # planner over-prefer long road-only routes.
+        # route type casing.  Treat water/mountain/branch case-insensitively.
         route_type = str(edge.route_type or "ROAD").upper()
         coefficient = ROUTE_COEFFICIENT.get(route_type, ROUTE_COEFFICIENT["ROAD"])
         required_move = edge.distance * coefficient
-        return max(1, (required_move + 999) // 1000)
+        base_frames = max(1, (required_move + 999) // 1000)
+        return base_frames + self._freshness_risk_penalty(state, edge, route_type, base_frames)
+
+    def _freshness_risk_penalty(self, state: GameState, edge: RouteEdge, route_type: str, base_frames: int) -> int:
+        """Convert route-type freshness risk into frame-equivalent cost.
+
+        Water shortcuts are still attractive early, with ICE_BOX in hand, or when
+        the deadline is genuinely tight.  They become expensive after the convoy
+        has 90+ task score, low freshness, no ICE_BOX safety net, or is already
+        protecting delivery quality.  This prevents a fast WATER route from
+        winning the path search while silently throwing away 10+ freshness.
+        """
+
+        if route_type not in {"WATER", "MOUNTAIN"}:
+            return 0
+        me = state.me
+        pressure = 0
+        if me.task_score_base >= 90:
+            pressure += 1
+        if me.task_score_base >= 120:
+            pressure += 1
+        if me.freshness <= 92:
+            pressure += 1
+        if me.freshness <= 82:
+            pressure += 1
+        if not me.has_resource("ICE_BOX"):
+            pressure += 1
+        if state.turns_left <= 180:
+            # Near timeout, time may matter more than quality.  Do not make
+            # risky edges impossible when the alternative is failing delivery.
+            pressure = max(0, pressure - 1)
+        if pressure <= 0:
+            return 0
+        if route_type == "WATER":
+            return max(1, (base_frames * pressure + 1) // 2)
+        # Mountain is already slow and usually freshness-risky; add a smaller
+        # extra premium so it is not chosen just because of graph topology.
+        return max(1, (base_frames * pressure + 2) // 3)
 
     def _node_penalty(self, state: GameState, node_id: str) -> int:
         station = state.station(node_id)
