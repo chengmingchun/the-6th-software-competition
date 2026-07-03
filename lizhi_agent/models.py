@@ -424,8 +424,10 @@ def _parse_stations(start_data: dict[str, Any], inquire_data: dict[str, Any]) ->
         guard = item.get("guard") if isinstance(item.get("guard"), dict) else {}
         stock = item.get("resourceStock") if isinstance(item.get("resourceStock"), dict) else {}
         gameplay_process_type, gameplay_process_round, gameplay_process_raw = process_nodes.get(node_id, (None, 0, {}))
-        process_type = _first_present(item, "processType", default=gameplay_process_type)
-        process_round = _as_int(_first_present(item, "processRound", default=gameplay_process_round), gameplay_process_round)
+        raw_process_type = _first_present(item, "processType", default=gameplay_process_type)
+        process_type = raw_process_type or gameplay_process_type
+        raw_process_round = _as_int(_first_present(item, "processRound", default=gameplay_process_round), gameplay_process_round)
+        process_round = raw_process_round or gameplay_process_round
         stations[node_id] = Station(
             id=node_id,
             name=str(_first_present(item, "name", default="")),

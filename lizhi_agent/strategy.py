@@ -197,6 +197,7 @@ class BaselineStrategy:
         self._pending_process_started_at: dict[str, int] = {}
         self._rejected_task_ids: set[str] = set()
         self._rejected_resource_keys: set[tuple[str, str]] = set()
+        self._task_approach_nodes: dict[str, str] = {}
 
     def on_start(self, start_data: dict) -> None:
         self._start_seen = True
@@ -334,7 +335,10 @@ class BaselineStrategy:
         scout = self._squad_scout_action(state)
         route_task = self._best_reachable_task(state)
         if route_task is not None:
-            return done(self._move_towards_node(state, route_task.target, squad=scout), f"move_to_task:{route_task.template}:{route_task.id}")
+            approach = self._task_approach_nodes.get(route_task.id, route_task.target)
+            if approach == state.me.station:
+                return done(self._claim_task(route_task, squad=scout), f"claim_task:{route_task.template}:{route_task.id}:approach")
+            return done(self._move_towards_node(state, approach, squad=scout), f"move_to_task:{route_task.template}:{route_task.id}")
         route_resource = self._best_reachable_resource(state)
         if route_resource is not None:
             return done(self._move_towards_node(state, route_resource.station, squad=scout), f"move_to_resource:{route_resource.resource_type}")
@@ -709,7 +713,13 @@ class BaselineStrategy:
         return ActionBundle(main=MainAction(MainActionType.PROCESS, target=target))
 
     def _best_station_task(self, state: GameState) -> TaskInstance | None:
-        tasks = [task for task in state.station_tasks(state.me.station) if task.id not in self._rejected_task_ids and not self._is_object_on_cooldown(state, self._task_object_key(task.id))]
+        tasks = [
+            task
+            for task in state.tasks
+            if self._can_claim_task_from_station(state, task, state.me.station)
+            and task.id not in self._rejected_task_ids
+            and not self._is_object_on_cooldown(state, self._task_object_key(task.id))
+        ]
         if not tasks:
             self.logger.info("task_eval_station", station=state.me.station, candidates=[])
             return None
@@ -748,33 +758,58 @@ class BaselineStrategy:
         if state.me.task_score_base >= self.config.greed_task_score or state.me.station is None:
             return None
         direct = self.route_planner.estimate_frames(state, state.me.station, state.gate_node)
-        candidates: list[tuple[int, TaskInstance, int, int, int]] = []
+        candidates: list[tuple[int, TaskInstance, str, int, int, int]] = []
         for task in state.tasks:
-            if exclude_current_station and task.target == state.me.station:
-                continue
             if task.id in self._rejected_task_ids or self._is_object_on_cooldown(state, self._task_object_key(task.id)):
                 continue
             if not task.available_for(state.player_id) or task.score <= 0:
                 continue
-            to_task = self.route_planner.estimate_frames(state, state.me.station, task.target)
-            to_gate = self.route_planner.estimate_frames(state, task.target, state.gate_node)
-            detour = to_task + task.process_frames + to_gate - direct
-            max_detour = self.config.max_task_detour_frames + (12 if task.score >= 30 else 0)
-            if state.me.task_score_base >= self.config.target_task_score and task.score >= 30:
-                max_detour = max(max_detour, self.config.max_competitive_task_detour_frames)
-            if detour <= max_detour:
-                value = task.score * 4 - max(0, detour)
-                if task.score >= 30:
-                    value += 40
-                if state.me.task_score_base >= self.config.target_task_score:
-                    value += 20
-                candidates.append((value, task, detour, to_task, to_gate))
+            for approach in self._task_approach_candidates(state, task):
+                if exclude_current_station and approach == state.me.station:
+                    continue
+                to_task = self.route_planner.estimate_frames(state, state.me.station, approach)
+                to_gate = self.route_planner.estimate_frames(state, approach, state.gate_node)
+                detour = to_task + task.process_frames + to_gate - direct
+                max_detour = self.config.max_task_detour_frames + (12 if task.score >= 30 else 0)
+                if task.template == "T04" and task.score >= 30:
+                    max_detour += 18
+                if state.me.task_score_base >= self.config.target_task_score and task.score >= 30:
+                    max_detour = max(max_detour, self.config.max_competitive_task_detour_frames)
+                if detour <= max_detour:
+                    value = task.score * 4 - max(0, detour)
+                    if task.score >= 30:
+                        value += 40
+                    if task.template == "T04":
+                        value += 35
+                    if state.me.task_score_base >= self.config.target_task_score:
+                        value += 20
+                    candidates.append((value, task, approach, detour, to_task, to_gate))
         if not candidates:
             self.logger.info("task_eval_reachable", directToGate=direct, candidates=[])
             return None
-        chosen_value, chosen, chosen_detour, chosen_to_task, chosen_to_gate = max(candidates, key=lambda item: item[0])
-        self.logger.info("task_eval_reachable", directToGate=direct, candidates=[{"taskId": t.id, "template": t.template, "target": t.target, "score": t.score, "value": v, "detour": d, "toTask": tt, "toGate": tg} for v, t, d, tt, tg in sorted(candidates, key=lambda item: item[0], reverse=True)[:5]], chosen=chosen.id, chosenValue=chosen_value, chosenDetour=chosen_detour, chosenToTask=chosen_to_task, chosenToGate=chosen_to_gate)
+        chosen_value, chosen, chosen_approach, chosen_detour, chosen_to_task, chosen_to_gate = max(candidates, key=lambda item: item[0])
+        self._task_approach_nodes[chosen.id] = chosen_approach
+        self.logger.info("task_eval_reachable", directToGate=direct, candidates=[{"taskId": t.id, "template": t.template, "target": t.target, "approach": a, "score": t.score, "value": v, "detour": d, "toTask": tt, "toGate": tg} for v, t, a, d, tt, tg in sorted(candidates, key=lambda item: item[0], reverse=True)[:5]], chosen=chosen.id, chosenApproach=chosen_approach, chosenValue=chosen_value, chosenDetour=chosen_detour, chosenToTask=chosen_to_task, chosenToGate=chosen_to_gate)
         return chosen
+
+    def _can_claim_task_from_station(self, state: GameState, task: TaskInstance, station: str | None) -> bool:
+        if station is None or not task.available_for(state.player_id):
+            return False
+        if task.template == "T04":
+            return station == task.target or station in state.neighbors(task.target)
+        return station == task.target
+
+    def _task_approach_candidates(self, state: GameState, task: TaskInstance) -> list[str]:
+        if task.template != "T04":
+            return [task.target]
+        candidates = [task.target, *state.neighbors(task.target)]
+        seen: set[str] = set()
+        result: list[str] = []
+        for node in candidates:
+            if node not in seen:
+                seen.add(node)
+                result.append(node)
+        return result
 
     def _best_reachable_resource(self, state: GameState, *, exclude_current_station: bool = False) -> ResourceStock | None:
         if state.me.station is None:
@@ -847,7 +882,7 @@ class BaselineStrategy:
             return state.terminal_node if me.verified else state.gate_node
         route_task = self._best_reachable_task(state, exclude_current_station=exclude_current_station)
         if route_task is not None:
-            return route_task.target
+            return self._task_approach_nodes.get(route_task.id, route_task.target)
         route_resource = self._best_reachable_resource(state, exclude_current_station=exclude_current_station)
         if route_resource is not None:
             return route_resource.station
@@ -858,7 +893,7 @@ class BaselineStrategy:
             return state.terminal_node if state.me.verified else state.gate_node
         route_task = self._best_reachable_task(state)
         if route_task is not None:
-            return route_task.target
+            return self._task_approach_nodes.get(route_task.id, route_task.target)
         route_resource = self._best_reachable_resource(state)
         if route_resource is not None:
             return route_resource.station

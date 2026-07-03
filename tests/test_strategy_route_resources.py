@@ -89,6 +89,41 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.squad.action, SquadActionType.SQUAD_SCOUT)
         self.assertEqual(action.squad.to_action()["targetNodeId"], "S03")
 
+    def test_t04_routes_to_adjacent_claim_station(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=60,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", task_score_base=0),
+            edges=[
+                RouteEdge(id="D", start="S02", end="S14", distance=2),
+                RouteEdge(id="A", start="S02", end="S03", distance=1),
+                RouteEdge(id="B", start="S03", end="S06", distance=1),
+                RouteEdge(id="C", start="S03", end="S14", distance=1),
+            ],
+            tasks=[TaskInstance(id="clear-s06", template="T04", target="S06", score=30, process_frames=6)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S03")
+
+    def test_t04_claims_from_adjacent_station(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=70,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=0),
+            edges=[RouteEdge(id="B", start="S03", end="S06", distance=1), RouteEdge(id="C", start="S03", end="S14", distance=1)],
+            tasks=[TaskInstance(id="clear-s06", template="T04", target="S06", score=30, process_frames=6)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.CLAIM_TASK)
+        self.assertEqual(action.main.to_action()["taskId"], "clear-s06")
+
     def test_ice_box_used_before_critical_when_score_run_started(self) -> None:
         strategy = self.make_strategy()
         state = GameState(

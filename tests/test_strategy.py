@@ -6,7 +6,7 @@ import unittest
 from lizhi_agent.actions import MainActionType, WindowCard
 from lizhi_agent.config import StrategyConfig
 from lizhi_agent.logger import DecisionLogger
-from lizhi_agent.models import ConvoyStatus, GameState, PlayerState, ResourceStock, RouteEdge, Station, TaskInstance, WindowState
+from lizhi_agent.models import ConvoyStatus, GameState, PlayerState, ResourceStock, RouteEdge, Station, TaskInstance, WindowState, parse_game_state
 from lizhi_agent.protocol import LengthPrefixedCodec
 from lizhi_agent.strategy import BaselineStrategy
 
@@ -63,6 +63,31 @@ class BaselineStrategyTest(unittest.TestCase):
         action = self.strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.VERIFY_GATE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
+
+    def test_empty_node_process_fields_fall_back_to_gameplay_process_nodes(self) -> None:
+        start = {
+            "durationRound": 600,
+            "map": {
+                "gameplay": {
+                    "roles": {"startNodeId": "S01", "gateNodeId": "S14"},
+                    "processNodes": [{"nodeId": "S02", "processType": "TRANSFER", "processRound": 4}],
+                }
+            },
+            "players": [{"playerId": "1001"}, {"playerId": "1002"}],
+            "nodes": [{"nodeId": "S02", "processType": "", "processRound": 0}],
+            "edges": [],
+        }
+        inquire = {
+            "round": 1,
+            "phase": "NORMAL",
+            "players": [{"playerId": "1001", "state": "IDLE", "currentNodeId": "S02"}],
+            "nodes": [{"nodeId": "S02", "processType": "", "processRound": 0}],
+        }
+        state = parse_game_state("1001", start, inquire)
+        station = state.station("S02")
+        self.assertIsNotNone(station)
+        self.assertEqual(station.process_type, "TRANSFER")
+        self.assertEqual(station.process_round, 4)
 
     def test_claim_valuable_task_before_90_score(self) -> None:
         state = GameState(
