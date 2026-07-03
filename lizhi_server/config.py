@@ -169,6 +169,10 @@ WINDOW_MATRIX: dict[str, dict[str, str]] = {
 NORMAL_BOUNTY_SCORE = 10
 KEY_BOUNTY_SCORE = 18
 
+# ── Clearance residual tax (from 任务书 6.1.2) ──
+CLEAR_RESIDUAL_TAX_FRAMES = 30  # 清障后 30 帧内非清障方通过需额外支付
+CLEAR_RESIDUAL_TAX_DELAY = 6     # 额外 6 个结算帧
+
 # ── Game limits ──
 MAX_FRAMES = 600
 FRESHNESS_MAX = 100.0

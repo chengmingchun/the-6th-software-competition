@@ -120,6 +120,9 @@ class Player:
     # Forced-pass repeat tracking
     last_forced_pass_node: str | None = None
 
+    # Residual clearance tax extra wait frames
+    additional_wait_frames: int = 0
+
     # Re-verify
     needs_reverify: bool = False
 
@@ -1012,9 +1015,12 @@ class GameEngine:
                     p.last_action_error = "MOVE_EDGE_NOT_FOUND"
                     return
 
+        # Special rule: S15 -> S14 return ignores obstacles and guards (任务书 2.3.1)
+        is_return_from_terminal = (p.station == "S15" and target == "S14")
+
         # Check for obstacle
         obs = self.obstacles.get(target)
-        if obs and not obs.cleared:
+        if obs and not obs.cleared and not is_return_from_terminal:
             self._add_action_result(pid, "MOVE", False, "MOVE_BLOCKED_BY_OBSTACLE",
                                     error=f"Obstacle at {target}")
             p.last_action_result = "ACTION_REJECTED"
@@ -1022,17 +1028,18 @@ class GameEngine:
             return
 
         # Check for enemy guard
-        for opid, op in self.players.items():
-            if opid == pid:
-                continue
-            if target in op.guards:
-                g = op.guards[target]
-                if g.defense > 0 and g.owner_team != p.team_id:
-                    self._add_action_result(pid, "MOVE", False, "MOVE_BLOCKED_BY_GUARD",
-                                            error=f"Enemy guard at {target}")
-                    p.last_action_result = "ACTION_REJECTED"
-                    p.last_action_error = "MOVE_BLOCKED_BY_GUARD"
-                    return
+        if not is_return_from_terminal:
+            for opid, op in self.players.items():
+                if opid == pid:
+                    continue
+                if target in op.guards:
+                    g = op.guards[target]
+                    if g.defense > 0 and g.owner_team != p.team_id:
+                        self._add_action_result(pid, "MOVE", False, "MOVE_BLOCKED_BY_GUARD",
+                                                error=f"Enemy guard at {target}")
+                        p.last_action_result = "ACTION_REJECTED"
+                        p.last_action_error = "MOVE_BLOCKED_BY_GUARD"
+                        return
 
         # Check fixed process requirement: cannot leave a fixed process node
         # without completing the required PROCESS first (VERIFY is handled separately).
@@ -1062,6 +1069,16 @@ class GameEngine:
         coeff = C.ROUTE_COEFFICIENT.get(edge["type"], 1380)
         frames = _edge_frames(edge["dist"], coeff, speed, weather_mult)
 
+        # Check for residual clearance tax (任务书 6.1.2)
+        residual_tax = 0
+        obs = self.obstacles.get(target)
+        if obs and obs.cleared and obs.clear_team and obs.clear_team != pid:
+            elapsed = self.frame - obs.clear_frame
+            if 0 <= elapsed < C.CLEAR_RESIDUAL_TAX_FRAMES:
+                residual_tax = C.CLEAR_RESIDUAL_TAX_DELAY
+                self._add_event("RESIDUAL_TAX", {"playerId": pid, "nodeId": target,
+                                                  "taxFrames": residual_tax})
+
         p.status = "MOVING"
         p.target_station = target
         p.route_edge = edge["id"]
@@ -1069,6 +1086,7 @@ class GameEngine:
         p.move_accumulated = 0
         p.move_edge_distance = edge["dist"]
         p.move_edge_coefficient = coeff
+        p.additional_wait_frames = residual_tax
 
         self._add_action_result(pid, "MOVE", True, "ACCEPTED")
         p.last_action = "MOVE"
@@ -1112,7 +1130,13 @@ class GameEngine:
             return
 
         # All checks pass — now it's safe to consume scout marker
-        reduced_pr, _ = self._apply_scout_reduction(p, target, pr)
+        # Apply weather extra frames for BOARD / WATER_TRANSFER in heavy rain
+        weather_extra = 0
+        if (self.current_weather and self.current_weather.weather_type == "HEAVY_RAIN"
+                and pt in ("BOARD", "WATER_TRANSFER")):
+            weather_extra = 4
+        adjusted_pr = pr + weather_extra
+        reduced_pr, _ = self._apply_scout_reduction(p, target, adjusted_pr)
 
         p.status = "PROCESSING"
         p.current_process = {
@@ -1205,6 +1229,10 @@ class GameEngine:
             self._add_event("RESOURCE_USED", {"playerId": pid, "resourceType": rtype, "duration": duration})
 
         elif rtype == "INTEL":
+            if p.status not in ("IDLE", "WAITING"):
+                self._add_action_result(pid, "USE_RESOURCE", False, "NOT_AT_TARGET_NODE",
+                                        error="Intel can only be used while stopped at a node")
+                return
             if target:
                 # Check distance
                 dist = self._route_distance(p.station, target)
@@ -1359,6 +1387,17 @@ class GameEngine:
         rush_tactic = act.get("rushTactic")
         verify_frames = 6
         if rush_tactic == "BREAK_ORDER" and p.rush_tactic_used == 0:
+            # 破关令成本：坏果优先，至少2篓时消耗2篓坏果，否则消耗1篓好果
+            if p.bad_fruit >= 2:
+                p.bad_fruit -= 2
+            elif p.bad_fruit == 1:
+                p.bad_fruit -= 1
+            elif p.good_fruit >= 1:
+                p.good_fruit -= 1
+            else:
+                self._add_action_result(pid, "VERIFY_GATE", False, "RESOURCE_NOT_ENOUGH",
+                                        error="Not enough bad/good fruit for BREAK_ORDER")
+                return
             verify_frames = max(3, verify_frames - 3)
             p.rush_tactic_used = 1
 
@@ -1411,21 +1450,28 @@ class GameEngine:
             self._add_action_result(pid, "SET_GUARD", False, "PARAM_OUT_OF_RANGE")
             return
 
-        if extra > 0 and p.good_fruit < extra:
-            self._add_action_result(pid, "SET_GUARD", False, "RESOURCE_NOT_ENOUGH")
-            return
-
-        # Calculate cap
+        # Calculate cap and base cost
         node_info = C.NODE_INFO.get(target, {})
         has_obs = target in self.obstacles and not self.obstacles[target].cleared
-        if node_info.get("type") == "KEY_PASS":
+        ntype = node_info.get("type", "")
+        if ntype == "KEY_PASS":
             cap = C.GUARD_DEFENSE_CAP["KEY_PASS"]
-        elif node_info.get("type") == "GATE":
+            base_cost = 1  # 关键关隘基础成本 1 篓好果
+        elif ntype == "GATE":
             cap = C.GUARD_DEFENSE_CAP["GATE"]
+            base_cost = 1  # 宫门基础成本 1 篓好果
         elif has_obs:
             cap = C.GUARD_DEFENSE_WITH_OBSTACLE
+            base_cost = 0
         else:
             cap = C.GUARD_DEFENSE_CAP["default"]
+            base_cost = 0
+
+        total_cost = base_cost + extra
+        if total_cost > 0 and p.good_fruit < total_cost:
+            self._add_action_result(pid, "SET_GUARD", False, "RESOURCE_NOT_ENOUGH",
+                                    error=f"Need {total_cost} good fruit for guard (base={base_cost}, extra={extra})")
+            return
 
         defense = min(cap, 2 + extra * 2)
 
@@ -1446,9 +1492,10 @@ class GameEngine:
             "defense": defense,
             "cap": cap,
             "extraGoodFruit": extra,
+            "baseCost": base_cost,
         }
         p.processing_frame_start = self.frame
-        p.frozen_good_fruit += extra
+        p.frozen_good_fruit += (base_cost + extra)
 
         self._add_action_result(pid, "SET_GUARD", True, "ACCEPTED")
         p.last_action = "SET_GUARD"
@@ -1505,6 +1552,16 @@ class GameEngine:
         break_power = good * 2 + bad * 3
         rush_tactic = act.get("rushTactic")
         if rush_tactic == "BREAK_ORDER" and p.rush_tactic_used == 0:
+            if p.bad_fruit >= 2:
+                p.bad_fruit -= 2
+            elif p.bad_fruit == 1:
+                p.bad_fruit -= 1
+            elif p.good_fruit >= 1:
+                p.good_fruit -= 1
+            else:
+                self._add_action_result(pid, "BREAK_GUARD", False, "RESOURCE_NOT_ENOUGH",
+                                        error="Not enough bad/good fruit for BREAK_ORDER")
+                return
             break_power += 3
             p.rush_tactic_used = 1
 
@@ -1745,6 +1802,41 @@ class GameEngine:
 
     # ── Process window cards ──
 
+    def _deduct_window_card_cost(self, pid: str, card: str) -> bool:
+        """Deduct resources for a window card. Returns False if cost cannot be paid (card becomes ABSTAIN)."""
+        p = self.players[pid]
+        if card == "ABSTAIN":
+            return True
+        if card == "YAN_DIE":
+            if p.resources.get("PASS_TOKEN", 0) > 0:
+                p.resources["PASS_TOKEN"] -= 1
+                return True
+            if p.resources.get("OFFICIAL_PERMIT", 0) > 0:
+                p.resources["OFFICIAL_PERMIT"] -= 1
+                return True
+            return False
+        if card == "QIANG_XING":
+            if p.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED"):
+                return True
+            if p.resources.get("FAST_HORSE", 0) > 0:
+                p.resources["FAST_HORSE"] -= 1
+                return True
+            if p.resources.get("SHORT_HORSE", 0) > 0:
+                p.resources["SHORT_HORSE"] -= 1
+                return True
+            return False
+        if card == "XIAN_GONG":
+            if p.freshness < 80 or p.good_fruit < 1:
+                return False
+            p.good_fruit -= 1
+            return True
+        if card == "BING_ZHENG":
+            if p.guard_points <= 0:
+                return False
+            p.guard_points -= 1
+            return True
+        return True
+
     def _process_windows(self, frame: int,
                          window_actions: dict[str, dict[str, Any] | None]) -> None:
         for contest in list(self.contests):
@@ -1775,6 +1867,16 @@ class GameEngine:
 
             contest.red_card = red_card
             contest.blue_card = blue_card
+
+            # Deduct window card costs; if insufficient, downgrade to ABSTAIN
+            if not self._deduct_window_card_cost(red_pid, red_card) and red_pid and red_card != "ABSTAIN":
+                red_card = "ABSTAIN"
+                contest.red_card = "ABSTAIN"
+                self._add_event("WINDOW_CARD_COST_FAILED", {"playerId": red_pid, "contestId": contest.contest_id, "card": red_card})
+            if not self._deduct_window_card_cost(blue_pid, blue_card) and blue_pid and blue_card != "ABSTAIN":
+                blue_card = "ABSTAIN"
+                contest.blue_card = "ABSTAIN"
+                self._add_event("WINDOW_CARD_COST_FAILED", {"playerId": blue_pid, "contestId": contest.contest_id, "card": blue_card})
 
             # Resolve round
             result = C.WINDOW_MATRIX.get(red_card, {}).get(blue_card, "DRAW")
@@ -2113,7 +2215,8 @@ class GameEngine:
         speed = self._effective_speed(p)
         weather_mult = self._weather_move_mult(edge["type"])
         coeff = C.ROUTE_COEFFICIENT.get(edge["type"], 1380)
-        required = edge["dist"] * coeff
+        # Residual clearance tax adds extra wait as move units (1000 per frame)
+        required = edge["dist"] * coeff + p.additional_wait_frames * 1000
         per_frame = (speed * 1000) // max(weather_mult, 1)
 
         p.move_accumulated += per_frame
@@ -2128,6 +2231,7 @@ class GameEngine:
             p.route_edge = None
             p.route_type = None
             p.move_accumulated = 0
+            p.additional_wait_frames = 0
             # Reset fixed-process-completed flag on arrival at any station
             p.fixed_process_completed_here = False
 
@@ -2198,11 +2302,13 @@ class GameEngine:
         elif cptype == "SET_GUARD":
             defense = p.current_process.get("defense", 2)
             cap = p.current_process.get("cap", 6)
+            base_cost = p.current_process.get("baseCost", 0)
             extra_gf = p.current_process.get("extraGoodFruit", 0)
+            total_cost = base_cost + extra_gf
             # Update frozen fruit
-            if extra_gf > 0 and p.frozen_good_fruit >= extra_gf:
-                p.frozen_good_fruit -= extra_gf
-                p.good_fruit -= extra_gf
+            if total_cost > 0 and p.frozen_good_fruit >= total_cost:
+                p.frozen_good_fruit -= total_cost
+                p.good_fruit -= total_cost
             node_info = C.NODE_INFO.get(target, {})
             is_key = node_info.get("type") == "KEY_PASS"
             p.guards[target] = GuardState(
@@ -2490,18 +2596,50 @@ class GameEngine:
                 p = self.players[pid]
                 if p.delivered or p.retired:
                     continue
+                # Condition 1: at S14
                 if p.station == "S14":
                     trigger = True
                     break
-                # Check distance to S14
-                dist = self._route_distance(p.station, "S14")
-                if dist is not None and dist <= 15:
-                    trigger = True
-                    break
+                # Condition 2: not at S11/S12/S13, and distance to S14 <= 15
+                if p.station not in ("S11", "S12", "S13"):
+                    dist = self._route_distance(p.station, "S14")
+                    if dist is not None and dist <= 15:
+                        trigger = True
+                        break
+                # Condition 3: fastest route can reach S15 within 60 frames (estimated)
+                if p.station is not None:
+                    frames_to_gate = self._estimate_fastest_frames(p.station, "S14")
+                    frames_to_term = self._estimate_fastest_frames("S14", "S15")
+                    if frames_to_gate is not None and frames_to_term is not None:
+                        if frames_to_gate + frames_to_term <= 60:
+                            trigger = True
+                            break
 
         if trigger:
             self.phase = "RUSH"
             self._add_event("RUSH_PHASE_STARTED", {"round": frame})
+
+    def _estimate_fastest_frames(self, start: str, end: str) -> int | None:
+        """Estimate fastest possible frames ignoring weather, obstacles, guards."""
+        if start == end:
+            return 0
+        visited = {start}
+        queue = [(start, 0)]
+        while queue:
+            node, cost = queue.pop(0)
+            for neighbor in self._neighbors(node):
+                if neighbor in visited:
+                    continue
+                edge = self._find_edge(node, neighbor)
+                if edge:
+                    coeff = C.ROUTE_COEFFICIENT.get(edge["type"], 1380)
+                    frames = max(1, (edge["dist"] * coeff + 999) // 1000)
+                    nc = cost + frames
+                    if neighbor == end:
+                        return nc
+                    visited.add(neighbor)
+                    queue.append((neighbor, nc))
+        return None
 
     # ── Scoring ──
 
@@ -2524,7 +2662,7 @@ class GameEngine:
 
             if p.delivered:
                 # Delivery base
-                task_factor = min(1.0, p.task_score_base / 90) if p.task_score_base < 90 else 1.0
+                task_factor = min(1.0, max(0.5, p.task_score_base / 90.0)) if p.task_score_base < 90 else 1.0
                 delivery_score = min(240, 120 + int(p.task_score_base * 4 / 3))
 
                 # Good fruit score
