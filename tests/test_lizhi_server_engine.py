@@ -339,6 +339,44 @@ class TestOnlineRealismHardening(unittest.TestCase):
             self.engine.process_actions(frame, [], [])
         self.assertEqual(p2.guards["S10"].defense, 0)
 
+    def test_two_person_squad_actions_require_two_available_members(self):
+        """CLEAR/REINFORCE/WEAKEN consume 2 people and must reject with only 1."""
+        p1 = self.engine.players["1001"]
+        p2 = self.engine.players["1002"]
+        p1.station = "S09"
+        p1.status = "IDLE"
+        p1.squad_available = 1
+        p2.guards["S10"] = GuardState(
+            owner_team=p2.team_id,
+            defense=2,
+            cap=7,
+            completed_frame=19,
+            last_wind_frame=19,
+            wind_interval=30,
+            is_key_pass=True,
+        )
+
+        self.engine.process_actions(20, [{"action": "SQUAD_WEAKEN", "targetNodeId": "S10"}], [])
+        p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
+        self.assertTrue(p1_results, "Expected SQUAD_WEAKEN rejection")
+        self.assertFalse(p1_results[0].get("accepted", True))
+        self.assertEqual(p1_results[0].get("code"), "SQUAD_NOT_AVAILABLE")
+        self.assertEqual(p1.squad_available, 1)
+        self.assertEqual(p2.guards["S10"].defense, 2)
+
+    def test_squad_action_rejects_unknown_target_node(self):
+        """Squad actions target map nodes, not arbitrary ids."""
+        p1 = self.engine.players["1001"]
+        p1.station = "S09"
+        p1.status = "IDLE"
+
+        self.engine.process_actions(20, [{"action": "SQUAD_SCOUT", "targetNodeId": "NOPE"}], [])
+        p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
+        self.assertTrue(p1_results, "Expected SQUAD_SCOUT rejection")
+        self.assertFalse(p1_results[0].get("accepted", True))
+        self.assertEqual(p1_results[0].get("code"), "TARGET_NOT_FOUND")
+        self.assertEqual(p1.squad_available, 8)
+
     def test_guard_placed_during_movement_traps_convoy_until_wind(self):
         """If a target gets guarded while the convoy is MOVING, arrival stalls."""
         p1 = self.engine.players["1001"]
@@ -366,6 +404,14 @@ class TestOnlineRealismHardening(unittest.TestCase):
         self.assertTrue(p1_results, "Expected moving guard block feedback")
         self.assertEqual(p1_results[0].get("code"), "MOVE_BLOCKED_BY_GUARD")
         self.assertEqual(p1_results[0].get("targetNodeId"), "S10")
+        self.assertTrue(p1_results[0].get("systemFeedback"))
+        self.assertFalse(p1_results[0].get("submittedAction"))
+        p1_events = [
+            e for e in self.engine.events
+            if e.type == "MOVE_BLOCKED_BY_GUARD" and str(e.payload.get("playerId")) == "1001"
+        ]
+        self.assertTrue(p1_events, "Expected moving guard block feedback event")
+        self.assertEqual(p1_events[0].payload.get("targetNodeId"), "S10")
         self.assertEqual(p1.status, "MOVING")
         self.assertEqual(p1.station, "S09")
 

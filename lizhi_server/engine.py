@@ -2167,8 +2167,21 @@ class GameEngine:
 
         if not target:
             return
+        if target not in C.NODE_INFO:
+            self._add_action_result(pid, atype, False, "TARGET_NOT_FOUND")
+            return
 
-        if p.squad_available <= 0:
+        squad_costs = {
+            "SQUAD_SCOUT": 1,
+            "SQUAD_CLEAR": 2,
+            "SQUAD_REINFORCE": 2,
+            "SQUAD_WEAKEN": 2,
+        }
+        cost = squad_costs.get(atype)
+        if cost is None:
+            self._add_action_result(pid, atype, False, "INVALID_ACTION_TYPE")
+            return
+        if p.squad_available < cost:
             self._add_action_result(pid, atype, False, "SQUAD_NOT_AVAILABLE")
             return
 
@@ -2185,7 +2198,7 @@ class GameEngine:
         arrival_frame = self.frame + base_delay
 
         if atype == "SQUAD_SCOUT":
-            p.squad_available -= 1
+            p.squad_available -= cost
             p.squad_in_flight += 1
             p.last_action = atype
             p.last_action_accepted = True
@@ -2199,7 +2212,7 @@ class GameEngine:
                 self._add_action_result(pid, atype, False, "OBSTACLE_NOT_FOUND")
                 return
             # Guard: squad clears on arrival
-            p.squad_available -= 2
+            p.squad_available -= cost
             p.squad_in_flight += 1
             self._schedule_squad_arrival(pid, atype, target, arrival_frame)
             self._add_action_result(pid, atype, True, "ACCEPTED")
@@ -2209,7 +2222,7 @@ class GameEngine:
             if target not in p.guards or p.guards[target].defense <= 0:
                 self._add_action_result(pid, atype, False, "NO_OWN_GUARD")
                 return
-            p.squad_available -= 2
+            p.squad_available -= cost
             p.squad_in_flight += 1
             self._schedule_squad_arrival(pid, atype, target, arrival_frame,
                                          guard_info={"defense_boost": 2, "cap": p.guards[target].cap})
@@ -2227,13 +2240,10 @@ class GameEngine:
             if not enemy_found:
                 self._add_action_result(pid, atype, False, "NO_ENEMY_GUARD")
                 return
-            p.squad_available -= 2
+            p.squad_available -= cost
             p.squad_in_flight += 1
             self._schedule_squad_arrival(pid, atype, target, arrival_frame)
             self._add_action_result(pid, atype, True, "ACCEPTED")
-
-        else:
-            self._add_action_result(pid, atype, False, "INVALID_ACTION_TYPE")
 
     def _schedule_squad_arrival(self, pid: str, atype: str, target: str,
                                 arrival_frame: int, guard_info: dict[str, Any] | None = None) -> None:
@@ -2395,6 +2405,8 @@ class GameEngine:
                 targetNodeId=target,
                 nodeId=target,
                 whileMoving=True,
+                systemFeedback=True,
+                submittedAction=False,
             )
             p.last_action = "MOVE"
             p.last_action_accepted = False

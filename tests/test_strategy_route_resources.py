@@ -452,6 +452,20 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.CLAIM_TASK)
         self.assertEqual(action.main.to_action()["taskId"], "station-task")
 
+    def test_t06_requires_horse_resource_before_claim(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S09", task_score_base=30),
+            edges=[RouteEdge(id="E1", start="S09", end="S14", distance=1)],
+            tasks=[TaskInstance(id="horse-task", template="T06", target="S09", score=30, process_frames=5)],
+        )
+        action = strategy.decide(state)
+        self.assertFalse(action.main.action == MainActionType.CLAIM_TASK and action.main.to_action().get("taskId") == "horse-task")
+
     def test_pre_move_horse_does_not_skip_fixed_process(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
@@ -796,6 +810,53 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(rejected)
         self.assertFalse(action.main.action == MainActionType.USE_RESOURCE and action.main.to_action().get("resourceType") == "INTEL")
 
+    def test_intel_skips_target_beyond_raw_distance_limit(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=403,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S12", task_score_base=75, resources={"INTEL": 1}, squad_available=0),
+            stations={"S13": Station(id="S13")},
+            edges=[
+                RouteEdge(id="FAR", start="S12", end="S13", distance=25),
+                RouteEdge(id="GATE", start="S13", end="S14", distance=18),
+            ],
+            tasks=[TaskInstance(id="late-task", template="T13", target="S13", score=15, process_frames=5)],
+        )
+        action = strategy.decide(state)
+        self.assertFalse(action.main.action == MainActionType.USE_RESOURCE and action.main.to_action().get("resourceType") == "INTEL")
+
+    def test_intel_can_target_learned_guard_block(self) -> None:
+        strategy = self.make_strategy()
+        first = GameState(
+            frame=100,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=30),
+            stations={"S09": Station(id="S09")},
+            edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
+        )
+        self.assertEqual(strategy.decide(first).main.action, MainActionType.MOVE)
+
+        learned = GameState(
+            frame=101,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=30, resources={"INTEL": 1}, squad_available=0),
+            stations={"S09": Station(id="S09")},
+            edges=first.edges,
+            action_results=[{"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD", "targetNodeId": "S09"}],
+        )
+        action = strategy.decide(learned)
+        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
+        payload = action.main.to_action()
+        self.assertEqual(payload["resourceType"], "INTEL")
+        self.assertEqual(payload["targetNodeId"], "S09")
+
     def test_intel_keeps_available_squad_for_valuable_scouting(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
@@ -1070,6 +1131,27 @@ class StrategyRouteResourceTest(unittest.TestCase):
         )
         action = strategy.decide(state)
         self.assertIsNone(action.main)
+
+    def test_delivery_route_pushes_live_trap_when_no_alternate(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=176,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S07", task_score_base=0, good_fruit=96, freshness=90),
+            opponent=PlayerState(player_id="2002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S09", task_score_base=75, good_fruit=95),
+            edges=[
+                RouteEdge(id="M1", start="S07", end="S09", distance=1),
+                RouteEdge(id="M2", start="S09", end="S10", distance=1),
+                RouteEdge(id="M3", start="S10", end="S14", distance=1),
+                RouteEdge(id="T", start="S14", end="S15", distance=1),
+            ],
+            stations={"S09": Station(id="S09"), "S10": Station(id="S10", node_type="KEY_PASS")},
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
 
     def test_skips_chokepoint_task_when_opponent_can_arrive_first(self) -> None:
         strategy = self.make_strategy()

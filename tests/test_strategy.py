@@ -562,7 +562,7 @@ class BaselineStrategyTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S09", task_score_base=30),
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S09", task_score_base=30, resources={"SHORT_HORSE": 1}),
             edges=[RouteEdge(id="E1", start="S09", end="S14", distance=1)],
             tasks=[
                 TaskInstance(id="task-a", template="T06", target="S09", score=30, process_frames=3),
@@ -576,7 +576,7 @@ class BaselineStrategyTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S09", task_score_base=30),
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S09", task_score_base=30, resources={"SHORT_HORSE": 1}),
             edges=[RouteEdge(id="E1", start="S09", end="S14", distance=1)],
             tasks=[
                 TaskInstance(id="task-a", template="T06", target="S09", score=30, process_frames=3),

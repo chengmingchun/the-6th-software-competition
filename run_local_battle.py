@@ -267,6 +267,8 @@ def run_battle(seed: int = 42, player1_id: str = "1001", player2_id: str = "1002
         cnt = action_counts[pid]
         for ar in server.action_results:
             if str(ar.get("playerId")) == str(pid):
+                if ar.get("systemFeedback") is True or ar.get("submittedAction") is False:
+                    continue
                 if ar.get("accepted", False):
                     cnt["accepted_action"] = cnt.get("accepted_action", 0) + 1
                 else:

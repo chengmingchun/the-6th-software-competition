@@ -1209,14 +1209,18 @@ class BaselineStrategy:
         objective = self._current_route_objective(state)
         target, _ = self._priority_scout_target(state, objective, forbidden)
         if target is not None:
-            return target
+            if self._intel_target_in_range(state, target):
+                return target
+            self.logger.info("resource_use_skip", resourceType="INTEL", reason="target_too_far_by_route_distance", target=target)
         me = state.me
         if me.station is not None:
             best_blocked: tuple[int, str] | None = None
-            for blocked_node, until in self._blocked_guard_nodes.items():
-                if state.frame > until:
+            for blocked_node, count in self._blocked_guard_nodes.items():
+                if count <= 0:
                     continue
                 if blocked_node in forbidden:
+                    continue
+                if not self._intel_target_in_range(state, blocked_node):
                     continue
                 cost = self.route_planner.estimate_frames(state, me.station, blocked_node)
                 if cost >= 10**8:
@@ -1225,6 +1229,30 @@ class BaselineStrategy:
                     best_blocked = (cost, blocked_node)
             if best_blocked is not None:
                 return best_blocked[1]
+        return None
+
+    def _intel_target_in_range(self, state: GameState, target: str) -> bool:
+        if state.me.station is None:
+            return False
+        distance = self._raw_route_distance(state, state.me.station, target)
+        return distance is not None and distance <= 15
+
+    def _raw_route_distance(self, state: GameState, start: str, target: str) -> int | None:
+        if start == target:
+            return 0
+        visited = {start}
+        queue: list[tuple[str, int]] = [(start, 0)]
+        while queue:
+            node, dist = queue.pop(0)
+            for edge in state.edges:
+                other = edge.other(node)
+                if other is None or other in visited:
+                    continue
+                next_dist = dist + edge.distance
+                if other == target:
+                    return next_dist
+                visited.add(other)
+                queue.append((other, next_dist))
         return None
 
     def _gate_intel_action(self, state: GameState) -> ActionBundle | None:
@@ -1358,7 +1386,7 @@ class BaselineStrategy:
                 continue
             if self._is_task_scope_rejected(state, task):
                 continue
-            if not task.available_for(state.player_id) or task.score <= 0:
+            if not self._task_requirements_met(state, task) or task.score <= 0:
                 continue
             for approach in self._task_approach_candidates(state, task):
                 if exclude_current_station and approach == state.me.station:
@@ -1397,7 +1425,7 @@ class BaselineStrategy:
         return chosen
 
     def _can_claim_task_from_station(self, state: GameState, task: TaskInstance, station: str | None) -> bool:
-        if station is None or not task.available_for(state.player_id):
+        if station is None or not self._task_requirements_met(state, task):
             return False
         if task.template == "T04":
             return station == task.target or station in state.neighbors(task.target)
@@ -1929,7 +1957,7 @@ class BaselineStrategy:
         station = state.station(node)
         reasons: list[str] = []
         value = 0
-        task_score = sum(task.score for task in state.tasks if task.target == node and task.available_for(state.player_id) and task.id not in self._rejected_task_ids)
+        task_score = sum(task.score for task in state.tasks if task.target == node and self._task_requirements_met(state, task) and task.id not in self._rejected_task_ids)
         if task_score > 0:
             value += 70 + min(60, task_score)
             reasons.append("task")
@@ -2120,6 +2148,14 @@ class BaselineStrategy:
             if alternate is not None:
                 self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=alternate, avoided=next_hop, reason="avoid_live_guard_trap")
                 next_hop = alternate
+            elif target in {state.gate_node, state.terminal_node} and (
+                state.me.task_score_base < self.config.target_task_score // 2
+                or self._station_stay_frames(state) >= 12
+                or self._need_endgame(state)
+                or self._must_lock_delivery(state)
+                or state.phase in RUSH_PHASES
+            ):
+                self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=next_hop, reason="push_delivery_live_guard_trap")
             elif not self._must_lock_delivery(state) and state.phase not in RUSH_PHASES:
                 self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=None, avoided=next_hop, reason="wait_live_guard_trap")
                 return wait("wait_live_guard_trap", active=False)
@@ -2167,6 +2203,9 @@ class BaselineStrategy:
             if t04 is not None:
                 self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="CLAIM_TASK", taskId=t04.id)
                 return self._claim_task(t04)
+            if self._should_preserve_squad_for_guard_rescue(state, next_hop):
+                self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="CLEAR", reason="preserve_squad_for_guard_rescue")
+                return ActionBundle(main=MainAction(MainActionType.CLEAR, target=next_hop), squad=squad)
             support = self._squad_blocker_action(state, next_hop, "obstacle") or squad
             if support is not None and support is not squad:
                 self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="SQUAD_CLEAR")
@@ -2185,6 +2224,10 @@ class BaselineStrategy:
                 return wait("wait_squad_weaken", active=False)
             support = self._squad_blocker_action(state, next_hop, "enemy_guard") or squad
             if support is not None and support is not squad:
+                good, bad = self._fruit_to_break_guard(state, station, next_hop, objective)
+                if (good > 0 or bad > 0) and self._should_stack_fruit_with_squad_guard(state, next_hop):
+                    self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="BREAK_GUARD_AND_SQUAD_WEAKEN", reason="key_guard_fast_clear", goodFruit=good, badFruit=bad)
+                    return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=next_hop, good_fruit=good, bad_fruit=bad), squad=support)
                 self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="SQUAD_WEAKEN")
                 return ActionBundle(squad=support)
             # 1. Squad weaken at key chokepoint
@@ -2329,6 +2372,20 @@ class BaselineStrategy:
     def _should_spend_good_fruit_to_clear(self, state: GameState) -> bool:
         return self._need_endgame(state) and state.me.good_fruit >= 95
 
+    def _should_preserve_squad_for_guard_rescue(self, state: GameState, target: str) -> bool:
+        if state.phase in RUSH_PHASES or self._need_endgame(state):
+            return False
+        if state.me.task_score_base >= self.config.target_task_score // 2:
+            return False
+        if state.me.squad_available > 7:
+            return False
+        return self._is_key_chokepoint(target) or target in {"S10", "S11"}
+
+    def _should_stack_fruit_with_squad_guard(self, state: GameState, target: str) -> bool:
+        if not (self._is_key_chokepoint(target) or target in {"S10", "S11"}):
+            return False
+        return state.me.task_score_base < self.config.target_task_score // 2 or self._must_lock_delivery(state) or state.phase in RUSH_PHASES
+
     def _fruit_to_break_guard(self, state: GameState, station: Station | None, target: str, objective: str) -> tuple[int, int]:
         if station is None or not station.has_enemy_guard(state.me.team_id):
             return (0, 0)
@@ -2433,6 +2490,13 @@ class BaselineStrategy:
 
     def _t04_for_target(self, state: GameState, target: str) -> TaskInstance | None:
         for task in state.tasks:
-            if task.template == "T04" and task.target == target and task.available_for(state.player_id) and task.id not in self._rejected_task_ids and not self._is_task_scope_rejected(state, task):
+            if task.template == "T04" and task.target == target and self._task_requirements_met(state, task) and task.id not in self._rejected_task_ids and not self._is_task_scope_rejected(state, task):
                 return task
         return None
+
+    def _task_requirements_met(self, state: GameState, task: TaskInstance) -> bool:
+        if not task.available_for(state.player_id):
+            return False
+        if task.template == "T06" and not (state.me.has_resource("FAST_HORSE") or state.me.has_resource("SHORT_HORSE")):
+            return False
+        return True
