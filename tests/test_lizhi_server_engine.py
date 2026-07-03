@@ -652,6 +652,43 @@ class TestWindowContestResolution(unittest.TestCase):
         self.assertNotEqual(p2.status, "CONTESTING",
                             f"P2 should not be CONTESTING after window resolved, got {p2.status}")
 
+    def test_pass_draw_restores_initiator_and_defender(self):
+        """PASS windows that draw should not leave either side CONTESTING."""
+        pid1, pid2 = "1001", "1002"
+        p1 = self.engine.players[pid1]
+        p2 = self.engine.players[pid2]
+        p1.station = "S09"
+        p2.station = "S09"
+        p1.status = "CONTESTING"
+        p2.status = "CONTESTING"
+
+        contest = ContestWindow(
+            contest_id="C_pass_draw",
+            contest_type="PASS",
+            target_node="S10",
+            red_player_id=pid1 if self.engine.team_map[pid1] == "RED" else pid2,
+            blue_player_id=pid2 if self.engine.team_map[pid2] == "BLUE" else pid1,
+            initiator_player_id=pid1,
+            round_index=1,
+            total_rounds=3,
+            deadline_round=self.engine.frame + 1,
+            initial_time_tax=12,
+        )
+        self.engine.contests.append(contest)
+
+        for _ in range(3):
+            self.engine.process_actions(
+                self.engine.frame + 1,
+                [{"action": "WINDOW_CARD", "contestId": "C_pass_draw", "card": "ABSTAIN"}],
+                [{"action": "WINDOW_CARD", "contestId": "C_pass_draw", "card": "ABSTAIN"}],
+            )
+            self.engine._advance_states(self.engine.frame)
+
+        self.assertEqual(p1.status, "RESTING")
+        self.assertEqual(p1.current_process["type"], "REST")
+        self.assertEqual(p2.status, "IDLE")
+        self.assertIsNone(p2.current_process)
+
 
 if __name__ == "__main__":
     unittest.main()

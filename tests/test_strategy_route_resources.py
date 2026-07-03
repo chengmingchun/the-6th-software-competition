@@ -1202,7 +1202,7 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.FORCED_PASS)
         self.assertNotEqual(action.squad.action if action.squad else None, SquadActionType.SQUAD_WEAKEN)
 
-    def test_heavy_enemy_guard_on_mandatory_chokepoint_uses_fruit_combo(self) -> None:
+    def test_heavy_enemy_guard_on_mandatory_chokepoint_uses_squad_before_fruit_combo(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
             frame=360,
@@ -1210,6 +1210,28 @@ class StrategyRouteResourceTest(unittest.TestCase):
             player_id="1001",
             roles={"gateNodeId": "S14"},
             me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S09", task_score_base=95, good_fruit=98, bad_fruit=1),
+            opponent=PlayerState(player_id="2002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S01", task_score_base=90),
+            stations={"S10": Station(id="S10", node_type="KEY_PASS", guard_owner="BLUE", guard_defense=5)},
+            edges=[
+                RouteEdge(id="E1", start="S09", end="S10", distance=1),
+                RouteEdge(id="E2", start="S10", end="S14", distance=1),
+                RouteEdge(id="T", start="S14", end="S15", distance=1),
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertIsNone(action.main)
+        self.assertEqual(action.squad.action, SquadActionType.SQUAD_WEAKEN)
+        payload = action.squad.to_action()
+        self.assertEqual(payload["targetNodeId"], "S10")
+
+    def test_heavy_enemy_guard_uses_fruit_combo_when_squad_unavailable(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=360,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S09", task_score_base=95, good_fruit=98, bad_fruit=1, squad_available=0),
             opponent=PlayerState(player_id="2002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S01", task_score_base=90),
             stations={"S10": Station(id="S10", node_type="KEY_PASS", guard_owner="BLUE", guard_defense=5)},
             edges=[
@@ -1255,6 +1277,33 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.FORCED_PASS)
         self.assertNotIn("goodFruit", action.main.to_action())
+
+    def test_no_blocker_feedback_moves_instead_of_repeating_forced_pass(self) -> None:
+        strategy = self.make_strategy()
+        first = GameState(
+            frame=249,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=90, squad_available=0, good_fruit=90, rush_tactic_used_count=1),
+            stations={"S02": Station(id="S02", guard_owner="BLUE", guard_defense=2)},
+            edges=[RouteEdge(id="E1", start="S01", end="S02", distance=1), RouteEdge(id="E2", start="S02", end="S14", distance=1)],
+        )
+        self.assertEqual(strategy.decide(first).main.action, MainActionType.FORCED_PASS)
+
+        stale = GameState(
+            frame=250,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=90, squad_available=0, good_fruit=90, rush_tactic_used_count=1),
+            stations={"S02": Station(id="S02", guard_owner="BLUE", guard_defense=2)},
+            edges=[RouteEdge(id="E1", start="S01", end="S02", distance=1), RouteEdge(id="E2", start="S02", end="S14", distance=1)],
+            action_results=[{"playerId": "1001", "action": "FORCED_PASS", "accepted": False, "code": "NO_BLOCKER", "targetNodeId": "S01"}],
+        )
+        action = strategy.decide(stale)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
 
 
 if __name__ == "__main__":

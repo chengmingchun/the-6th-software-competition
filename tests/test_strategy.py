@@ -62,7 +62,27 @@ class BaselineStrategyTest(unittest.TestCase):
         )
         action = self.strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.VERIFY_GATE)
-        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
+        self.assertNotIn("targetNodeId", action.main.to_action())
+
+    def test_delivered_state_does_not_attach_window_card(self) -> None:
+        state = GameState(
+            frame=560,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.DELIVERED,
+                station="S15",
+                verified=True,
+                delivered=True,
+            ),
+            windows=[WindowState(id="late-window", window_type="TASK", target="S15", active=True, my_turn=True, round_index=1)],
+        )
+        action = self.strategy.decide(state)
+        self.assertIsNone(action.main)
+        self.assertIsNone(action.window)
+        self.assertEqual(action.to_actions(), [])
 
     def test_empty_node_process_fields_fall_back_to_gameplay_process_nodes(self) -> None:
         start = {

@@ -92,6 +92,23 @@ class FreshnessProtectionTest(unittest.TestCase):
         action = strategy.decide(still_cooling)
         self.assertTrue(action.main is None or action.main.action != MainActionType.USE_RESOURCE)
 
+    def test_zero_freshness_does_not_use_rejected_icebox(self) -> None:
+        state = GameState(
+            frame=300,
+            phase="RUSH",
+            player_id="1001",
+            me=PlayerState(
+                player_id="1001",
+                status="IDLE",
+                station="S09",
+                task_score_base=120,
+                freshness=0,
+                resources={"ICE_BOX": 1},
+            ),
+        )
+        action = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger()).decide(state)
+        self.assertTrue(action.main is None or action.main.action != MainActionType.USE_RESOURCE)
+
 
 if __name__ == "__main__":
     unittest.main()

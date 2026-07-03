@@ -1920,7 +1920,7 @@ class GameEngine:
         for contest in list(self.contests):
             if contest.resolved or contest.suppressed:
                 continue
-            if contest.deadline_round < frame:
+            if contest.deadline_round > frame:
                 continue
 
             # Determine who is RED and BLUE
@@ -2021,9 +2021,12 @@ class GameEngine:
             # Put both players into RESTING (except PASS defender)
             for pid in [self.player1_id, self.player2_id]:
                 p = self.players[pid]
-                team = self.team_map[pid]
-                if contest.contest_type == "PASS" and team != contest.initiator_player_id:
-                    # Defender doesn't rest
+                if contest.contest_type == "PASS" and str(pid) != str(contest.initiator_player_id):
+                    # Defender does not pay the failed-pass rest tax, but also
+                    # must not remain in the contest state.
+                    if p.status == "CONTESTING":
+                        p.status = "IDLE"
+                        p.current_process = None
                     continue
                 if p.status in ("CONTESTING", "IDLE", "WAITING"):
                     p.status = "RESTING"
