@@ -1886,9 +1886,19 @@ class BaselineStrategy:
         for neighbor in state.neighbors(state.me.station):
             if neighbor == blocked_next_hop or self._is_learned_guard_blocked(state, neighbor):
                 continue
+            # Skip obstacle nodes — they also block movement.
+            station = state.station(neighbor)
+            if station is not None and station.has_obstacle:
+                continue
             cost_to_neighbor = self.route_planner.estimate_frames(state, state.me.station, neighbor)
             cost_to_target = self.route_planner.estimate_frames(state, neighbor, target)
             if cost_to_target >= 10**8:
+                continue
+            # Check that the route from neighbor to target does NOT pass through
+            # the blocked node again.  If it does, this 'alternate' is useless
+            # and we might as well go directly through the guard.
+            plan = self.route_planner.plan(state, neighbor, target)
+            if plan is not None and blocked_next_hop in plan.path:
                 continue
             candidates.append((cost_to_neighbor + cost_to_target, neighbor))
         if not candidates:
