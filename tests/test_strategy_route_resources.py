@@ -229,6 +229,28 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
         self.assertEqual(action.main.to_action()["resourceType"], "FAST_HORSE")
 
+    def test_rush_protect_preempts_horse_when_freshness_is_under_pressure(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=500,
+            max_frame=600,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S10",
+                freshness=87,
+                task_score_base=120,
+                rush_tactic_used_count=0,
+                resources={"FAST_HORSE": 1},
+            ),
+            edges=[RouteEdge(id="E1", start="S10", end="S14", distance=6)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.RUSH_PROTECT)
+
     def test_rush_protect_does_not_skip_fixed_process(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
@@ -430,6 +452,45 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
         self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
+
+    def test_hot_forecast_uses_ice_box_before_quality_gap_opens(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=300,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S03",
+                freshness=92,
+                task_score_base=90,
+                resources={"ICE_BOX": 1},
+            ),
+            weather=WeatherState(forecast_types=("HOT",)),
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
+        self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
+
+    def test_low_freshness_after_target_score_skips_reachable_task(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=300,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", freshness=80, task_score_base=90),
+            edges=[
+                RouteEdge(id="D", start="S01", end="S14", distance=2),
+                RouteEdge(id="T1", start="S01", end="S02", distance=1),
+                RouteEdge(id="T2", start="S02", end="S14", distance=3),
+            ],
+            tasks=[TaskInstance(id="detour-task", template="T08", target="S02", score=45, process_frames=4)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
 
     def test_squad_scouts_gate_when_delivery_score_is_ready(self) -> None:
         strategy = self.make_strategy()

@@ -560,6 +560,10 @@ class BaselineStrategy:
         pre_move_resource = self._pre_move_resource_action(state)
         if pre_move_resource is not None:
             return done(pre_move_resource, "use_route_resource")
+        pressure_ice = self._best_reachable_ice_box(state)
+        if pressure_ice is not None:
+            scout = self._squad_scout_action(state)
+            return done(self._move_towards_node(state, pressure_ice.station, squad=scout), "move_to_pressure_ice_box")
         if self._should_lock_delivery(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_quality_delivery_first")
             scout = self._squad_scout_action(state)
@@ -872,10 +876,10 @@ class BaselineStrategy:
             if remaining_cost >= 8 and state.turns_left <= remaining_cost + 32:
                 self.logger.info("rush_tactic", action="RUSH_SPEED", reason="deadline_speedup", remainingCost=remaining_cost, turnsLeft=state.turns_left)
                 return ActionBundle(main=MainAction(MainActionType.RUSH_SPEED))
-        if has_speed_resource and not me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") and me.freshness >= 83 and remaining_cost >= 6:
+        if has_speed_resource and not me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") and me.freshness >= 90 and remaining_cost >= 6:
             self.logger.info("rush_tactic_skip", action="RUSH_PROTECT", reason="use_horse_before_protect", remainingCost=remaining_cost)
             return None
-        if not me.has_buff("RUSH_PROTECT") and (me.task_score_base >= self.config.target_task_score or me.freshness <= 86):
+        if not me.has_buff("RUSH_PROTECT") and (me.task_score_base >= self.config.target_task_score or me.freshness <= 90):
             self.logger.info("rush_tactic", action="RUSH_PROTECT", reason="protect_freshness_in_rush", freshness=me.freshness, taskScore=me.task_score_base)
             return ActionBundle(main=MainAction(MainActionType.RUSH_PROTECT))
         return None
@@ -896,6 +900,9 @@ class BaselineStrategy:
         if me.freshness <= 88 and me.task_score_base >= self.config.target_task_score:
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_target_score_quality", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        if me.freshness <= 92 and me.task_score_base >= self.config.target_task_score and (self._weather_forecast(state, "HOT") or state.turns_left < 260):
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="preempt_hot_or_late_freshness_loss", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         if me.freshness <= 90 and (state.phase in RUSH_PHASES or self._should_lock_delivery(state) or self._hot_weather_active(state)):
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_quality_in_pressure_or_hot", freshness=me.freshness, taskScore=me.task_score_base, phase=state.phase, weather=state.weather.active_types if state.weather else ())
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
@@ -906,6 +913,9 @@ class BaselineStrategy:
 
     def _hot_weather_active(self, state: GameState) -> bool:
         return bool(state.weather and "HOT" in state.weather.active_types)
+
+    def _weather_forecast(self, state: GameState, weather_type: str) -> bool:
+        return bool(state.weather and weather_type in state.weather.forecast_types)
 
     def _pre_move_resource_action(self, state: GameState) -> ActionBundle | None:
         me = state.me
@@ -996,6 +1006,9 @@ class BaselineStrategy:
         return ActionBundle(main=MainAction(MainActionType.PROCESS, target=target))
 
     def _best_station_task(self, state: GameState) -> TaskInstance | None:
+        if self._freshness_pressure(state) >= 2 and state.me.task_score_base >= self.config.target_task_score:
+            self.logger.info("task_eval_station", station=state.me.station, candidates=[], reason="freshness_pressure_delivery_first")
+            return None
         tasks = [
             task
             for task in state.tasks
@@ -1014,6 +1027,8 @@ class BaselineStrategy:
             return threshold_bonus + clear_bonus + task.score, -task.process_frames
         best = max(tasks, key=score)
         self.logger.info("task_eval_station", station=state.me.station, candidates=[{"taskId": t.id, "template": t.template, "score": t.score, "processFrames": t.process_frames, "rank": score(t)} for t in tasks], chosen=best.id)
+        if self._freshness_pressure(state) >= 2 and best.score < 45:
+            return None
         if state.me.task_score_base < self.config.target_task_score:
             return best
         if state.me.task_score_base < self.config.competitive_task_score and best.score >= 30 and not self._need_endgame(state):
@@ -1030,6 +1045,10 @@ class BaselineStrategy:
         useful = [stock for stock in stocks if stock.resource_type in self.config.resource_priority]
         if self._need_endgame(state) or self._opponent_pressure(state):
             useful = [stock for stock in useful if stock.resource_type in {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE"}]
+        if self._freshness_pressure(state) >= 2:
+            ice = [stock for stock in useful if stock.resource_type == "ICE_BOX"]
+            if ice:
+                useful = ice
         if not useful:
             self.logger.info("resource_eval_station", station=state.me.station, candidates=[{"resourceType": s.resource_type, "amount": s.amount} for s in stocks], chosen=None)
             return None
@@ -1039,6 +1058,10 @@ class BaselineStrategy:
 
     def _best_reachable_task(self, state: GameState, *, exclude_current_station: bool = False) -> TaskInstance | None:
         if state.me.task_score_base >= self.config.greed_task_score or state.me.station is None:
+            return None
+        freshness_pressure = self._freshness_pressure(state)
+        if freshness_pressure >= 3 and state.me.task_score_base >= self.config.target_task_score:
+            self.logger.info("task_eval_reachable", candidates=[], reason="critical_freshness_delivery_first")
             return None
         direct = self.route_planner.estimate_frames(state, state.me.station, state.gate_node)
         candidates: list[tuple[int, TaskInstance, str, int, int, int]] = []
@@ -1058,6 +1081,10 @@ class BaselineStrategy:
                     max_detour += 18
                 if state.me.task_score_base >= self.config.target_task_score and task.score >= 30:
                     max_detour = max(max_detour, self.config.max_competitive_task_detour_frames)
+                if freshness_pressure >= 2:
+                    max_detour = min(max_detour, 10 if state.me.task_score_base >= self.config.target_task_score else 16)
+                elif freshness_pressure == 1:
+                    max_detour = min(max_detour, 20 if state.me.task_score_base >= self.config.target_task_score else max_detour)
                 if detour <= max_detour:
                     value = task.score * 4 - max(0, detour)
                     if task.score >= 30:
@@ -1066,6 +1093,8 @@ class BaselineStrategy:
                         value += 35
                     if state.me.task_score_base >= self.config.target_task_score:
                         value += 20
+                    if freshness_pressure >= 2:
+                        value -= max(0, detour) * 4 + task.process_frames * 3
                     candidates.append((value, task, approach, detour, to_task, to_gate))
         if not candidates:
             self.logger.info("task_eval_reachable", directToGate=direct, candidates=[])
@@ -1115,6 +1144,10 @@ class BaselineStrategy:
             max_detour = self.config.max_resource_detour_frames
             if stock.resource_type in {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE"}:
                 max_detour = max(max_detour, self.config.max_valuable_resource_detour_frames)
+            if stock.resource_type == "ICE_BOX" and self._freshness_pressure(state) >= 1:
+                max_detour = max(max_detour, 72)
+            elif self._freshness_pressure(state) >= 2 and stock.resource_type not in {"ICE_BOX", "FAST_HORSE"}:
+                max_detour = min(max_detour, 4)
             if detour <= max_detour:
                 candidates.append((self._resource_value(state, stock, detour=detour), stock, detour))
         if not candidates:
@@ -1124,14 +1157,38 @@ class BaselineStrategy:
         self.logger.info("resource_eval_reachable", directToGate=direct, candidates=[{"resourceType": s.resource_type, "station": s.station, "value": v, "detour": d} for v, s, d in sorted(candidates, key=lambda item: item[0], reverse=True)[:5]], chosen=chosen.resource_type, chosenStation=chosen.station, chosenValue=chosen_value, chosenDetour=chosen_detour)
         return chosen
 
+    def _best_reachable_ice_box(self, state: GameState) -> ResourceStock | None:
+        if state.me.station is None or not self._should_lock_delivery(state):
+            return None
+        direct = self.route_planner.estimate_frames(state, state.me.station, state.gate_node)
+        candidates: list[tuple[int, ResourceStock, int]] = []
+        for stock in state.resources:
+            if stock.resource_type != "ICE_BOX":
+                continue
+            if (stock.station, stock.resource_type) in self._rejected_resource_keys or self._is_object_on_cooldown(state, self._resource_object_key(stock.station, stock.resource_type)):
+                continue
+            to_res = self.route_planner.estimate_frames(state, state.me.station, stock.station)
+            to_gate = self.route_planner.estimate_frames(state, stock.station, state.gate_node)
+            detour = to_res + stock.claim_frames + to_gate - direct
+            if detour <= 24:
+                candidates.append((self._resource_value(state, stock, detour=detour), stock, detour))
+        if not candidates:
+            self.logger.info("resource_eval_pressure_ice", directToGate=direct, candidates=[])
+            return None
+        chosen_value, chosen, chosen_detour = max(candidates, key=lambda item: item[0])
+        self.logger.info("resource_eval_pressure_ice", directToGate=direct, candidates=[{"station": s.station, "value": v, "detour": d} for v, s, d in candidates], chosen=chosen.station, chosenValue=chosen_value, chosenDetour=chosen_detour)
+        return chosen
+
     def _resource_value(self, state: GameState, stock: ResourceStock, detour: int) -> int:
         priority = {name: i for i, name in enumerate(self.config.resource_priority)}
         base = 100 - priority.get(stock.resource_type, 999) * 8
         me = state.me
         if stock.resource_type == "ICE_BOX":
-            base += 45 if me.freshness <= 88 else 20
+            base += 75 if me.freshness <= 82 else (55 if me.freshness <= 90 else 28)
             if me.task_score_base >= self.config.target_task_score:
-                base += 25
+                base += 40
+            if self._hot_weather_active(state) or self._weather_forecast(state, "HOT"):
+                base += 22
         elif stock.resource_type == "FAST_HORSE":
             target = state.terminal_node if me.verified else state.gate_node
             remaining = self.route_planner.estimate_frames(state, stock.station, target)
@@ -1186,9 +1243,28 @@ class BaselineStrategy:
         me = state.me
         if me.task_score_base >= self.config.greed_task_score:
             return True
+        if me.task_score_base >= self.config.target_task_score and me.freshness < 88:
+            return True
+        if me.task_score_base >= self.config.competitive_task_score and me.freshness < 90:
+            return True
         if me.good_fruit < 78 or me.freshness < 68:
             return me.task_score_base >= self.config.target_task_score
         return False
+
+    def _freshness_pressure(self, state: GameState) -> int:
+        me = state.me
+        pressure = 0
+        if me.freshness < 92 and me.task_score_base >= self.config.competitive_task_score:
+            pressure += 1
+        if me.freshness < 86 and me.task_score_base >= self.config.target_task_score:
+            pressure += 1
+        if me.freshness < 78:
+            pressure += 1
+        if self._hot_weather_active(state) or self._weather_forecast(state, "HOT"):
+            pressure += 1
+        if state.phase in RUSH_PHASES:
+            pressure += 1
+        return pressure
 
     def _should_prepare_gate_scout(self, state: GameState) -> bool:
         me = state.me
