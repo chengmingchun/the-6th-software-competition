@@ -61,6 +61,12 @@ WINDOW_TERMINAL_STATUSES = {"SUPPRESSED", "RESOLVED", "FINISHED", "FINISH", "END
 WINDOW_HARD_MAX_SENDS = 3
 SCOUT_PATH_LOOKAHEAD = 3
 ROUTE_RESOURCE_TYPES = {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE", "INTEL"}
+SQUAD_COST = {
+    SquadActionType.SQUAD_SCOUT: 1,
+    SquadActionType.SQUAD_CLEAR: 2,
+    SquadActionType.SQUAD_REINFORCE: 2,
+    SquadActionType.SQUAD_WEAKEN: 2,
+}
 WINDOW_MATRIX = {
     WindowCard.YAN_DIE: {
         WindowCard.YAN_DIE: "DRAW",
@@ -155,16 +161,16 @@ class WindowStrategy:
     def _opening_options(self, state: GameState, high_value: bool) -> list[tuple[WindowCard, int]]:
         me = state.me
         options: list[tuple[WindowCard, int]] = []
-        if me.guard_points > 0:
-            options.append((WindowCard.BING_ZHENG, 30 if high_value else 22))
-        if (high_value or me.guard_points > 0) and me.freshness >= 82 and me.good_fruit >= 75:
+        if me.guard_points > 1 or (high_value and me.guard_points > 0):
+            options.append((WindowCard.BING_ZHENG, 28 if high_value else 10))
+        if high_value and me.freshness >= 82 and me.good_fruit >= 75:
             options.append((WindowCard.XIAN_GONG, 42 if high_value else 28))
         if high_value and (me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")):
             options.append((WindowCard.QIANG_XING, 28))
         if high_value and (me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT")):
             options.append((WindowCard.YAN_DIE, 26))
         if not high_value or me.freshness < 75 or me.good_fruit < 70:
-            options.append((WindowCard.ABSTAIN, 18))
+            options.append((WindowCard.ABSTAIN, 60 if not high_value else 18))
         if not options:
             options.append((WindowCard.ABSTAIN, 100))
         return options
@@ -198,7 +204,7 @@ class WindowStrategy:
     def _affordable_cards(self, state: GameState, high_value: bool) -> list[WindowCard]:
         me = state.me
         cards: list[WindowCard] = []
-        if me.guard_points > 0:
+        if me.guard_points > 1 or (high_value and me.guard_points > 0):
             cards.append(WindowCard.BING_ZHENG)
         if high_value and me.freshness >= 82 and me.good_fruit >= 75:
             cards.append(WindowCard.XIAN_GONG)
@@ -219,9 +225,11 @@ class WindowStrategy:
         total_rounds = int(window.raw.get("totalRounds") or 3)
         round_index = window.round_index or 1
         remaining_after_this = max(0, total_rounds - round_index)
+        if not high_value and value < 60 and my_score >= opp_score and round_index < total_rounds:
+            return [(WindowCard.ABSTAIN, 100)]
         if not high_value and value < 45 and my_score <= opp_score:
             active = [card for card in affordable if card != WindowCard.ABSTAIN]
-            if not active or (state.me.guard_points <= 1 and state.me.task_score_base < 90):
+            if not active or (state.me.guard_points <= 2 and state.me.task_score_base < 90):
                 return [(WindowCard.ABSTAIN, 100)]
         if my_score > opp_score + remaining_after_this:
             return [(WindowCard.ABSTAIN, 100)]
@@ -295,13 +303,13 @@ class WindowStrategy:
         if card == WindowCard.ABSTAIN:
             return 0
         if card == WindowCard.BING_ZHENG:
-            return 10 if high_value else 18
+            return 16 if high_value else 42
         if card == WindowCard.XIAN_GONG:
             return 12 if me.freshness >= 90 and me.good_fruit >= 90 else 24
         if card == WindowCard.QIANG_XING:
-            return 16 if high_value else 28
+            return 22 if high_value else 45
         if card == WindowCard.YAN_DIE:
-            return 14 if high_value else 24
+            return 18 if high_value else 42
         return 20
 
     def _must_win_bonus(self, card: WindowCard, opponent_weights: dict[WindowCard, int]) -> int:
@@ -488,6 +496,7 @@ class BaselineStrategy:
         self.window_strategy = WindowStrategy()
         self._start_seen = False
         self._scout_dispatched: set[str] = set()
+        self._squad_scout_spent = 0
         self._squad_action_cooldown_until: dict[tuple[str, str], int] = {}
         self._last_station: str | None = None
         self._station_since_frame: int | None = None
@@ -512,6 +521,7 @@ class BaselineStrategy:
         self._last_attempted_move: tuple[int, str] | None = None
         self._blocked_guard_nodes: dict[str, int] = {}
         self._squad_weaken_until: dict[str, int] = {}
+        self._squad_clear_until: dict[str, int] = {}
 
     def on_start(self, start_data: dict) -> None:
         self._start_seen = True
@@ -531,9 +541,12 @@ class BaselineStrategy:
         if decision.bundle.squad is not None:
             if decision.bundle.squad.action == SquadActionType.SQUAD_SCOUT:
                 self._scout_dispatched.add(decision.bundle.squad.target)
+                self._squad_scout_spent += 1
             else:
                 key = (decision.bundle.squad.action.value, decision.bundle.squad.target)
                 self._squad_action_cooldown_until[key] = state.frame + 20
+                if decision.bundle.squad.action == SquadActionType.SQUAD_CLEAR:
+                    self._squad_clear_until[decision.bundle.squad.target] = state.frame + self._squad_arrival_delay(state, decision.bundle.squad.target) + 2
         self.logger.info(
             "decision",
             round=state.frame,
@@ -593,6 +606,12 @@ class BaselineStrategy:
             return done(wait("retired", active=False), "retired")
         if me.status in MOVING_STATES or self._is_transit_waiting(state):
             squad = self._moving_squad_guard_action(state)
+            speed = self._moving_speed_resource_action(state)
+            if speed is not None:
+                if squad is not None:
+                    self.logger.info("state_guard", state="MOVING", action="USE_RESOURCE+SQUAD_WEAKEN", target=squad.target, resourceType=speed.main.resource_type if speed.main else None, reason="moving_horse_and_squad_weaken")
+                    return done(ActionBundle(main=speed.main, squad=squad), "moving_horse_and_squad_weaken")
+                return done(speed, "moving_speed_resource")
             if squad is not None:
                 self.logger.info("state_guard", state="MOVING", action="SQUAD_WEAKEN", target=squad.target, reason="moving_squad_weaken_guard")
                 return done(ActionBundle(squad=squad), "moving_squad_weaken_guard")
@@ -703,6 +722,8 @@ class BaselineStrategy:
                 self._mark_process_completed(str(node_id), state, event)
             if event_type in {"TASK_COMPLETE", "CLAIM_TASK_COMPLETE"} and task_id:
                 self._rejected_task_ids.discard(str(task_id))
+            if event_type in {"OBSTACLE_CLEARED", "SQUAD_CLEAR"} and node_id:
+                self._squad_clear_until.pop(str(node_id), None)
             if event_type in {"WINDOW_CONTEST_DRAW", "WINDOW_CONTEST_REPEAT_SUPPRESSED", "CONTEST_DRAW"}:
                 object_key = self._event_object_key(event)
                 if object_key is not None:
@@ -1117,6 +1138,26 @@ class BaselineStrategy:
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="SHORT_HORSE"))
         return None
 
+    def _moving_speed_resource_action(self, state: GameState) -> ActionBundle | None:
+        me = state.me
+        if me.status not in MOVING_STATES and not self._is_transit_waiting(state):
+            return None
+        if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED"):
+            return None
+        if not me.target:
+            return None
+        leg_cost = self.route_planner.estimate_frames(state, me.station, me.target) if me.station else 0
+        if leg_cost <= 0:
+            leg_cost = self.route_planner.estimate_frames(state, me.target, state.gate_node)
+        remaining_cost = self._remaining_delivery_cost(state)
+        if me.has_resource("FAST_HORSE") and (leg_cost >= 4 or remaining_cost >= 8 or self._need_endgame(state)):
+            self.logger.info("resource_use", resourceType="FAST_HORSE", reason="moving_allowed_horse_long_leg", target=me.target, legCost=leg_cost, remainingCost=remaining_cost)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="FAST_HORSE"))
+        if me.has_resource("SHORT_HORSE") and (leg_cost >= 3 or remaining_cost >= 6 or self._need_endgame(state)):
+            self.logger.info("resource_use", resourceType="SHORT_HORSE", reason="moving_allowed_horse_medium_leg", target=me.target, legCost=leg_cost, remainingCost=remaining_cost)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="SHORT_HORSE"))
+        return None
+
     def _intel_action(self, state: GameState) -> ActionBundle | None:
         me = state.me
         if not me.has_resource("INTEL") or me.status not in PLANNING_STATES or me.station is None:
@@ -1460,8 +1501,61 @@ class BaselineStrategy:
             base += 18 if not me.verified else 6
         return base - max(0, detour * 2)
 
+    def _can_spend_squad(self, state: GameState, action: SquadActionType, purpose: str) -> bool:
+        cost = SQUAD_COST[action]
+        available = state.me.squad_available
+        if available < cost:
+            self.logger.info("squad_eval_skip", action=action.value, reason="squad_not_enough", purpose=purpose, available=available, cost=cost)
+            return False
+        # Per task book 3.4 / protocol squadInFlight, manpower is consumed and
+        # not returned after landing. Keep a rescue reserve unless this is the
+        # rescue itself or a late attack with spare people.
+        if action == SquadActionType.SQUAD_WEAKEN and purpose == "moving_guard_rescue":
+            return True
+        reserve = self._squad_reserve(state, action, purpose)
+        if available - cost < reserve:
+            self.logger.info("squad_eval_skip", action=action.value, reason="reserve_key_pass_manpower", purpose=purpose, available=available, cost=cost, reserve=reserve)
+            return False
+        if action == SquadActionType.SQUAD_SCOUT and self._squad_scout_spent >= self._squad_scout_budget(state):
+            self.logger.info("squad_eval_skip", action=action.value, reason="scout_budget_spent", purpose=purpose, spent=self._squad_scout_spent, budget=self._squad_scout_budget(state))
+            return False
+        return True
+
+    def _squad_reserve(self, state: GameState, action: SquadActionType, purpose: str) -> int:
+        if purpose in {"blocked_route_obstacle", "late_aggressive_reinforce", "moving_guard_rescue"}:
+            return 0
+        if action == SquadActionType.SQUAD_REINFORCE and self._can_attack_with_spare_squad(state):
+            return 0
+        if self._route_has_blocker_risk(state) or self._blocked_guard_nodes:
+            return 2
+        if state.frame < 180 and action == SquadActionType.SQUAD_SCOUT:
+            return 5
+        if state.frame < 260:
+            return 4
+        return 2
+
+    def _squad_scout_budget(self, state: GameState) -> int:
+        if self._need_endgame(state) or self._should_prepare_gate_scout(state):
+            return 3
+        return 2
+
+    def _can_attack_with_spare_squad(self, state: GameState) -> bool:
+        me = state.me
+        opponent = state.opponent
+        if me.squad_available < 2 or self._need_endgame(state) or self._must_lock_delivery(state):
+            return False
+        if state.phase in RUSH_PHASES and not me.verified:
+            return False
+        if opponent is None or opponent.station is None or me.station is None:
+            return me.task_score_base >= self.config.target_task_score and state.frame >= 300
+        my_gate = self.route_planner.estimate_frames(state, me.station, state.gate_node)
+        opp_gate = self.route_planner.estimate_frames(state, opponent.station, state.gate_node)
+        return me.task_score_base >= self.config.target_task_score and (my_gate + 20 < opp_gate or state.frame >= 300)
+
     def _squad_scout_action(self, state: GameState, *, after_current_action: bool = False) -> SquadAction | None:
-        if state.phase in RUSH_PHASES or state.me.squad_available <= 0 or state.me.station is None:
+        if state.phase in RUSH_PHASES or state.me.station is None:
+            return None
+        if not self._can_spend_squad(state, SquadActionType.SQUAD_SCOUT, "route_scout"):
             return None
         forbidden = self._scout_forbidden(state)
         objective = self._scout_objective(state, exclude_current_station=after_current_action)
@@ -1475,7 +1569,7 @@ class BaselineStrategy:
     def _moving_squad_guard_action(self, state: GameState) -> SquadAction | None:
         me = state.me
         target = me.target
-        if me.squad_available < 2 or not target:
+        if not target or not self._can_spend_squad(state, SquadActionType.SQUAD_WEAKEN, "moving_guard_rescue"):
             return None
         if self._squad_action_on_cooldown(state, SquadActionType.SQUAD_WEAKEN, target):
             return None
@@ -1619,7 +1713,10 @@ class BaselineStrategy:
         if self._opponent_next_hop_to_gate(state) != me.station:
             return None
         if station is not None and station.guard_owner == me.team_id and station.guard_defense > 0:
-            if me.squad_available > 0 and not self._squad_action_on_cooldown(state, SquadActionType.SQUAD_REINFORCE, me.station):
+            if (
+                self._can_spend_squad(state, SquadActionType.SQUAD_REINFORCE, "late_aggressive_reinforce")
+                and not self._squad_action_on_cooldown(state, SquadActionType.SQUAD_REINFORCE, me.station)
+            ):
                 self.logger.info("squad_eval", action="SQUAD_REINFORCE", target=me.station, reason="reinforce_opponent_chokepoint")
                 return ActionBundle(squad=SquadAction(SquadActionType.SQUAD_REINFORCE, me.station))
             return None
@@ -1647,7 +1744,11 @@ class BaselineStrategy:
         if station is not None and station.has_obstacle:
             return None
         if station is not None and station.guard_owner == me.team_id and station.guard_defense > 0:
-            if me.squad_available > 1 and not self._squad_action_on_cooldown(state, SquadActionType.SQUAD_REINFORCE, me.station):
+            purpose = "late_aggressive_reinforce" if self._can_attack_with_spare_squad(state) else "hold_mandatory_chokepoint"
+            if (
+                self._can_spend_squad(state, SquadActionType.SQUAD_REINFORCE, purpose)
+                and not self._squad_action_on_cooldown(state, SquadActionType.SQUAD_REINFORCE, me.station)
+            ):
                 self.logger.info("squad_eval", action="SQUAD_REINFORCE", target=me.station, reason="hold_mandatory_chokepoint")
                 return ActionBundle(squad=SquadAction(SquadActionType.SQUAD_REINFORCE, me.station))
             return None
@@ -1685,7 +1786,10 @@ class BaselineStrategy:
         if station is not None and station.has_obstacle:
             return None
         if station is not None and station.guard_owner == me.team_id and station.guard_defense > 0:
-            if me.squad_available > 0 and not self._squad_action_on_cooldown(state, SquadActionType.SQUAD_REINFORCE, me.station):
+            if (
+                self._can_spend_squad(state, SquadActionType.SQUAD_REINFORCE, "late_aggressive_reinforce")
+                and not self._squad_action_on_cooldown(state, SquadActionType.SQUAD_REINFORCE, me.station)
+            ):
                 self.logger.info("squad_eval", action="SQUAD_REINFORCE", target=me.station, reason="moving_trap_reinforce")
                 return ActionBundle(squad=SquadAction(SquadActionType.SQUAD_REINFORCE, me.station))
             return None
@@ -1718,7 +1822,10 @@ class BaselineStrategy:
                 if 1 <= idx <= 3:
                     station = state.station(me.station)
                     if station is not None and station.guard_owner == me.team_id and station.guard_defense > 0:
-                        if me.squad_available > 0 and not self._squad_action_on_cooldown(state, SquadActionType.SQUAD_REINFORCE, me.station):
+                        if (
+                            self._can_spend_squad(state, SquadActionType.SQUAD_REINFORCE, "late_aggressive_reinforce")
+                            and not self._squad_action_on_cooldown(state, SquadActionType.SQUAD_REINFORCE, me.station)
+                        ):
                             self.logger.info("squad_eval", action="SQUAD_REINFORCE", target=me.station, reason="trap_reinforce")
                             return ActionBundle(squad=SquadAction(SquadActionType.SQUAD_REINFORCE, me.station))
                         return None
@@ -1972,8 +2079,9 @@ class BaselineStrategy:
     def _move_towards_node(self, state: GameState, target: str, squad: SquadAction | None = None) -> ActionBundle:
         """Plan route with forbidden_nodes, then run pre-move safety gate.
 
-        MOVING state cannot send BREAK_GUARD/FORCED_PASS/SQUAD, so all
-        interception must happen here before the MOVE command.
+        MOVING state restricts main convoy actions, so BREAK_GUARD/FORCED_PASS
+        must happen before MOVE. Squad actions are still kept available for
+        documented remote support such as SQUAD_WEAKEN.
         """
         if state.me.station is None:
             return wait("unknown_station", active=False)
@@ -2020,13 +2128,17 @@ class BaselineStrategy:
                                squad: SquadAction | None = None) -> ActionBundle | None:
         """Inspect next_hop before issuing MOVE. Return intercept or None (safe MOVE).
 
-        Once in MOVING state, BREAK_GUARD/FORCED_PASS/SQUAD are forbidden,
-        so all blocker resolution must happen here.
+        Once in MOVING state, main convoy break/pass actions are unavailable;
+        squad actions remain legal but delayed, so visible blockers should be
+        handled before committing to the edge when possible.
         """
         station = state.station(next_hop)
         me = state.me
         # ── Obstacle ──
         if station is not None and station.has_obstacle:
+            if self._squad_clear_until.get(next_hop, -1) > state.frame:
+                self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="WAIT", reason="wait_squad_clear_arrival", until=self._squad_clear_until[next_hop])
+                return wait("wait_squad_clear", active=False)
             t04 = self._t04_for_target(state, next_hop)
             if t04 is not None:
                 self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="CLAIM_TASK", taskId=t04.id)
@@ -2231,9 +2343,11 @@ class BaselineStrategy:
         return False
 
     def _squad_blocker_action(self, state: GameState, target: str, blocker: str) -> SquadAction | None:
-        if state.phase in RUSH_PHASES or state.me.squad_available <= 0:
+        if state.phase in RUSH_PHASES:
             return None
         if blocker == "obstacle":
+            if not self._can_spend_squad(state, SquadActionType.SQUAD_CLEAR, "blocked_route_obstacle"):
+                return None
             if self._squad_action_on_cooldown(state, SquadActionType.SQUAD_CLEAR, target):
                 return None
             self.logger.info("squad_eval", action="SQUAD_CLEAR", target=target, reason="blocked_route_obstacle")
@@ -2250,6 +2364,34 @@ class BaselineStrategy:
             return True
         self._squad_action_cooldown_until.pop((action.value, target), None)
         return False
+
+    def _squad_arrival_delay(self, state: GameState, target: str) -> int:
+        current = state.me.station
+        if current is None:
+            return 8
+        sx, sy = self._station_xy(state, current)
+        tx, ty = self._station_xy(state, target)
+        if sx is None or tx is None:
+            distance = self.route_planner.estimate_frames(state, current, target)
+            if distance >= 10**8:
+                return 8
+            return max(3, min(15, distance))
+        d = max(abs(sx - tx), abs(sy - ty))
+        return max(3, min(15, (d + 2) // 3))
+
+    def _station_xy(self, state: GameState, station_id: str) -> tuple[int | None, int | None]:
+        raw = state.station(station_id).raw if state.station(station_id) is not None else {}
+        x = raw.get("x") if isinstance(raw, dict) else None
+        y = raw.get("y") if isinstance(raw, dict) else None
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            return int(x), int(y)
+        node_info = state.raw.get("nodeInfo") if isinstance(state.raw.get("nodeInfo"), dict) else {}
+        info = node_info.get(station_id) if isinstance(node_info.get(station_id), dict) else {}
+        x = info.get("x")
+        y = info.get("y")
+        if isinstance(x, (int, float)) and isinstance(y, (int, float)):
+            return int(x), int(y)
+        return None, None
 
     def _t04_for_target(self, state: GameState, target: str) -> TaskInstance | None:
         for task in state.tasks:

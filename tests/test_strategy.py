@@ -805,7 +805,7 @@ class BaselineStrategyTest(unittest.TestCase):
         )
         self.assertEqual(self.strategy.decide(state).window.card, WindowCard.ABSTAIN)
 
-    def test_low_value_window_uses_guard_instead_of_abstaining_when_affordable(self) -> None:
+    def test_low_value_window_preserves_guard_points_even_when_affordable(self) -> None:
         state = GameState(
             frame=220,
             phase="NORMAL",
@@ -813,7 +813,7 @@ class BaselineStrategyTest(unittest.TestCase):
             me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=2, good_fruit=92, freshness=92),
             windows=[WindowState(id="contest-low-guard", window_type="RESOURCE", resource_type="BOAT_RIGHT", target="S02", active=True, my_turn=True, round_index=1)],
         )
-        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.BING_ZHENG)
+        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.ABSTAIN)
 
     def test_symmetric_bots_pick_different_opening_window_cards(self) -> None:
         window = WindowState(
