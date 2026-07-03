@@ -103,6 +103,32 @@ def _patch_models_action_result_normalization() -> None:
     _models.parse_game_state = parse_game_state_with_feedback_normalization
 
 
+def _patch_strategy_freshness_protection() -> None:
+    from .actions import ActionBundle, MainAction, MainActionType
+    from . import strategy as _strategy
+
+    original = _strategy.BaselineStrategy._freshness_action
+    if getattr(original, "_score_quality_patched", False):
+        return
+
+    def freshness_action_with_score_quality(self, state):
+        me = state.me
+        if not me.has_resource("ICE_BOX"):
+            return None
+        protect_quality = me.task_score_base >= self.config.target_task_score or self._should_lock_delivery(state) or state.phase in _strategy.RUSH_PHASES
+        premium_quality = me.task_score_base >= 120 or self._should_lock_delivery(state)
+        if premium_quality and me.freshness <= 98:
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_premium_score_quality", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        if protect_quality and me.freshness <= 97:
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_score_quality", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        return original(self, state)
+
+    freshness_action_with_score_quality._score_quality_patched = True  # type: ignore[attr-defined]
+    _strategy.BaselineStrategy._freshness_action = freshness_action_with_score_quality
+
+
 def _patch_strategy_speed_resource_usage() -> None:
     from .actions import ActionBundle, MainAction, MainActionType
     from . import strategy as _strategy
@@ -153,5 +179,6 @@ def _patch_strategy_forced_process_priority() -> None:
 
 
 _patch_models_action_result_normalization()
+_patch_strategy_freshness_protection()
 _patch_strategy_speed_resource_usage()
 _patch_strategy_forced_process_priority()
