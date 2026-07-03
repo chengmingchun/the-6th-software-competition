@@ -452,6 +452,20 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
         self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
 
+    def test_urgent_station_resource_before_task(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=45, freshness=97),
+            resources=[ResourceStock(station="S03", resource_type="ICE_BOX", amount=1, claim_frames=2)],
+            tasks=[TaskInstance(id="task-local", template="T01", target="S03", score=30, process_frames=3)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.CLAIM_RESOURCE)
+        self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
+
     def test_reachable_ice_box_allows_quality_detour_at_target_score(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
@@ -459,7 +473,7 @@ class StrategyRouteResourceTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=90, freshness=95),
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=90, freshness=94),
             edges=[
                 RouteEdge(id="D", start="S01", end="S14", distance=3),
                 RouteEdge(id="R1", start="S01", end="S02", distance=12),
@@ -491,6 +505,26 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_delivery_deadline_skips_far_ice_box(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=540,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=120, freshness=90),
+            edges=[
+                RouteEdge(id="D1", start="S01", end="S14", distance=3),
+                RouteEdge(id="D2", start="S14", end="S15", distance=1),
+                RouteEdge(id="R1", start="S01", end="S02", distance=20),
+                RouteEdge(id="R2", start="S02", end="S14", distance=20),
+            ],
+            resources=[ResourceStock(station="S02", resource_type="ICE_BOX", amount=1, claim_frames=2)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
 
     def test_hot_weather_uses_ice_box_before_quality_gap_opens(self) -> None:
         strategy = self.make_strategy()
@@ -646,6 +680,50 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
         self.assertEqual(action.main.to_action()["resourceType"], "INTEL")
         self.assertEqual(action.main.to_action()["targetNodeId"], "S03")
+
+    def test_rejected_intel_target_cools_down_same_target(self) -> None:
+        strategy = self.make_strategy()
+        first = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S01",
+                task_score_base=90,
+                resources={"INTEL": 1},
+                squad_available=0,
+            ),
+            edges=[
+                RouteEdge(id="E1", start="S01", end="S02", distance=1),
+                RouteEdge(id="E2", start="S02", end="S03", distance=1),
+                RouteEdge(id="E3", start="S03", end="S14", distance=1),
+            ],
+            tasks=[TaskInstance(id="rich-task", template="T08", target="S03", score=45, process_frames=4)],
+        )
+        self.assertEqual(strategy.decide(first).main.to_action()["resourceType"], "INTEL")
+
+        rejected = GameState(
+            frame=181,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S01",
+                task_score_base=90,
+                resources={"INTEL": 1},
+                squad_available=0,
+            ),
+            edges=first.edges,
+            tasks=first.tasks,
+            action_results=[{"playerId": "1001", "action": "USE_RESOURCE", "accepted": False, "code": "TARGET_TOO_FAR"}],
+        )
+        action = strategy.decide(rejected)
+        self.assertFalse(action.main.action == MainActionType.USE_RESOURCE and action.main.to_action().get("resourceType") == "INTEL")
 
     def test_intel_keeps_available_squad_for_valuable_scouting(self) -> None:
         strategy = self.make_strategy()
