@@ -8,7 +8,7 @@ from lizhi_agent.config import StrategyConfig
 from lizhi_agent.logger import DecisionLogger
 from lizhi_agent.models import ConvoyStatus, GameState, PlayerState, ResourceStock, RouteEdge, TaskInstance
 from lizhi_agent.protocol import LengthPrefixedCodec
-from lizhi_agent.strategy import RoadMasterStrategy
+from lizhi_agent.strategy import FreshnessFirstStrategy
 
 
 class SilentLogger(DecisionLogger):
@@ -37,9 +37,9 @@ class MemoryStream:
         return None
 
 
-class RoadMasterStrategySmokeTest(unittest.TestCase):
+class FreshnessFirstStrategySmokeTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.strategy = RoadMasterStrategy("1001", StrategyConfig.default(), SilentLogger())
+        self.strategy = FreshnessFirstStrategy("1001", StrategyConfig.default(), SilentLogger())
 
     def test_deliver_when_at_terminal_verified(self) -> None:
         state = GameState(

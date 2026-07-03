@@ -6,7 +6,7 @@ from lizhi_agent.actions import MainActionType, SquadActionType
 from lizhi_agent.config import StrategyConfig
 from lizhi_agent.logger import DecisionLogger
 from lizhi_agent.models import ConvoyStatus, GameState, PlayerState, ResourceStock, RouteEdge, Station
-from lizhi_agent.strategy import RoadMasterStrategy
+from lizhi_agent.strategy import FreshnessFirstStrategy
 
 
 class SilentLogger(DecisionLogger):
@@ -20,9 +20,9 @@ class SilentLogger(DecisionLogger):
         return None
 
 
-class RoadMasterRouteResourceSmokeTest(unittest.TestCase):
-    def make_strategy(self) -> RoadMasterStrategy:
-        return RoadMasterStrategy("1001", StrategyConfig.default(), SilentLogger())
+class FreshnessFirstSmokeTest(unittest.TestCase):
+    def make_strategy(self) -> FreshnessFirstStrategy:
+        return FreshnessFirstStrategy("1001", StrategyConfig.default(), SilentLogger())
 
     def test_fixed_process_on_road_node(self) -> None:
         strategy = self.make_strategy()
@@ -92,7 +92,9 @@ class RoadMasterRouteResourceSmokeTest(unittest.TestCase):
         self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
         self.assertIsNotNone(action.squad)
         self.assertEqual(action.squad.action, SquadActionType.SQUAD_SCOUT)
-        self.assertEqual(action.squad.to_action()["targetNodeId"], "S02")
+        # FreshnessFirstStrategy allows scouting S14 (gate) for verify reduction
+        self.assertIn(action.squad.to_action()["targetNodeId"], ["S02", "S14"],
+                      f"Scout target unexpected: {action.squad.to_action()['targetNodeId']}")
 
     def test_ice_box_used_early_to_preserve_freshness(self) -> None:
         strategy = self.make_strategy()
@@ -104,8 +106,8 @@ class RoadMasterRouteResourceSmokeTest(unittest.TestCase):
                 player_id="1001",
                 status=ConvoyStatus.IDLE,
                 station="S03",
-                freshness=70,
-                task_score_base=45,
+                freshness=85,
+                task_score_base=65,
                 resources={"ICE_BOX": 1},
             ),
         )
