@@ -9,6 +9,7 @@ ICE_BOX usage, tighter post-90 detours, and S14 scout/value support.
 """
 
 import importlib.util
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +24,11 @@ _spec = importlib.util.spec_from_file_location("_root_lizhi_baseline_strategy", 
 if _spec is None or _spec.loader is None:
     raise ImportError(f"Cannot load root baseline strategy from {_ROOT_STRATEGY_PATH}")
 _root_strategy = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = _root_strategy
 _spec.loader.exec_module(_root_strategy)
 
 _RootBaselineStrategy = _root_strategy.BaselineStrategy
 _RUSH_PHASES = getattr(_root_strategy, "RUSH_PHASES", {"RUSH", "BANQUET", "ENDGAME", "FINAL", "宫宴冲刺"})
-_ROUTE_RESOURCE_TYPES = getattr(_root_strategy, "ROUTE_RESOURCE_TYPES", {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE", "INTEL"})
 
 
 class FreshnessFirstStrategy(_RootBaselineStrategy):
