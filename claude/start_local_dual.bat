@@ -2,19 +2,22 @@
 setlocal EnableExtensions
 chcp 65001 >nul
 
-rem Launch two local clients from the same current working tree against one local debug server.
-rem Use this for same-version self play. For different versions, start each version's
-rem single-client launcher manually from its own branch/worktree.
-rem
-rem Default local server: 127.0.0.1:30000
-rem Default players are inferred from local-debug start message:
-rem   RED  = 2765
-rem   BLUE = 2779
-rem
+rem Launch two Claude clients against one local debug server.
 rem Usage:
 rem   start_local_dual.bat [RED_PLAYER_ID] [BLUE_PLAYER_ID] [HOST] [PORT]
 
 cd /d "%~dp0"
+
+if not exist main.py (
+  echo [ERROR] main.py not found. Please run this script from the claude directory.
+  pause
+  exit /b 1
+)
+if not exist lizhi_agent (
+  echo [ERROR] lizhi_agent directory not found. Claude bot package is incomplete.
+  pause
+  exit /b 1
+)
 
 set "HOST=127.0.0.1"
 set "PORT=30000"
@@ -53,7 +56,7 @@ if "%CURRENT_BRANCH%"=="" set "CURRENT_BRANCH=unknown"
 if "%CURRENT_SHA%"=="" set "CURRENT_SHA=unknown"
 
 echo ============================================================
-echo Launching same-version local dual clients
+echo Launching Claude local dual clients
 echo Server: %HOST%:%PORT%
 echo Version: branch=%CURRENT_BRANCH% sha=%CURRENT_SHA%
 echo RED:    id=%RED_PLAYER_ID%  name=%RED_PLAYER_NAME%
@@ -64,13 +67,10 @@ echo.
 echo Make sure the local debug server is already listening.
 echo.
 
-start "lizhi RED %RED_PLAYER_ID%" /D "%~dp0" cmd /k "set LIZHI_DEBUG=1&& set LIZHI_RAW_LOG=1&& set LIZHI_FILE_LOG=1&& set LIZHI_FIXTURE_LOG=1&& set LIZHI_LOG_DIR=%LOG_DIR%&& set LIZHI_VERSION=%CURRENT_BRANCH%-%CURRENT_SHA%-red&& set LIZHI_PLAYER_NAME=%RED_PLAYER_NAME%&& echo [RED] playerId=%RED_PLAYER_ID% playerName=%RED_PLAYER_NAME% host=%HOST% port=%PORT%&& %PYTHON_CMD% main.py %RED_PLAYER_ID% %HOST% %PORT%"
+start "Claude RED %RED_PLAYER_ID%" /D "%~dp0" cmd /k "set LIZHI_DEBUG=1&& set LIZHI_LOG_MODE=brief&& set LIZHI_LOG_STYLE=pretty&& set LIZHI_RAW_LOG=0&& set LIZHI_FIXTURE_LOG=0&& set LIZHI_FILE_LOG=1&& set LIZHI_LOG_DIR=%LOG_DIR%&& set LIZHI_VERSION=%CURRENT_BRANCH%-%CURRENT_SHA%-claude-red&& set LIZHI_PLAYER_NAME=%RED_PLAYER_NAME%&& echo [RED] playerId=%RED_PLAYER_ID% playerName=%RED_PLAYER_NAME% host=%HOST% port=%PORT%&& %PYTHON_CMD% main.py %RED_PLAYER_ID% %HOST% %PORT%"
 timeout /t 1 /nobreak >nul
-start "lizhi BLUE %BLUE_PLAYER_ID%" /D "%~dp0" cmd /k "set LIZHI_DEBUG=1&& set LIZHI_RAW_LOG=1&& set LIZHI_FILE_LOG=1&& set LIZHI_FIXTURE_LOG=1&& set LIZHI_LOG_DIR=%LOG_DIR%&& set LIZHI_VERSION=%CURRENT_BRANCH%-%CURRENT_SHA%-blue&& set LIZHI_PLAYER_NAME=%BLUE_PLAYER_NAME%&& echo [BLUE] playerId=%BLUE_PLAYER_ID% playerName=%BLUE_PLAYER_NAME% host=%HOST% port=%PORT%&& %PYTHON_CMD% main.py %BLUE_PLAYER_ID% %HOST% %PORT%"
+start "Claude BLUE %BLUE_PLAYER_ID%" /D "%~dp0" cmd /k "set LIZHI_DEBUG=1&& set LIZHI_LOG_MODE=brief&& set LIZHI_LOG_STYLE=pretty&& set LIZHI_RAW_LOG=0&& set LIZHI_FIXTURE_LOG=0&& set LIZHI_FILE_LOG=1&& set LIZHI_LOG_DIR=%LOG_DIR%&& set LIZHI_VERSION=%CURRENT_BRANCH%-%CURRENT_SHA%-claude-blue&& set LIZHI_PLAYER_NAME=%BLUE_PLAYER_NAME%&& echo [BLUE] playerId=%BLUE_PLAYER_ID% playerName=%BLUE_PLAYER_NAME% host=%HOST% port=%PORT%&& %PYTHON_CMD% main.py %BLUE_PLAYER_ID% %HOST% %PORT%"
 
-echo [INFO] Two same-version client windows launched.
-echo [INFO] Expected server logs:
-echo        Registered player ... playerId=%RED_PLAYER_ID% ... playerName=%RED_PLAYER_NAME%
-echo        Registered player ... playerId=%BLUE_PLAYER_ID% ... playerName=%BLUE_PLAYER_NAME%
-echo [INFO] If the server still stops at ready, check both client windows and both log files.
+echo [INFO] Two Claude client windows launched.
+echo [INFO] If the server still stops at ready, check both client windows and logs.
 pause
