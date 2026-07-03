@@ -42,11 +42,11 @@ def _preview(value: Any, limit: int = 3000) -> str:
 
 
 def _raw_payload_logging_enabled() -> bool:
-    return os.environ.get("LIZHI_RAW_LOG", "1") != "0"
+    return os.environ.get("LIZHI_RAW_LOG", "0") == "1"
 
 
 def _fixture_logging_enabled() -> bool:
-    return os.environ.get("LIZHI_FIXTURE_LOG", "1") != "0"
+    return os.environ.get("LIZHI_FIXTURE_LOG", "0") == "1"
 
 
 def _fixture_log_path(player_id: str) -> str:
