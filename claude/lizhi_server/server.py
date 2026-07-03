@@ -142,8 +142,12 @@ class MatchRunner:
                 self.codec1.send(inquire)
                 self.codec2.send(inquire)
 
-                # Receive actions concurrently with equal deadline
-                actions1, actions2 = self._recv_actions_pair()
+                # Wait for actions (non-blocking, with timeout)
+                remaining = FRAME_INTERVAL_MS / 1000.0
+                actions1 = self.codec1.recv(remaining)
+                elapsed = time.time() - start_time
+                remaining = max(0.01, FRAME_INTERVAL_MS / 1000.0 - elapsed)
+                actions2 = self.codec2.recv(remaining)
 
                 # Process
                 a1 = actions1.get("msg_data", {}).get("actions", []) if actions1 else []
@@ -189,31 +193,6 @@ class MatchRunner:
                 self.codec2.sock.close()
             except Exception:
                 pass
-
-    def _recv_actions_pair(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        """Receive actions from both players concurrently with the same deadline.
-
-        Both players get the full frame interval timeout.  If a response comes
-        early the thread returns immediately; the join waits until the deadline
-        or until both have responded.
-        """
-        deadline = FRAME_INTERVAL_MS / 1000.0
-        results: dict[str, dict[str, Any] | None] = {}
-        lock = threading.Lock()
-
-        def recv_one(codec: FrameCodec, key: str) -> None:
-            result = codec.recv(deadline)
-            with lock:
-                results[key] = result
-
-        t1 = threading.Thread(target=recv_one, args=(self.codec1, "p1"), daemon=True)
-        t2 = threading.Thread(target=recv_one, args=(self.codec2, "p2"), daemon=True)
-        t1.start()
-        t2.start()
-        t1.join(timeout=deadline + 0.5)
-        t2.join(timeout=deadline + 0.5)
-
-        return results.get("p1"), results.get("p2")
 
 
 def _log(msg: str) -> None:

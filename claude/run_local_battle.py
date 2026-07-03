@@ -2,9 +2,7 @@
 """Local dual-bot battle: run two baseline strategies against each other.
 
 Usage:
-    python run_local_battle.py [--seed SEED]
-    python run_local_battle.py --seeds 1-20 [--summary-csv FILE]
-    python run_local_battle.py --seed-list 1,2,3,42
+    python run_local_battle.py [--seed SEED] [--fast] [--log-dir DIR]
 
 With --fast, runs at maximum speed with no frame-by-frame delay.
 Logs are written to logs/ for later analysis.
@@ -13,8 +11,6 @@ Logs are written to logs/ for later analysis.
 from __future__ import annotations
 
 import argparse
-import csv
-import itertools
 import os
 import sys
 import time
@@ -32,7 +28,7 @@ from lizhi_agent.actions import MainActionType, SquadActionType, WindowCard, wai
 from lizhi_agent.config import StrategyConfig
 from lizhi_agent.logger import DecisionLogger
 from lizhi_agent.models import parse_game_state, GameState
-from lizhi_agent.strategy import BaselineStrategy
+from lizhi_agent.strategy import RoadMasterStrategy
 
 
 class SilentLogger:
@@ -79,12 +75,9 @@ def convert_inquire_for_strategy(start_data: dict, player_id: str,
         buffs = [{"type": b, "remaining": r} for b, r in player.buffs.items() if r > 0]
         if buffs:
             data["buffs"] = buffs
-        # Include currentProcess so strategy can detect busy states
-        if player.current_process:
-            data["currentProcess"] = player.current_process
         return data
 
-    # Build nodes — include scout markers and process info
+    # Build nodes
     nodes = []
     for nid, sinfo in server.stations.items():
         node = {
@@ -94,8 +87,6 @@ def convert_inquire_for_strategy(start_data: dict, player_id: str,
             "type": sinfo.get("type", ""),
             "hasObstacle": sinfo.get("hasObstacle", False),
             "canWindow": True,
-            "processType": sinfo.get("processType", ""),
-            "processRound": sinfo.get("processRound", 0),
         }
         # Resource stock
         stock = server.resource_stock.get(nid, {})
@@ -106,14 +97,6 @@ def convert_inquire_for_strategy(start_data: dict, player_id: str,
             if nid in op.guards and op.guards[nid].defense > 0:
                 node["guard"] = {"ownerTeamId": op.guards[nid].owner_team, "defense": op.guards[nid].defense}
                 break
-        # Scout markers
-        markers = server.scout_markers.get(nid, [])
-        active_markers = [m for m in markers if m.end_frame >= round_no and not m.used]
-        if active_markers:
-            node["scouted"] = [
-                {"teamId": m.team_id, "remainingTriggers": 1, "endFrame": m.end_frame}
-                for m in active_markers
-            ]
         nodes.append(node)
 
     # Build edges
@@ -170,8 +153,9 @@ def convert_inquire_for_strategy(start_data: dict, player_id: str,
             cdata["resourceType"] = c.resource_type
         if c.task_id:
             cdata["taskId"] = c.task_id
-        for pid, pobj in [(server.player1_id, p1), (server.player2_id, p2)]:
-            if pobj.team_id == "RED":
+        # Determine if this player participates
+        for pid, p in [(server.player1_id, p1), (server.player2_id, p2)]:
+            if p.team_id == "RED":
                 cdata["redPlayerId"] = pid
             else:
                 cdata["bluePlayerId"] = pid
@@ -190,7 +174,7 @@ def convert_inquire_for_strategy(start_data: dict, player_id: str,
     events = [{"type": e.type, "round": e.round, "payload": e.payload} for e in server.events]
 
     # Action results
-    action_results = [dict(r) for r in server.action_results]
+    action_results = [r for r in server.action_results]
 
     return {
         "matchId": server.match_id,
@@ -211,15 +195,11 @@ def convert_inquire_for_strategy(start_data: dict, player_id: str,
 
 
 def run_battle(seed: int = 42, player1_id: str = "1001", player2_id: str = "1002",
-               log_dir: str = "logs", fast: bool = True,
-               strategy_cls=None) -> dict:
-    """Run a full match between two strategies.
+               log_dir: str = "logs", fast: bool = True) -> dict:
+    """Run a full match between two baseline strategies.
 
     Returns the over payload dict with results.
     """
-    if strategy_cls is None:
-        strategy_cls = BaselineStrategy
-
     # Create server engine
     server = ServerEngine(
         match_id=f"battle_{seed}",
@@ -235,8 +215,8 @@ def run_battle(seed: int = 42, player1_id: str = "1001", player2_id: str = "1002
     config = StrategyConfig.default()
     logger1 = DecisionLogger(player_id=player1_id, log_dir=log_dir)
     logger2 = DecisionLogger(player_id=player2_id, log_dir=log_dir)
-    strategy1 = strategy_cls(player_id=player1_id, config=config, logger=logger1)
-    strategy2 = strategy_cls(player_id=player2_id, config=config, logger=logger2)
+    strategy1 = RoadMasterStrategy(player_id=player1_id, config=config, logger=logger1)
+    strategy2 = RoadMasterStrategy(player_id=player2_id, config=config, logger=logger2)
 
     strategy1.on_start(start_data)
     strategy2.on_start(start_data)
@@ -292,153 +272,37 @@ def run_battle(seed: int = 42, player1_id: str = "1001", player2_id: str = "1002
     return over
 
 
-def format_player_row(pl: dict) -> dict:
-    """Extract a flat dict of key metrics from a player's over data."""
-    sd = pl["scoreDetail"]
-    return {
-        "playerId": pl["playerId"],
-        "totalScore": pl["totalScore"],
-        "delivered": pl["delivered"],
-        "deliverRound": pl["deliverRound"],
-        "freshness": pl["freshness"],
-        "goodFruit": pl["goodFruit"],
-        "badFruit": pl["badFruit"],
-        "taskScore": pl["taskScore"],
-        "bountyScore": pl["bountyScore"],
-        "penaltyScore": pl["penaltyScore"],
-        "scoreDelivery": sd["delivery"],
-        "scoreGoodFruit": sd["goodFruit"],
-        "scoreFreshness": sd["freshness"],
-        "scoreTime": sd["time"],
-        "scoreTasks": sd["tasks"],
-        "scoreBounty": sd["bounty"],
-        "scorePenalty": sd["penalty"],
-    }
-
-
-def write_summary_csv(path: str, rows: list[dict], fieldnames: list[str]) -> None:
-    """Write results to a CSV file."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"  Summary written to {path}")
-
-
-def print_summary(all_rows: list[dict]) -> None:
-    """Print aggregate statistics from a list of result rows."""
-    if not all_rows:
-        print("  No results to summarize.")
-        return
-
-    scores = [r["totalScore"] for r in all_rows]
-    delivered = [r for r in all_rows if r["delivered"]]
-    deliver_rounds = [r["deliverRound"] for r in delivered if r["deliverRound"] > 0]
-    freshnesses = [r["freshness"] for r in all_rows]
-    good_fruits = [r["goodFruit"] for r in all_rows]
-    bad_fruits = [r["badFruit"] for r in all_rows]
-    task_scores = [r["taskScore"] for r in all_rows]
-    bounty_scores = [r["bountyScore"] for r in all_rows]
-    penalties = [r["penaltyScore"] for r in all_rows]
-
-    scores_sorted = sorted(scores)
-    n = len(scores_sorted)
-    median = scores_sorted[n // 2] if n % 2 == 1 else (scores_sorted[n // 2 - 1] + scores_sorted[n // 2]) // 2
-
-    print(f"\n{'='*60}")
-    print(f"  Summary ({n} players across seeds)")
-    print(f"{'-'*60}")
-    print(f"  Average Score:    {sum(scores)//n:>6d}")
-    print(f"  Median Score:     {median:>6d}")
-    print(f"  Min Score:        {min(scores):>6d}")
-    print(f"  Max Score:        {max(scores):>6d}")
-    print(f"{'-'*60}")
-    print(f"  Delivery Rate:    {len(delivered)/n*100:>5.1f}% ({len(delivered)}/{n})")
-    if deliver_rounds:
-        print(f"  Avg Deliver Rd:   {sum(deliver_rounds)//len(deliver_rounds):>6d}")
-        print(f"  Earliest Deliver: {min(deliver_rounds):>6d}")
-        print(f"  Latest Deliver:   {max(deliver_rounds):>6d}")
-    print(f"{'-'*60}")
-    print(f"  Avg Freshness:    {sum(freshnesses)/n:>6.1f}")
-    print(f"  Avg Good Fruit:   {sum(good_fruits)/n:>6.1f}")
-    print(f"  Avg Bad Fruit:    {sum(bad_fruits)/n:>6.1f}")
-    print(f"  Avg Task Score:   {sum(task_scores)/n:>6.1f}")
-    print(f"  Avg Bounty Score: {sum(bounty_scores)/n:>6.1f}")
-    print(f"  Avg Penalty:      {sum(penalties)/n:>6.1f}")
-    print(f"{'='*60}\n")
-
-
-def parse_seed_spec(s: str) -> list[int]:
-    """Parse '1-20' or '1,2,3' into a list of seeds."""
-    if "-" in s and not s.startswith("--"):
-        parts = s.split("-", 1)
-        try:
-            start, end = int(parts[0]), int(parts[1])
-            return list(range(start, end + 1))
-        except ValueError:
-            pass
-    result = []
-    for part in s.split(","):
-        part = part.strip()
-        if part:
-            result.append(int(part))
-    return result
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run local dual-bot battle")
-    parser.add_argument("--seed", type=int, default=42, help="Single random seed")
-    parser.add_argument("--seeds", type=str, default=None, help="Seed range, e.g. 1-20")
-    parser.add_argument("--seed-list", type=str, default=None, help="Comma-separated seeds, e.g. 1,2,3,42")
-    parser.add_argument("--summary-csv", type=str, default=None, help="CSV output path")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--log-dir", type=str, default="logs", help="Log directory")
     args = parser.parse_args()
 
     os.makedirs(args.log_dir, exist_ok=True)
 
-    # Determine seed list
-    if args.seed_list:
-        seeds = parse_seed_spec(args.seed_list)
-    elif args.seeds:
-        seeds = parse_seed_spec(args.seeds)
-    else:
-        seeds = [args.seed]
+    print(f"\n{'='*60}")
+    print(f"Local Battle: Baseline vs Baseline")
+    print(f"   Seed: {args.seed}")
+    print(f"{'='*60}\n")
 
-    if not seeds:
-        print("No seeds specified.")
-        return 1
+    over = run_battle(seed=args.seed, log_dir=args.log_dir)
 
-    all_rows: list[dict] = []
-    base_fieldnames = None
-
-    for i, seed in enumerate(seeds):
-        print(f"\n{'='*60}")
-        print(f"Battle {i+1}/{len(seeds)}: Seed={seed}")
-        print(f"{'='*60}")
-
-        over = run_battle(seed=seed, log_dir=args.log_dir)
-        od = over["msg_data"]
-
-        for pl in od["players"]:
-            row = format_player_row(pl)
-            row["seed"] = seed
-            all_rows.append(row)
-            if base_fieldnames is None:
-                base_fieldnames = list(format_player_row(pl).keys())
-
-        # Print per-battle summary
-        p1, p2 = od["players"][0], od["players"][1]
-        print(f"  Result: P1={p1['totalScore']} P2={p2['totalScore']} "
-              f"winner={od['winnerPlayerId']} type={od['resultType']}")
-
-    # Overall summary
-    print_summary(all_rows)
-
-    # CSV output
-    if args.summary_csv and base_fieldnames:
-        fieldnames = ["seed"] + base_fieldnames
-        write_summary_csv(args.summary_csv, all_rows, fieldnames)
+    od = over["msg_data"]
+    print(f"\n{'='*60}")
+    print(f"[RESULT] Match Result")
+    print(f"   Type: {od['resultType']} | Reason: {od['overReason']}")
+    print(f"   Winner: {od['winnerPlayerId']}")
+    print(f"   Frames: {od['overRound']}")
+    print(f"{'-'*60}")
+    for pl in od["players"]:
+        sd = pl["scoreDetail"]
+        print(f"   Player {pl['playerId']}:")
+        print(f"     Total Score: {pl['totalScore']}")
+        print(f"     Delivered: {pl['delivered']} (round {pl['deliverRound']})")
+        print(f"     Freshness: {pl['freshness']:.1f}  |  Good Fruit: {pl['goodFruit']}  |  Bad Fruit: {pl['badFruit']}")
+        print(f"     Delivery: {sd['delivery']}  |  Fruit: {sd['goodFruit']}  |  Fresh: {sd['freshness']}  |  Time: {sd['time']}")
+        print(f"     Tasks: {sd['tasks']}  |  Bounty: {sd['bounty']}  |  Penalty: {sd['penalty']}")
+    print(f"{'='*60}\n")
 
     return 0
 

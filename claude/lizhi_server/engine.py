@@ -126,11 +126,6 @@ class Player:
     # Processing for fixed process / claim / etc
     processing_frame_start: int = 0
 
-    # Per-visit fixed process completion tracking (RESET on each arrival)
-    fixed_process_completed_here: bool = False
-    # Tracks whether the verify gate condition has been met before leaving S14
-    # (Separate from p.verified which is the global verified flag)
-
     # Last frame action summary
     last_action: str | None = None
     last_action_accepted: bool = True
@@ -1034,27 +1029,10 @@ class GameEngine:
                     p.last_action_error = "MOVE_BLOCKED_BY_GUARD"
                     return
 
-        # Check fixed process requirement: cannot leave a fixed process node
-        # without completing the required PROCESS first (VERIFY is handled separately).
-        fixed_process_nodes_without_verify = {
-            nid for nid in C.FIXED_PROCESS_NODES
-            if C.FIXED_PROCESS_NODES[nid][0] != "VERIFY"
-        }
-        if p.station in fixed_process_nodes_without_verify and not p.fixed_process_completed_here:
-            self._add_action_result(pid, "MOVE", False, "PROCESS_REQUIRED",
-                                    error=f"Must complete PROCESS at {p.station} before leaving")
-            p.last_action_result = "ACTION_REJECTED"
-            p.last_action_error = "PROCESS_REQUIRED"
-            return
-
-        # S14 constraint: cannot leave S14 to S15 without being verified
-        # (VERIFY_GATE is the only valid way, not a plain PROCESS)
-        if p.station == "S14" and target == "S15" and not p.verified:
-            self._add_action_result(pid, "MOVE", False, "VERIFY_REQUIRED",
-                                    error="Must complete VERIFY_GATE at S14 before going to S15")
-            p.last_action_result = "ACTION_REJECTED"
-            p.last_action_error = "VERIFY_REQUIRED"
-            return
+        # Check fixed process requirement
+        if target in C.FIXED_PROCESS_NODES and p.station != target:
+            # Need to complete process at the node before leaving (checked at arrival)
+            pass
 
         # Start move
         speed = self._effective_speed(p)
@@ -1101,8 +1079,6 @@ class GameEngine:
             return
 
         pt, pr, cw = C.FIXED_PROCESS_NODES[target]
-        # Apply scout marker reduction
-        reduced_pr, _ = self._apply_scout_reduction(p, target, pr)
         handle_event = ""
 
         # Check if can process here
@@ -1115,8 +1091,8 @@ class GameEngine:
         p.current_process = {
             "type": pt,
             "target": target,
-            "framesLeft": reduced_pr,
-            "totalFrames": reduced_pr,
+            "framesLeft": pr,
+            "totalFrames": pr,
         }
         p.processing_frame_start = self.frame
 
@@ -1146,16 +1122,13 @@ class GameEngine:
             p.last_action_result = "ACTION_REJECTED"
             return
 
-        claim_frames = C.RESOURCE_CLAIM_FRAMES
-        reduced_frames, _ = self._apply_scout_reduction(p, target, claim_frames)
-
         p.status = "PROCESSING"
         p.current_process = {
             "type": "CLAIM_RESOURCE",
             "target": target,
             "resourceType": rtype,
-            "framesLeft": reduced_frames,
-            "totalFrames": reduced_frames,
+            "framesLeft": C.RESOURCE_CLAIM_FRAMES,
+            "totalFrames": C.RESOURCE_CLAIM_FRAMES,
         }
         p.processing_frame_start = self.frame
 
@@ -1273,19 +1246,14 @@ class GameEngine:
             else:
                 p.resources["SHORT_HORSE"] -= 1
 
-        # Apply scout marker reduction at the task's target node
-        # T04 target is the obstacle node, which is where processing takes effect
-        task_frames = task.process_frames
-        reduced_task_frames, _ = self._apply_scout_reduction(p, task.target, task_frames)
-
         p.status = "PROCESSING"
         p.current_process = {
             "type": "CLAIM_TASK",
             "taskId": task_id,
             "template": task.template,
             "target": task.target,
-            "framesLeft": reduced_task_frames,
-            "totalFrames": reduced_task_frames,
+            "framesLeft": task.process_frames,
+            "totalFrames": task.process_frames,
             "score": task.score,
         }
         p.processing_frame_start = self.frame
@@ -1359,15 +1327,12 @@ class GameEngine:
             verify_frames = max(3, verify_frames - 3)
             p.rush_tactic_used = 1
 
-        # Scout marker can further reduce verify time (stacking with BREAK_ORDER)
-        reduced_frames, _ = self._apply_scout_reduction(p, "S14", verify_frames)
-
         p.status = "VERIFYING"
         p.current_process = {
             "type": "VERIFY",
             "target": "S14",
-            "framesLeft": reduced_frames,
-            "totalFrames": reduced_frames,
+            "framesLeft": verify_frames,
+            "totalFrames": verify_frames,
             "rushTactic": rush_tactic or "",
         }
         p.processing_frame_start = self.frame
@@ -1684,16 +1649,13 @@ class GameEngine:
             self._add_action_result(pid, "CLEAR", False, "RESOURCE_NOT_ENOUGH")
             return
 
-        clear_frames = 6
-        reduced_frames, _ = self._apply_scout_reduction(p, target, clear_frames)
-
         p.status = "PROCESSING"
         p.frozen_good_fruit += 1
         p.current_process = {
             "type": "CLEAR_OBSTACLE",
             "target": target,
-            "framesLeft": reduced_frames,
-            "totalFrames": reduced_frames,
+            "framesLeft": 6,
+            "totalFrames": 6,
         }
         p.processing_frame_start = self.frame
 
@@ -2111,8 +2073,6 @@ class GameEngine:
             p.route_edge = None
             p.route_type = None
             p.move_accumulated = 0
-            # Reset fixed-process-completed flag on arrival at any station
-            p.fixed_process_completed_here = False
 
     def _complete_forced_pass(self, pid: str) -> None:
         p = self.players[pid]
@@ -2139,7 +2099,6 @@ class GameEngine:
 
         if cptype == "TRANSFER" or cptype in ("BOARD", "WATER_TRANSFER", "PASS_TRANSFER", "PALACE_TRANSFER"):
             # Fixed process completed
-            p.fixed_process_completed_here = True
             self._add_event("PROCESS_COMPLETE", {"playerId": pid, "nodeId": target, "processType": cptype})
             p.status = "IDLE"
 
@@ -2202,30 +2161,6 @@ class GameEngine:
             p.status = "IDLE"
 
         p.current_process = None
-
-    # ── Scout marker reduction ──
-
-    def _apply_scout_reduction(self, player: Player, node_id: str, base_frames: int) -> tuple[int, bool]:
-        """Apply scout marker time reduction if a valid marker exists.
-
-        Returns (reduced_frames, was_reduced).  If a valid marker is found,
-        frames are reduced by 3, minimum 2, and the marker is marked used.
-        """
-        markers = self.scout_markers.get(node_id, [])
-        for marker in markers:
-            if (marker.team_id == player.team_id
-                    and marker.end_frame >= self.frame
-                    and not marker.used):
-                marker.used = True
-                reduced = max(2, base_frames - 3)
-                self._add_event("SCOUT_MARKER_USED", {
-                    "playerId": player.player_id,
-                    "nodeId": node_id,
-                    "baseFrames": base_frames,
-                    "reducedFrames": reduced,
-                })
-                return reduced, True
-        return base_frames, False
 
     def _advance_contests(self, frame: int) -> None:
         # Remove resolved contests from previous rounds
@@ -2742,14 +2677,7 @@ class GameEngine:
             "accepted": accepted,
             "result": result,
         }
-        # Always write all error fields for rejected actions so strategy can learn
-        if not accepted:
-            error_code = error or result
-            entry["errorCode"] = error_code
-            entry["code"] = result  # short canonical code
-            entry["reason"] = error or result
-            entry["message"] = error or result
-        elif error:
+        if error:
             entry["errorCode"] = error
             entry["message"] = error
         if success is not None:
