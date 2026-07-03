@@ -80,7 +80,12 @@ class RoutePlanner:
         return result
 
     def _edge_frames(self, edge: RouteEdge) -> int:
-        coefficient = ROUTE_COEFFICIENT.get(edge.route_type, ROUTE_COEFFICIENT["ROAD"])
+        # Official packets and local fixtures are not perfectly consistent about
+        # route type casing.  Treat water/mountain/branch case-insensitively;
+        # otherwise lowercase "water" silently fell back to ROAD and made the
+        # planner over-prefer long road-only routes.
+        route_type = str(edge.route_type or "ROAD").upper()
+        coefficient = ROUTE_COEFFICIENT.get(route_type, ROUTE_COEFFICIENT["ROAD"])
         required_move = edge.distance * coefficient
         return max(1, (required_move + 999) // 1000)
 
