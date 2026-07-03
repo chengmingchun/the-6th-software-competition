@@ -408,6 +408,83 @@ class TestOnlineGuardRegressionScenario(unittest.TestCase):
         self.assertEqual(result.get("targetNodeId"), "S10")
         self.assertEqual(p1.station, "S09")
 
+    def test_moving_lock_trap_injects_guard_while_convoy_is_moving(self):
+        engine = GameEngine(
+            seed=42,
+            player1_id="1001",
+            player2_id="1002",
+            scenario="moving_lock_trap",
+        )
+        for obs in engine.obstacles.values():
+            obs.cleared = True
+        for nid in engine.obstacles:
+            engine.stations[nid]["hasObstacle"] = False
+        p1 = engine.players["1001"]
+        p2 = engine.players["1002"]
+        p1.station = "S09"
+        p1.status = "MOVING"
+        p1.target_station = "S10"
+
+        engine.process_actions(300, [], [])
+
+        self.assertIn("S10", p2.guards)
+        self.assertGreater(p2.guards["S10"].defense, 0)
+
+    def test_rush_guard_wall_injects_late_palace_and_gate_guards(self):
+        engine = GameEngine(
+            seed=42,
+            player1_id="1001",
+            player2_id="1002",
+            scenario="rush_guard_wall",
+        )
+        p1 = engine.players["1001"]
+        p2 = engine.players["1002"]
+        p1.station = "S12"
+        p1.status = "IDLE"
+
+        engine.process_actions(450, [], [])
+        self.assertIn("S13", p2.guards)
+        self.assertEqual(p2.guards["S13"].defense, 4)
+
+        p1.station = "S13"
+        engine.process_actions(500, [], [])
+        self.assertIn("S14", p2.guards)
+        self.assertLessEqual(p2.guards["S14"].defense, 4)
+
+    def test_weather_obstacle_gauntlet_adds_deterministic_weather_pressure(self):
+        engine = GameEngine(
+            seed=42,
+            player1_id="1001",
+            player2_id="1002",
+            scenario="weather_obstacle_gauntlet",
+        )
+
+        deterministic_events = {
+            (event.weather_type, event.start_frame, event.duration)
+            for event in engine.weather_events
+        }
+        self.assertIn(("MOUNTAIN_FOG", 150, 90), deterministic_events)
+        self.assertIn(("HOT", 300, 120), deterministic_events)
+        self.assertIn(("HEAVY_RAIN", 430, 80), deterministic_events)
+
+    def test_full_stress_combines_guard_and_weather_scenarios(self):
+        engine = GameEngine(
+            seed=42,
+            player1_id="1001",
+            player2_id="1002",
+            scenario="full_stress",
+        )
+        p1 = engine.players["1001"]
+        p2 = engine.players["1002"]
+        p1.station = "S09"
+        p1.status = "MOVING"
+        p1.target_station = "S10"
+
+        engine.process_actions(300, [], [])
+
+        self.assertIn("S10", p2.guards)
+        self.assertTrue(any(event.weather_type == "HOT" and event.start_frame == 300 for event in engine.weather_events))
+
 
 class TestScoutConsumptionBeforeValidation(unittest.TestCase):
     """Scout marker should not be consumed if PROCESS is rejected."""

@@ -418,6 +418,13 @@ class GameEngine:
                     self.stations[node]["resourceStock"][res_type] = count
 
     def _init_weather(self) -> None:
+        scenario_names = self._scenario_names()
+        if "weather_obstacle_gauntlet" in scenario_names or "full_stress" in scenario_names:
+            self.weather_events.extend([
+                WeatherEvent(weather_type="MOUNTAIN_FOG", start_frame=150, duration=90, region=["MOUNTAIN"]),
+                WeatherEvent(weather_type="HOT", start_frame=300, duration=120, region=["ALL"]),
+                WeatherEvent(weather_type="HEAVY_RAIN", start_frame=430, duration=80, region=["WATER"]),
+            ])
         for ws in C.WEATHER_SCHEDULE:
             start = self.rng.randint(ws["start_range"][0], ws["start_range"][1])
             self.weather_events.append(WeatherEvent(
@@ -426,6 +433,20 @@ class GameEngine:
                 duration=ws["duration"],
                 region=ws["region"],
             ))
+
+    def _scenario_names(self) -> set[str]:
+        if not self.scenario:
+            return set()
+        names = {
+            chunk.strip()
+            for chunk in self.scenario.replace("+", ",").replace(";", ",").split(",")
+            if chunk.strip()
+        }
+        if "online_guard_regression" in names:
+            names.add("guard_gauntlet")
+        if "full_stress" in names:
+            names.update({"moving_lock_trap", "rush_guard_wall", "weather_obstacle_gauntlet"})
+        return names
 
     def reset_seed(self, new_seed: int) -> None:
         self.seed = new_seed
@@ -954,27 +975,52 @@ class GameEngine:
 
         The normal engine only creates guards when a bot submits SET_GUARD. That
         is faithful, but it means self-play between two passive bots may never
-        test the recovery path for enemy guard blocks. The guard_gauntlet
-        scenario injects opponent-owned S10/S11 guards once player1 is close,
-        matching the old logs where repeated MOVE into a guarded key pass caused
-        a late-game stall.
+        test the recovery path for enemy guard blocks. These scenarios inject
+        opponent-owned guards at key moments, including while player1 is already
+        MOVING, matching the official behavior that can trap the main convoy
+        until a squad or weathering removes the blocker.
         """
 
-        if self.scenario not in {"guard_gauntlet", "online_guard_regression"}:
+        scenario_names = self._scenario_names()
+        if not scenario_names:
             return
         victim = self.players.get(self.player1_id)
         defender = self.players.get(self.player2_id)
         if victim is None or defender is None or victim.retired or victim.delivered:
             return
-        schedule = (
-            ("S09", "S10", 5, 280),
-            ("S10", "S11", 4, 360),
-        )
-        for approach, target, defense, earliest_frame in schedule:
+
+        if "guard_gauntlet" in scenario_names:
+            self._apply_scenario_guard_schedule(frame, victim, defender, (
+                ("station", "S09", "S10", 5, 280),
+                ("station", "S10", "S11", 4, 360),
+            ))
+        if "moving_lock_trap" in scenario_names:
+            self._apply_scenario_guard_schedule(frame, victim, defender, (
+                ("moving_target", "S09", "S10", 5, 250),
+            ))
+        if "rush_guard_wall" in scenario_names:
+            self._apply_scenario_guard_schedule(frame, victim, defender, (
+                ("station", "S12", "S13", 4, 430),
+                ("station", "S13", "S14", 3, 480),
+            ))
+
+    def _apply_scenario_guard_schedule(
+        self,
+        frame: int,
+        victim: Player,
+        defender: Player,
+        schedule: tuple[tuple[str, str, str, int, int], ...],
+    ) -> None:
+        for trigger, approach, target, defense, earliest_frame in schedule:
             key = (defender.player_id, target)
             if key in self._scenario_guard_installed:
                 continue
-            if frame < earliest_frame or victim.station != approach:
+            if frame < earliest_frame:
+                continue
+            if trigger == "moving_target":
+                if victim.status != "MOVING" or victim.target_station != target:
+                    continue
+            elif victim.station != approach:
                 continue
             self._install_scenario_guard(defender.player_id, target, defense, frame)
             self._scenario_guard_installed.add(key)
