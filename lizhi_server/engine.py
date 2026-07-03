@@ -1093,23 +1093,26 @@ class GameEngine:
         if not station:
             self._add_action_result(pid, "PROCESS", False, "TARGET_NOT_FOUND")
             p.last_action_result = "ACTION_REJECTED"
+            p.last_action_error = "TARGET_NOT_FOUND"
             return
 
         if target not in C.FIXED_PROCESS_NODES:
             self._add_action_result(pid, "PROCESS", False, "PROCESS_NOT_AVAILABLE")
             p.last_action_result = "ACTION_REJECTED"
+            p.last_action_error = "PROCESS_NOT_AVAILABLE"
             return
 
         pt, pr, cw = C.FIXED_PROCESS_NODES[target]
-        # Apply scout marker reduction
-        reduced_pr, _ = self._apply_scout_reduction(p, target, pr)
-        handle_event = ""
 
-        # Check if can process here
+        # Check position BEFORE consuming scout marker
         if p.station != target:
             self._add_action_result(pid, "PROCESS", False, "NOT_AT_TARGET_NODE")
             p.last_action_result = "ACTION_REJECTED"
+            p.last_action_error = "NOT_AT_TARGET_NODE"
             return
+
+        # All checks pass — now it's safe to consume scout marker
+        reduced_pr, _ = self._apply_scout_reduction(p, target, pr)
 
         p.status = "PROCESSING"
         p.current_process = {
@@ -1854,7 +1857,7 @@ class GameEngine:
                 pid = str(contest.initiator_player_id)
                 p = self.players[pid]
                 p.status = "FORCED_PASSING"
-                total = contest.initial_time_tax + 10  # approximate route frames
+                total = contest.initial_time_tax + 10
                 p.current_process = {
                     "type": "FORCED_PASS",
                     "target": contest.target_node,
@@ -1873,44 +1876,58 @@ class GameEngine:
                 p.status = "RESTING"
                 rest_frames = max(3, min(8, contest.initial_time_tax // 4 + 3))
                 p.current_process = {"type": "REST", "framesLeft": rest_frames, "totalFrames": rest_frames}
+            # In PASS contests, ensure defender is never stuck CONTESTING
+            defender_pid = self._team_to_player_id("RED" if initiator_team == "BLUE" else "BLUE")
+            if defender_pid:
+                dp = self.players.get(str(defender_pid))
+                if dp and dp.status == "CONTESTING":
+                    dp.status = "IDLE"
+                    dp.current_process = None
 
-        elif contest.contest_type == "RESOURCE":
-            winner_team = contest.winner_team
-            if winner_team and contest.target_node and contest.resource_type:
-                # Give resource to winner
-                for pid, p in self.players.items():
-                    if p.team_id == winner_team:
-                        stock = self.resource_stock.get(contest.target_node, {})
-                        if contest.resource_type in stock and stock[contest.resource_type] > 0:
-                            stock[contest.resource_type] -= 1
-                            p.resources[contest.resource_type] = p.resources.get(contest.resource_type, 0) + 1
-                            self._add_event("RESOURCE_CLAIM", {
-                                "playerId": pid,
-                                "nodeId": contest.target_node,
-                                "resourceType": contest.resource_type,
-                            })
-                        break
+        else:
+            # Non-DRAW, non-PASS contest (RESOURCE, TASK, GATE, DOCK, OBSTACLE).
+            # Restore BOTH players from CONTESTING back to IDLE after resolution.
+            for pid in [self.player1_id, self.player2_id]:
+                p = self.players[pid]
+                if p.status == "CONTESTING":
+                    p.status = "IDLE"
+                    p.current_process = None
 
-        elif contest.contest_type == "TASK":
-            winner_team = contest.winner_team
-            if winner_team and contest.task_id:
-                task = self._find_task(contest.task_id)
-                if task and not task.completed:
+            if contest.contest_type == "RESOURCE":
+                winner_team = contest.winner_team
+                if winner_team and contest.target_node and contest.resource_type:
                     for pid, p in self.players.items():
                         if p.team_id == winner_team:
-                            task.owner_player_id = pid
-                            # Start processing the task
-                            p.status = "PROCESSING"
-                            p.current_process = {
-                                "type": "CLAIM_TASK",
-                                "taskId": task.task_id,
-                                "template": task.template,
-                                "target": task.target,
-                                "framesLeft": task.process_frames,
-                                "totalFrames": task.process_frames,
-                                "score": task.score,
-                            }
+                            stock = self.resource_stock.get(contest.target_node, {})
+                            if contest.resource_type in stock and stock[contest.resource_type] > 0:
+                                stock[contest.resource_type] -= 1
+                                p.resources[contest.resource_type] = p.resources.get(contest.resource_type, 0) + 1
+                                self._add_event("RESOURCE_CLAIM", {
+                                    "playerId": pid,
+                                    "nodeId": contest.target_node,
+                                    "resourceType": contest.resource_type,
+                                })
                             break
+
+            elif contest.contest_type == "TASK":
+                winner_team = contest.winner_team
+                if winner_team and contest.task_id:
+                    task = self._find_task(contest.task_id)
+                    if task and not task.completed:
+                        for pid, p in self.players.items():
+                            if p.team_id == winner_team:
+                                task.owner_player_id = pid
+                                p.status = "PROCESSING"
+                                p.current_process = {
+                                    "type": "CLAIM_TASK",
+                                    "taskId": task.task_id,
+                                    "template": task.template,
+                                    "target": task.target,
+                                    "framesLeft": task.process_frames,
+                                    "totalFrames": task.process_frames,
+                                    "score": task.score,
+                                }
+                                break
 
     # ── Squad actions ──
 
@@ -2124,6 +2141,8 @@ class GameEngine:
         p.current_process = None
         p.target_station = None
         p.route_edge = None
+        # Entering via forced pass counts as a new visit — may need to redo PROCESS
+        p.fixed_process_completed_here = False
 
     def _complete_verify(self, pid: str) -> None:
         p = self.players[pid]

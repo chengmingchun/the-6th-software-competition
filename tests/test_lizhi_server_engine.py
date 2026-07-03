@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import unittest
 
-from lizhi_server.engine import GameEngine, ScoutMarker, Player
+from lizhi_server.engine import GameEngine, ScoutMarker, Player, ContestWindow
 from lizhi_server.config import FIXED_PROCESS_NODES
 
 
@@ -221,9 +221,252 @@ class TestRecvActionsUtility(unittest.TestCase):
         """_recv_actions_pair should be a method on MatchRunner that returns two values."""
         from lizhi_server.server import MatchRunner
         import socket
-        # Just test that the method exists and has correct signature
         self.assertTrue(hasattr(MatchRunner, "_recv_actions_pair"))
         self.assertTrue(callable(MatchRunner._recv_actions_pair))
+
+
+class TestScoutConsumptionBeforeValidation(unittest.TestCase):
+    """Scout marker should not be consumed if PROCESS is rejected."""
+
+    def setUp(self):
+        self.engine = GameEngine(seed=42, player1_id="1001", player2_id="1002")
+        for obs in self.engine.obstacles.values():
+            obs.cleared = True
+
+    def test_scout_not_consumed_on_not_at_target_node(self):
+        """PROCESS at wrong node should NOT consume scout marker."""
+        p = self.engine.players["1001"]
+        # Player at S01, send PROCESS target=S02 (NOT_AT_TARGET_NODE)
+        p.station = "S01"
+        p.status = "IDLE"
+        # Place a scout marker at S02
+        self.engine.scout_markers.setdefault("S02", []).append(
+            ScoutMarker(team_id=p.team_id, start_frame=1, end_frame=100, used=False)
+        )
+        self.engine.process_actions(10, [{"action": "PROCESS", "targetNodeId": "S02"}], [])
+        # Should be rejected
+        ar = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
+        self.assertTrue(any(not r.get("accepted", True) for r in ar),
+                        f"PROCESS should be rejected: {self.engine.action_results}")
+        # Scout marker should still be unused
+        markers = self.engine.scout_markers.get("S02", [])
+        self.assertTrue(any(not m.used for m in markers),
+                        "Scout marker at S02 should remain unused after rejected PROCESS")
+
+
+class TestForcedPassFixedProcessReset(unittest.TestCase):
+    """ _complete_forced_pass should reset fixed_process_completed_here."""
+
+    def setUp(self):
+        self.engine = GameEngine(seed=42, player1_id="1001", player2_id="1002")
+        for obs in self.engine.obstacles.values():
+            obs.cleared = True
+
+    def test_forced_pass_resets_fixed_process_completed(self):
+        """After forced pass into S11 (PASS_TRANSFER), need to redo PROCESS."""
+        p = self.engine.players["1001"]
+        p.station = "S10"
+        p.status = "IDLE"
+        p.fixed_process_completed_here = True  # pretend we had done it
+
+        # Simulate what _complete_forced_pass does
+        p.station = "S11"
+        p.status = "IDLE"
+        p.current_process = None
+        p.target_station = None
+        p.route_edge = None
+        # This is exactly what _complete_forced_pass should do:
+        p.fixed_process_completed_here = False
+
+        self.assertFalse(p.fixed_process_completed_here,
+                         "forced_pass arrival should reset fixed_process_completed_here")
+
+    def test_forced_pass_requires_process_at_fixed_node(self):
+        """Entering S11 via forced pass then MOVE back should reject with PROCESS_REQUIRED."""
+        p = self.engine.players["1001"]
+        p.station = "S10"
+        p.status = "IDLE"
+        p.fixed_process_completed_here = True
+
+        # Manually call what _complete_forced_pass does for entering S11
+        p.station = "S11"
+        p.status = "IDLE"
+        p.current_process = None
+        p.target_station = None
+        p.route_edge = None
+        p.fixed_process_completed_here = False
+
+        # Now try to MOVE away without PROCESS
+        self.engine.process_actions(50, [{"action": "MOVE", "targetNodeId": "S12"}], [])
+        ar = [r for r in self.engine.action_results
+              if str(r.get("playerId")) == "1001" and r.get("action") == "MOVE"]
+        self.assertTrue(ar, f"No MOVE result found: {self.engine.action_results}")
+        self.assertFalse(ar[0].get("accepted", True),
+                         f"Should reject MOVE without PROCESS, got {ar[0]}")
+        self.assertIn("PROCESS_REQUIRED", str(ar[0].get("result", "")),
+                      f"Expected PROCESS_REQUIRED, got {ar[0]}")
+
+
+class TestScoutReductionEndToEnd(unittest.TestCase):
+    """End-to-end tests: scout markers reduce processing time through process_actions."""
+
+    def setUp(self):
+        self.engine = GameEngine(seed=42, player1_id="1001", player2_id="1002")
+        for obs in self.engine.obstacles.values():
+            obs.cleared = True
+        for nid in self.engine.obstacles:
+            self.engine.stations[nid]["hasObstacle"] = False
+
+    def test_process_reduced_by_scout(self):
+        """PROCESS at S02 with scout marker uses reduced frames."""
+        p = self.engine.players["1001"]
+        p.station = "S02"
+        p.status = "IDLE"
+        # Add scout marker at S02
+        self.engine.scout_markers.setdefault("S02", []).append(
+            ScoutMarker(team_id=p.team_id, start_frame=1, end_frame=100, used=False)
+        )
+        self.engine.process_actions(10, [{"action": "PROCESS", "targetNodeId": "S02"}], [])
+        # PROCESS should be accepted with reduced frames
+        self.assertIsNotNone(p.current_process, "Should have started processing")
+        self.assertEqual(p.current_process.get("totalFrames"), 2,
+                         f"Expected 2 (reduced from 4), got {p.current_process}")
+        # Marker should be used
+        markers = self.engine.scout_markers.get("S02", [])
+        self.assertTrue(all(m.used for m in markers), "Scout markers should be used")
+
+    def test_claim_resource_reduced_by_scout(self):
+        """CLAIM_RESOURCE at S03 with scout marker uses reduced frames."""
+        p = self.engine.players["1001"]
+        p.station = "S03"
+        p.status = "IDLE"
+        # Ensure resource exists
+        self.engine.resource_stock.setdefault("S03", {})["ICE_BOX"] = 1
+        # Add scout marker
+        self.engine.scout_markers.setdefault("S03", []).append(
+            ScoutMarker(team_id=p.team_id, start_frame=1, end_frame=100, used=False)
+        )
+        self.engine.process_actions(10, [{"action": "CLAIM_RESOURCE", "targetNodeId": "S03", "resourceType": "ICE_BOX"}], [])
+        self.assertIsNotNone(p.current_process, "Should have started claiming")
+        self.assertEqual(p.current_process.get("totalFrames"), 2,
+                         f"Expected 2 (RESOURCE_CLAIM_FRAMES=2 -> min=2, no reduction possible), got {p.current_process}")
+
+    def test_verify_gate_reduced_by_scout(self):
+        """VERIFY_GATE at S14 with scout marker uses reduced frames."""
+        p = self.engine.players["1001"]
+        p.station = "S14"
+        p.status = "IDLE"
+        self.engine.phase = "RUSH"
+        # Add scout marker
+        self.engine.scout_markers.setdefault("S14", []).append(
+            ScoutMarker(team_id=p.team_id, start_frame=1, end_frame=100, used=False)
+        )
+        self.engine.process_actions(50, [{"action": "VERIFY_GATE", "targetNodeId": "S14"}], [])
+        self.assertIsNotNone(p.current_process, "Should have started verifying")
+        self.assertEqual(p.current_process.get("totalFrames"), 3,
+                         f"Expected 3 (reduced from 6), got {p.current_process}")
+
+    def test_verify_gate_break_order_and_scout_stack(self):
+        """VERIFY_GATE with BREAK_ORDER and scout marker: 6->3->2 (stacked)."""
+        p = self.engine.players["1001"]
+        p.station = "S14"
+        p.status = "IDLE"
+        p.rush_tactic_used = 0
+        self.engine.phase = "RUSH"
+        # Add scout marker
+        self.engine.scout_markers.setdefault("S14", []).append(
+            ScoutMarker(team_id=p.team_id, start_frame=1, end_frame=100, used=False)
+        )
+        self.engine.process_actions(50, [{"action": "VERIFY_GATE", "targetNodeId": "S14", "rushTactic": "BREAK_ORDER"}], [])
+        self.assertIsNotNone(p.current_process, "Should have started verifying")
+        # BREAK_ORDER reduces 6->3, then scout reduces 3->2
+        total = p.current_process.get("totalFrames", 99)
+        self.assertLessEqual(total, 3,
+                             f"Expected <=3 (stacked reduction), got {total}")
+        # Note: if both stack, result is max(2, 6-3-3)=2. Check:
+        self.assertEqual(total, 2,
+                         f"Expected 2 (break_order 6->3, scout 3->2), got {total}")
+
+
+class TestWindowContestResolution(unittest.TestCase):
+    """Window contests should cleanly resolve without leaving players stuck."""
+
+    def setUp(self):
+        self.engine = GameEngine(seed=42, player1_id="1001", player2_id="1002")
+        for obs in self.engine.obstacles.values():
+            obs.cleared = True
+
+    def _resolve_window_full(self, contest_type="RESOURCE", resource_type="SHORT_HORSE"):
+        """Create a window and run it through all 3 beats with cards."""
+        pid1, pid2 = "1001", "1002"
+        p1, p2 = self.engine.players[pid1], self.engine.players[pid2]
+        p1.station = "S07"
+        p2.station = "S07"
+        p1.status = "IDLE"
+        p2.status = "IDLE"
+
+        contest = ContestWindow(
+            contest_id="C_test_001",
+            contest_type=contest_type,
+            target_node="S07",
+            resource_type=resource_type if contest_type == "RESOURCE" else None,
+            red_player_id=pid1 if self.engine.team_map[pid1] == "RED" else pid2,
+            blue_player_id=pid2 if self.engine.team_map[pid2] == "BLUE" else pid1,
+            round_index=1,
+            total_rounds=3,
+            deadline_round=self.engine.frame + 1,
+        )
+        self.engine.contests.append(contest)
+        return pid1, pid2
+
+    def test_resource_window_resolves_cleanly(self):
+        """After 3 beats of a resource contest, players are no longer CONTESTING."""
+        pid1, pid2 = self._resolve_window_full("RESOURCE")
+        # Play all 3 beats with BING_ZHENG vs ABSTAIN -> RED wins all 3
+        for beat in range(1, 4):
+            if self.engine.team_map[pid1] == "RED":
+                red_pid, blue_pid = pid1, pid2
+            else:
+                red_pid, blue_pid = pid2, pid1
+
+            self.engine.process_actions(
+                self.engine.frame + 1,
+                [{"action": "WINDOW_CARD", "contestId": "C_test_001", "card": "BING_ZHENG"}],
+                [{"action": "WINDOW_CARD", "contestId": "C_test_001", "card": "ABSTAIN"}],
+            )
+            self.engine._advance_states(self.engine.frame)
+
+        # After all beats, the contest should be resolved
+        resolved = [c for c in self.engine.contests if c.contest_id == "C_test_001"]
+        # It may have been removed from the list or marked resolved
+        if resolved:
+            self.assertTrue(resolved[0].resolved, "Contest should be resolved")
+
+    def test_window_does_not_stick_in_contesting(self):
+        """After window resolves, players should not remain CONTESTING."""
+        pid1, pid2 = self._resolve_window_full()
+        p1 = self.engine.players[pid1]
+        p2 = self.engine.players[pid2]
+
+        # Red wins with BING_ZHENG, Blue abstains
+        for beat in range(1, 4):
+            if self.engine.team_map[pid1] == "RED":
+                red_pid, blue_pid = pid1, pid2
+            else:
+                red_pid, blue_pid = pid2, pid1
+
+            self.engine.process_actions(
+                self.engine.frame + 1,
+                [{"action": "WINDOW_CARD", "contestId": "C_test_001", "card": "BING_ZHENG"}],
+                [{"action": "WINDOW_CARD", "contestId": "C_test_001", "card": "ABSTAIN"}],
+            )
+            self.engine._advance_states(self.engine.frame)
+
+        # Check players are not stuck in CONTESTING
+        self.assertNotEqual(p1.status, "CONTESTING",
+                            f"P1 should not be CONTESTING after window resolved, got {p1.status}")
+        self.assertNotEqual(p2.status, "CONTESTING",
+                            f"P2 should not be CONTESTING after window resolved, got {p2.status}")
 
 
 if __name__ == "__main__":

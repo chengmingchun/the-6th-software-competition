@@ -175,6 +175,32 @@ class MatchRunner:
             _log(f"  Player 2 ({p2.team_id}): {p2.total_score} pts (delivered={p2.delivered})")
             _log(f"  Frames played: {engine.frame}")
             _log(f"{'='*60}\n")
+            # Machine-readable result line for tournament runner
+            import json as _json
+            _result = {
+                "seed": self.seed, "matchId": self.match_id,
+                "overRound": engine.frame,
+                "players": [
+                    {"playerId": p1.player_id, "teamId": p1.team_id,
+                     "totalScore": p1.total_score, "delivered": p1.delivered,
+                     "deliverRound": p1.deliver_round, "freshness": round(p1.freshness, 2),
+                     "goodFruit": p1.good_fruit, "badFruit": p1.bad_fruit,
+                     "taskScore": p1.task_score, "bountyScore": p1.bounty_score,
+                     "penaltyScore": min(20, max(0, p1.illegal_action_count - 5)) + min(30, p1.post_deliver_penalty * 5)},
+                    {"playerId": p2.player_id, "teamId": p2.team_id,
+                     "totalScore": p2.total_score, "delivered": p2.delivered,
+                     "deliverRound": p2.deliver_round, "freshness": round(p2.freshness, 2),
+                     "goodFruit": p2.good_fruit, "badFruit": p2.bad_fruit,
+                     "taskScore": p2.task_score, "bountyScore": p2.bounty_score,
+                     "penaltyScore": min(20, max(0, p2.illegal_action_count - 5)) + min(30, p2.post_deliver_penalty * 5)},
+                ],
+                "winnerPlayerId": None,
+            }
+            if p1.total_score > p2.total_score:
+                _result["winnerPlayerId"] = p1.player_id
+            elif p2.total_score > p1.total_score:
+                _result["winnerPlayerId"] = p2.player_id
+            _log(f"MATCH_RESULT_JSON {_json.dumps(_result, ensure_ascii=False, separators=(',', ':'))}")
 
         except Exception as exc:
             _log(f"  [ERROR] Match failed: {exc}")

@@ -243,6 +243,33 @@ def run_battle(seed: int = 42, player1_id: str = "1001", player2_id: str = "1002
 
     start_time = time.time()
 
+    # Action counters per player
+    action_counts: dict[str, dict[str, int]] = {
+        player1_id: {},
+        player2_id: {},
+    }
+
+    def _update_action_counts(pid: str, actions: list[dict]) -> None:
+        cnt = action_counts[pid]
+        if not actions:
+            cnt["empty_action"] = cnt.get("empty_action", 0) + 1
+        for a in actions:
+            atype = a.get("action", "UNKNOWN")
+            cnt[atype] = cnt.get(atype, 0) + 1
+            if atype == "WINDOW_CARD":
+                card = a.get("card", "UNKNOWN")
+                cnt[f"window_card_{card}"] = cnt.get(f"window_card_{card}", 0) + 1
+
+    def _count_action_results(pid: str) -> None:
+        """Tally accepted/rejected from the latest frame's action_results."""
+        cnt = action_counts[pid]
+        for ar in server.action_results:
+            if str(ar.get("playerId")) == str(pid):
+                if ar.get("accepted", False):
+                    cnt["accepted_action"] = cnt.get("accepted_action", 0) + 1
+                else:
+                    cnt["rejected_action"] = cnt.get("rejected_action", 0) + 1
+
     # Game loop
     for frame in range(1, 601):
         if server.ended:
@@ -268,10 +295,14 @@ def run_battle(seed: int = 42, player1_id: str = "1001", player2_id: str = "1002
 
         actions1 = bundle1.to_actions()
         actions2 = bundle2.to_actions()
+        _update_action_counts(player1_id, actions1)
+        _update_action_counts(player2_id, actions2)
 
         # Process
         server.process_actions(frame, actions1, actions2)
         server._advance_buffs()
+        _count_action_results(player1_id)
+        _count_action_results(player2_id)
 
         # Progress log
         if frame % 100 == 0 or frame == 1:
@@ -287,15 +318,16 @@ def run_battle(seed: int = 42, player1_id: str = "1001", player2_id: str = "1002
     print(f"  [Done] {server.frame} frames in {total_time:.1f}s ({server.frame / total_time:.0f} f/s)")
 
     over = server.get_over_payload()
+    over["_action_counts"] = action_counts
     logger1.close()
     logger2.close()
     return over
 
 
-def format_player_row(pl: dict) -> dict:
+def format_player_row(pl: dict, action_counts: dict[str, int] | None = None) -> dict:
     """Extract a flat dict of key metrics from a player's over data."""
     sd = pl["scoreDetail"]
-    return {
+    row = {
         "playerId": pl["playerId"],
         "totalScore": pl["totalScore"],
         "delivered": pl["delivered"],
@@ -314,6 +346,10 @@ def format_player_row(pl: dict) -> dict:
         "scoreBounty": sd["bounty"],
         "scorePenalty": sd["penalty"],
     }
+    if action_counts:
+        for key in sorted(action_counts.keys()):
+            row[f"act_{key}"] = action_counts[key]
+    return row
 
 
 def write_summary_csv(path: str, rows: list[dict], fieldnames: list[str]) -> None:
@@ -419,18 +455,43 @@ def main() -> int:
 
         over = run_battle(seed=seed, log_dir=args.log_dir)
         od = over["msg_data"]
+        action_counts = over.get("_action_counts", {})
 
         for pl in od["players"]:
-            row = format_player_row(pl)
+            pid = pl["playerId"]
+            counts = action_counts.get(str(pid), {})
+            row = format_player_row(pl, counts)
             row["seed"] = seed
             all_rows.append(row)
             if base_fieldnames is None:
                 base_fieldnames = list(format_player_row(pl).keys())
 
-        # Print per-battle summary
+        # Print per-battle summary with action counts
         p1, p2 = od["players"][0], od["players"][1]
         print(f"  Result: P1={p1['totalScore']} P2={p2['totalScore']} "
               f"winner={od['winnerPlayerId']} type={od['resultType']}")
+        for pid_label, pid_val in [("P1", p1["playerId"]), ("P2", p2["playerId"])]:
+            cnt = action_counts.get(str(pid_val), {})
+            accepted = cnt.get("accepted_action", 0)
+            rejected = cnt.get("rejected_action", 0)
+            wait_ct = cnt.get("WAIT", 0)
+            move_ct = cnt.get("MOVE", 0)
+            claim_task = cnt.get("CLAIM_TASK", 0)
+            claim_res = cnt.get("CLAIM_RESOURCE", 0)
+            use_res = cnt.get("USE_RESOURCE", 0)
+            window_ct = cnt.get("WINDOW_CARD", 0)
+            abstain = cnt.get("window_card_ABSTAIN", 0)
+            guard_ct = cnt.get("SET_GUARD", 0)
+            break_g = cnt.get("BREAK_GUARD", 0)
+            forced_p = cnt.get("FORCED_PASS", 0)
+            verify_g = cnt.get("VERIFY_GATE", 0)
+            deliver_ct = cnt.get("DELIVER", 0)
+            empty = cnt.get("empty_action", 0)
+            print(f"    {pid_label} actions: accepted={accepted} rejected={rejected} "
+                  f"WAIT={wait_ct} MOVE={move_ct} empty={empty}")
+            print(f"    {pid_label} details: TASK={claim_task} RES={claim_res} USE={use_res} "
+                  f"WINDOW={window_ct}(ABSTAIN={abstain}) GUARD={guard_ct} BREAK={break_g} "
+                  f"FORCE={forced_p} VERIFY={verify_g} DELIVER={deliver_ct}")
 
     # Overall summary
     print_summary(all_rows)
