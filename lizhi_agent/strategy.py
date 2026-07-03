@@ -47,6 +47,43 @@ WINDOW_TERMINAL_STATUSES = {"SUPPRESSED", "RESOLVED", "FINISHED", "FINISH", "END
 WINDOW_HARD_MAX_SENDS = 3
 SCOUT_PATH_LOOKAHEAD = 3
 ROUTE_RESOURCE_TYPES = {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE", "INTEL"}
+WINDOW_MATRIX = {
+    WindowCard.YAN_DIE: {
+        WindowCard.YAN_DIE: "DRAW",
+        WindowCard.QIANG_XING: "WIN",
+        WindowCard.XIAN_GONG: "LOSE",
+        WindowCard.BING_ZHENG: "LOSE",
+        WindowCard.ABSTAIN: "WIN",
+    },
+    WindowCard.QIANG_XING: {
+        WindowCard.YAN_DIE: "LOSE",
+        WindowCard.QIANG_XING: "DRAW",
+        WindowCard.XIAN_GONG: "WIN",
+        WindowCard.BING_ZHENG: "LOSE",
+        WindowCard.ABSTAIN: "WIN",
+    },
+    WindowCard.XIAN_GONG: {
+        WindowCard.YAN_DIE: "WIN",
+        WindowCard.QIANG_XING: "LOSE",
+        WindowCard.XIAN_GONG: "DRAW",
+        WindowCard.BING_ZHENG: "WIN",
+        WindowCard.ABSTAIN: "WIN",
+    },
+    WindowCard.BING_ZHENG: {
+        WindowCard.YAN_DIE: "WIN",
+        WindowCard.QIANG_XING: "WIN",
+        WindowCard.XIAN_GONG: "LOSE",
+        WindowCard.BING_ZHENG: "DRAW",
+        WindowCard.ABSTAIN: "WIN",
+    },
+    WindowCard.ABSTAIN: {
+        WindowCard.YAN_DIE: "LOSE",
+        WindowCard.QIANG_XING: "LOSE",
+        WindowCard.XIAN_GONG: "LOSE",
+        WindowCard.BING_ZHENG: "LOSE",
+        WindowCard.ABSTAIN: "DRAW",
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -67,8 +104,8 @@ class WindowStrategy:
     """Low-regret mixed policy for contest windows."""
 
     def choose(self, state: GameState, window: WindowState, config: StrategyConfig) -> WindowChoice:
-        me = state.me
-        high_value = window.window_type in {"GATE", "TASK", "PASS"} or window.resource_type in {"FAST_HORSE", "ICE_BOX"}
+        high_value = self._is_high_value(state, window)
+        value = self._window_value(state, window)
         opponent_card = self._opponent_revealed_card(state, window)
         if opponent_card is not None:
             counter = self._counter_card(state, opponent_card, high_value)
@@ -78,17 +115,10 @@ class WindowStrategy:
             options = self._opening_options(state, high_value)
             card, roll = self._weighted_pick(state, window, options)
             return WindowChoice(card, "OPENING_MIX", f"开局窗口混合策略，候选={self._options_text(options)}", roll)
-        if high_value and me.guard_points > 0:
-            return WindowChoice(WindowCard.BING_ZHENG, "FIXED_VALUE", "高价值窗口且有护卫点")
-        if high_value and (me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT")):
-            return WindowChoice(WindowCard.YAN_DIE, "FIXED_RESOURCE", "有通行类资源")
-        if high_value and (me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")):
-            return WindowChoice(WindowCard.QIANG_XING, "FIXED_SPEED", "有速度资源/增益")
-        if high_value and me.freshness >= 85 and me.good_fruit >= 80:
-            return WindowChoice(WindowCard.XIAN_GONG, "FIXED_FRUIT", "高价值窗口且果况健康")
-        if me.guard_points > 0 and me.freshness >= 70 and me.good_fruit >= 70:
-            return WindowChoice(WindowCard.BING_ZHENG, "ACTIVE_GUARD", "contest_has_guard_point")
-        return WindowChoice(WindowCard.ABSTAIN, "SAVE_FRUIT", "价值不够或资源不足")
+        options = self._ev_options(state, window, high_value, value)
+        card, roll = self._weighted_pick(state, window, options)
+        style = "WINDOW_EV_MIX" if len(options) > 1 else "WINDOW_EV_FIXED"
+        return WindowChoice(card, style, f"value={value};score={self._score_text(state, window)};options={self._options_text(options)}", roll)
 
     def choose_card(self, state: GameState, window: WindowState) -> WindowCard:
         return self.choose(state, window, StrategyConfig.default()).card
@@ -117,6 +147,201 @@ class WindowStrategy:
         if not options:
             options.append((WindowCard.ABSTAIN, 100))
         return options
+
+    def _is_high_value(self, state: GameState, window: WindowState) -> bool:
+        return self._window_value(state, window) >= 60
+
+    def _window_value(self, state: GameState, window: WindowState) -> int:
+        ctype = str(window.window_type or "").upper()
+        resource = str(window.resource_type or "").upper()
+        if ctype == "GATE" or window.target == state.gate_node:
+            return 95
+        if ctype == "PASS":
+            return 78
+        if ctype == "TASK" or window.task_id:
+            task_score = 0
+            if window.task_id:
+                for task in state.tasks:
+                    if task.id == window.task_id:
+                        task_score = task.score
+                        break
+            return 65 + min(45, task_score)
+        if resource in {"ICE_BOX", "FAST_HORSE"}:
+            return 72
+        if resource in {"SHORT_HORSE", "INTEL", "PASS_TOKEN", "OFFICIAL_PERMIT"}:
+            return 54
+        if ctype in {"OBSTACLE", "DOCK"}:
+            return 48
+        return 28
+
+    def _affordable_cards(self, state: GameState, high_value: bool) -> list[WindowCard]:
+        me = state.me
+        cards: list[WindowCard] = []
+        if me.guard_points > 0:
+            cards.append(WindowCard.BING_ZHENG)
+        if high_value and me.freshness >= 82 and me.good_fruit >= 75:
+            cards.append(WindowCard.XIAN_GONG)
+        if high_value and (me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")):
+            cards.append(WindowCard.QIANG_XING)
+        if high_value and (me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT")):
+            cards.append(WindowCard.YAN_DIE)
+        cards.append(WindowCard.ABSTAIN)
+        result: list[WindowCard] = []
+        for card in cards:
+            if card not in result:
+                result.append(card)
+        return result
+
+    def _ev_options(self, state: GameState, window: WindowState, high_value: bool, value: int) -> list[tuple[WindowCard, int]]:
+        affordable = self._affordable_cards(state, high_value)
+        my_score, opp_score = self._score_state(state, window)
+        total_rounds = int(window.raw.get("totalRounds") or 3)
+        round_index = window.round_index or 1
+        remaining_after_this = max(0, total_rounds - round_index)
+        if not high_value and value < 45 and my_score <= opp_score:
+            active = [card for card in affordable if card != WindowCard.ABSTAIN]
+            if not active or (state.me.guard_points <= 1 and state.me.task_score_base < 90):
+                return [(WindowCard.ABSTAIN, 100)]
+        if my_score > opp_score + remaining_after_this:
+            return [(WindowCard.ABSTAIN, 100)]
+        if high_value and round_index == 1 and WindowCard.BING_ZHENG in affordable and WindowCard.XIAN_GONG in affordable:
+            if str(state.me.team_id or "") == "BLUE":
+                return [(WindowCard.XIAN_GONG, 100)]
+            return [(WindowCard.BING_ZHENG, 100)]
+
+        opponent_weights = self._opponent_model(state, window, high_value)
+        scored: list[tuple[int, WindowCard]] = []
+        for card in affordable:
+            if card == WindowCard.ABSTAIN and (high_value or my_score <= opp_score):
+                continue
+            score = self._expected_card_score(card, opponent_weights, value)
+            score -= self._card_cost(card, state, high_value)
+            if my_score < opp_score:
+                score += self._must_win_bonus(card, opponent_weights)
+            if my_score > opp_score:
+                score += self._avoid_draw_bonus(card, opponent_weights)
+            if round_index >= total_rounds:
+                score += self._final_round_bonus(card, opponent_weights, my_score, opp_score)
+            score += self._role_card_bias(state, card)
+            score += self._stable_jitter(state, window, card)
+            scored.append((score, card))
+        if not scored:
+            return [(WindowCard.ABSTAIN, 100)]
+        scored.sort(reverse=True)
+        best = scored[0][0]
+        spread = 18 if high_value else 12
+        options: list[tuple[WindowCard, int]] = []
+        for score, card in scored:
+            if score < best - spread:
+                continue
+            options.append((card, max(8, score - best + spread + 12)))
+        return options or [(scored[0][1], 100)]
+
+    def _opponent_model(self, state: GameState, window: WindowState, high_value: bool) -> dict[WindowCard, int]:
+        opponent = state.opponent
+        weights = {
+            WindowCard.BING_ZHENG: 36,
+            WindowCard.XIAN_GONG: 30 if high_value else 14,
+            WindowCard.QIANG_XING: 20 if high_value else 8,
+            WindowCard.YAN_DIE: 18 if high_value else 7,
+            WindowCard.ABSTAIN: 8 if high_value else 24,
+        }
+        if opponent is not None:
+            if opponent.guard_points <= 0:
+                weights[WindowCard.BING_ZHENG] = 0
+            if opponent.freshness < 80 or opponent.good_fruit < 1:
+                weights[WindowCard.XIAN_GONG] = 0
+            if not (opponent.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or opponent.has_resource("FAST_HORSE") or opponent.has_resource("SHORT_HORSE")):
+                weights[WindowCard.QIANG_XING] = 0
+            if not (opponent.has_resource("PASS_TOKEN") or opponent.has_resource("OFFICIAL_PERMIT")):
+                weights[WindowCard.YAN_DIE] = 0
+        if window.round_index >= 2:
+            last = self._opponent_revealed_card(state, window)
+            if last is not None:
+                weights[last] += 30
+        return {card: weight for card, weight in weights.items() if weight > 0}
+
+    def _expected_card_score(self, card: WindowCard, opponent_weights: dict[WindowCard, int], value: int) -> int:
+        total = max(1, sum(opponent_weights.values()))
+        score = 0
+        for opp_card, weight in opponent_weights.items():
+            result = WINDOW_MATRIX.get(card, {}).get(opp_card, "DRAW")
+            if result == "WIN":
+                score += weight * value
+            elif result == "LOSE":
+                score -= weight * value
+            else:
+                score -= weight * max(8, value // 5)
+        return score // total
+
+    def _card_cost(self, card: WindowCard, state: GameState, high_value: bool) -> int:
+        me = state.me
+        if card == WindowCard.ABSTAIN:
+            return 0
+        if card == WindowCard.BING_ZHENG:
+            return 10 if high_value else 18
+        if card == WindowCard.XIAN_GONG:
+            return 12 if me.freshness >= 90 and me.good_fruit >= 90 else 24
+        if card == WindowCard.QIANG_XING:
+            return 16 if high_value else 28
+        if card == WindowCard.YAN_DIE:
+            return 14 if high_value else 24
+        return 20
+
+    def _must_win_bonus(self, card: WindowCard, opponent_weights: dict[WindowCard, int]) -> int:
+        return sum(weight * 2 for opp, weight in opponent_weights.items() if WINDOW_MATRIX.get(card, {}).get(opp) == "WIN")
+
+    def _avoid_draw_bonus(self, card: WindowCard, opponent_weights: dict[WindowCard, int]) -> int:
+        return -sum(weight for opp, weight in opponent_weights.items() if WINDOW_MATRIX.get(card, {}).get(opp) == "DRAW")
+
+    def _final_round_bonus(self, card: WindowCard, opponent_weights: dict[WindowCard, int], my_score: int, opp_score: int) -> int:
+        if my_score <= opp_score:
+            return self._must_win_bonus(card, opponent_weights)
+        return self._avoid_draw_bonus(card, opponent_weights)
+
+    def _score_state(self, state: GameState, window: WindowState) -> tuple[int, int]:
+        team = str(state.me.team_id or "")
+        if team == "RED":
+            return window.red_point, window.blue_point
+        if team == "BLUE":
+            return window.blue_point, window.red_point
+        red_pid = str(window.raw.get("redPlayerId") or "")
+        blue_pid = str(window.raw.get("bluePlayerId") or "")
+        if red_pid == str(state.player_id):
+            return window.red_point, window.blue_point
+        if blue_pid == str(state.player_id):
+            return window.blue_point, window.red_point
+        return window.red_point, window.blue_point
+
+    def _score_text(self, state: GameState, window: WindowState) -> str:
+        my_score, opp_score = self._score_state(state, window)
+        return f"{my_score}:{opp_score}"
+
+    def _stable_jitter(self, state: GameState, window: WindowState, card: WindowCard) -> int:
+        seed = "|".join([
+            state.player_id,
+            str(state.me.team_id or ""),
+            str(window.id),
+            str(window.target or ""),
+            str(window.task_id or ""),
+            str(window.resource_type or ""),
+            str(window.round_index or 1),
+            card.value,
+        ])
+        return int.from_bytes(hashlib.blake2s(seed.encode("utf-8"), digest_size=2).digest(), "big") % 11
+
+    def _role_card_bias(self, state: GameState, card: WindowCard) -> int:
+        team = str(state.me.team_id or "")
+        if team == "BLUE":
+            if card == WindowCard.XIAN_GONG:
+                return 42
+            if card == WindowCard.BING_ZHENG:
+                return -8
+        if card == WindowCard.BING_ZHENG:
+            return 42
+        if card == WindowCard.XIAN_GONG:
+            return -8
+        return 0
 
     def _weighted_pick(self, state: GameState, window: WindowState, options: list[tuple[WindowCard, int]]) -> tuple[WindowCard, int]:
         total = sum(weight for _, weight in options)

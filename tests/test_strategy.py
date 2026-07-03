@@ -441,6 +441,63 @@ class BaselineStrategyTest(unittest.TestCase):
         )
         self.assertEqual(self.strategy.decide(state).window.card, WindowCard.BING_ZHENG)
 
+    def test_symmetric_bots_pick_different_opening_window_cards(self) -> None:
+        window = WindowState(
+            id="contest-symmetric",
+            window_type="TASK",
+            target="S02",
+            task_id="task-hot",
+            active=True,
+            my_turn=True,
+            round_index=1,
+            raw={"redPlayerId": "1001", "bluePlayerId": "1002", "totalRounds": 3},
+        )
+        red = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S02", guard_points=2, good_fruit=96, freshness=96),
+            opponent=PlayerState(player_id="1002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S02", guard_points=2, good_fruit=96, freshness=96),
+            windows=[window],
+            tasks=[TaskInstance(id="task-hot", template="T08", target="S02", score=45, process_frames=4)],
+        )
+        blue = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1002",
+            me=PlayerState(player_id="1002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S02", guard_points=2, good_fruit=96, freshness=96),
+            opponent=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S02", guard_points=2, good_fruit=96, freshness=96),
+            windows=[window],
+            tasks=[TaskInstance(id="task-hot", template="T08", target="S02", score=45, process_frames=4)],
+        )
+        red_card = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger()).decide(red).window.card
+        blue_card = BaselineStrategy("1002", StrategyConfig.default(), SilentLogger()).decide(blue).window.card
+        self.assertNotEqual(red_card, blue_card)
+        self.assertNotIn(WindowCard.ABSTAIN, {red_card, blue_card})
+
+    def test_window_abstains_only_when_lead_is_mathematically_safe(self) -> None:
+        state = GameState(
+            frame=250,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S02", guard_points=2, good_fruit=95, freshness=95),
+            windows=[
+                WindowState(
+                    id="contest-safe-lead",
+                    window_type="TASK",
+                    target="S02",
+                    task_id="task-safe",
+                    active=True,
+                    my_turn=True,
+                    round_index=3,
+                    red_point=2,
+                    blue_point=0,
+                    raw={"redPlayerId": "1001", "bluePlayerId": "1002", "totalRounds": 3},
+                )
+            ],
+        )
+        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.ABSTAIN)
+
 
 class ProtocolCodecTest(unittest.TestCase):
     def test_length_prefixed_codec_roundtrip(self) -> None:
