@@ -86,6 +86,8 @@ class WindowStrategy:
             return WindowChoice(WindowCard.QIANG_XING, "FIXED_SPEED", "有速度资源/增益")
         if high_value and me.freshness >= 85 and me.good_fruit >= 80:
             return WindowChoice(WindowCard.XIAN_GONG, "FIXED_FRUIT", "高价值窗口且果况健康")
+        if me.guard_points > 0 and me.freshness >= 70 and me.good_fruit >= 70:
+            return WindowChoice(WindowCard.BING_ZHENG, "ACTIVE_GUARD", "contest_has_guard_point")
         return WindowChoice(WindowCard.ABSTAIN, "SAVE_FRUIT", "价值不够或资源不足")
 
     def choose_card(self, state: GameState, window: WindowState) -> WindowCard:
@@ -198,6 +200,8 @@ class BaselineStrategy:
         self._rejected_task_ids: set[str] = set()
         self._rejected_resource_keys: set[tuple[str, str]] = set()
         self._task_approach_nodes: dict[str, str] = {}
+        self._last_attempted_task: tuple[int, str] | None = None
+        self._last_attempted_resource: tuple[int, str, str] | None = None
 
     def on_start(self, start_data: dict) -> None:
         self._start_seen = True
@@ -213,7 +217,7 @@ class BaselineStrategy:
         self._last_station = state.me.station
         self._log_state_snapshot(state)
         decision = self._decide(state)
-        self._remember_outbound_process(state, decision.bundle)
+        self._remember_outbound_actions(state, decision.bundle)
         if decision.bundle.squad is not None:
             self._scout_dispatched.add(decision.bundle.squad.target)
         self.logger.info(
@@ -292,6 +296,9 @@ class BaselineStrategy:
             return done(self._move_to(state, state.gate_node), "leave_terminal_not_ready")
         if me.station == state.gate_node:
             if not me.verified:
+                gate_intel = self._gate_intel_action(state)
+                if gate_intel is not None:
+                    return done(gate_intel, "use_intel_before_verify")
                 if self._can_verify_gate(state):
                     return done(self._verify_action(state), "verify_gate")
                 return done(wait("at_gate_before_rush", active=False), "at_gate_before_rush")
@@ -384,6 +391,12 @@ class BaselineStrategy:
             node_id = result.get("targetNodeId") or result.get("nodeId") or state.me.station
             task_id = result.get("taskId")
             resource_type = result.get("resourceType")
+            if action == "CLAIM_TASK" and not task_id:
+                task_id = self._recent_attempted_task(state)
+            if action == "CLAIM_RESOURCE" and (not node_id or not resource_type):
+                recent_resource = self._recent_attempted_resource(state)
+                if recent_resource is not None:
+                    node_id, resource_type = recent_resource
             self.logger.info("action_result", action=action, accepted=accepted, success=success, code=code, nodeId=node_id, taskId=task_id, resourceType=resource_type, raw=result)
             failed = accepted is False or success is False or effective is False or bool(code)
             if action == "WINDOW_CARD" and (failed or code in WINDOW_REJECT_CODES):
@@ -459,12 +472,35 @@ class BaselineStrategy:
         self._pending_process_started_at.pop(node, None)
         self.logger.info("feedback_learn", learned="fixed_process_completed", nodeId=node, raw=raw)
 
-    def _remember_outbound_process(self, state: GameState, bundle: ActionBundle) -> None:
-        if bundle.main is None or bundle.main.action != MainActionType.PROCESS:
+    def _remember_outbound_actions(self, state: GameState, bundle: ActionBundle) -> None:
+        if bundle.main is None:
             return
-        target = bundle.main.target or state.me.station
-        if target:
-            self._mark_process_pending(str(target), state, "outbound")
+        if bundle.main.action == MainActionType.PROCESS:
+            target = bundle.main.target or state.me.station
+            if target:
+                self._mark_process_pending(str(target), state, "outbound")
+        elif bundle.main.action == MainActionType.CLAIM_TASK and bundle.main.task_id:
+            self._last_attempted_task = (state.frame, bundle.main.task_id)
+        elif bundle.main.action == MainActionType.CLAIM_RESOURCE and bundle.main.target and bundle.main.resource_type:
+            self._last_attempted_resource = (state.frame, bundle.main.target, bundle.main.resource_type)
+        elif bundle.main.action == MainActionType.USE_RESOURCE and bundle.main.resource_type == "INTEL" and bundle.main.target:
+            self._scout_dispatched.add(bundle.main.target)
+
+    def _recent_attempted_task(self, state: GameState) -> str | None:
+        if self._last_attempted_task is None:
+            return None
+        frame, task_id = self._last_attempted_task
+        if state.frame - frame <= 3:
+            return task_id
+        return None
+
+    def _recent_attempted_resource(self, state: GameState) -> tuple[str, str] | None:
+        if self._last_attempted_resource is None:
+            return None
+        frame, node_id, resource_type = self._last_attempted_resource
+        if state.frame - frame <= 3:
+            return node_id, resource_type
+        return None
 
     def _pending_process_wait_action(self, state: GameState) -> ActionBundle | None:
         station = state.me.station
@@ -632,10 +668,19 @@ class BaselineStrategy:
         if me.freshness <= 82 and (me.task_score_base >= self.config.target_task_score or state.turns_left < 320):
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_quality_before_delivery", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        if me.freshness <= 88 and me.task_score_base >= self.config.target_task_score:
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_target_score_quality", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        if me.freshness <= 90 and (state.phase in RUSH_PHASES or self._should_lock_delivery(state) or self._hot_weather_active(state)):
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_quality_in_pressure_or_hot", freshness=me.freshness, taskScore=me.task_score_base, phase=state.phase, weather=state.weather.active_types if state.weather else ())
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         if me.freshness <= 90 and me.task_score_base >= self.config.competitive_task_score:
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_high_score_quality", freshness=me.freshness, taskScore=me.task_score_base)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         return None
+
+    def _hot_weather_active(self, state: GameState) -> bool:
+        return bool(state.weather and "HOT" in state.weather.active_types)
 
     def _pre_move_resource_action(self, state: GameState) -> ActionBundle | None:
         me = state.me
@@ -657,9 +702,9 @@ class BaselineStrategy:
         me = state.me
         if not me.has_resource("INTEL") or me.status not in PLANNING_STATES or me.station is None:
             return None
-        if me.squad_available > 0 and state.phase not in RUSH_PHASES:
-            return None
         target = self._intel_target(state)
+        if me.squad_available > 0 and state.phase not in RUSH_PHASES and target != state.gate_node:
+            return None
         if target is None:
             self.logger.info("resource_use_skip", resourceType="INTEL", reason="no_route_scout_target")
             return None
@@ -671,6 +716,19 @@ class BaselineStrategy:
         objective = self._current_route_objective(state)
         target, _ = self._priority_scout_target(state, objective, forbidden)
         return target
+
+    def _gate_intel_action(self, state: GameState) -> ActionBundle | None:
+        me = state.me
+        if not me.has_resource("INTEL") or me.station != state.gate_node or me.verified:
+            return None
+        if state.phase not in RUSH_PHASES:
+            return None
+        if state.gate_node in self._scout_dispatched:
+            return None
+        if self._has_own_scout_marker(state, state.gate_node):
+            return None
+        self.logger.info("resource_use", resourceType="INTEL", reason="gate_verify_scout_marker", target=state.gate_node)
+        return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, target=state.gate_node, resource_type="INTEL"))
 
     def _moving_horse_action(self, state: GameState) -> ActionBundle | None:
         me = state.me
@@ -874,7 +932,7 @@ class BaselineStrategy:
         return None
 
     def _scout_forbidden(self, state: GameState) -> set[str]:
-        return {state.me.station or "", state.start_node, state.gate_node, state.terminal_node, *map(str, state.roles.get("safeZoneNodeIds", []) or [])}
+        return {state.me.station or "", state.start_node, state.terminal_node, *map(str, state.roles.get("safeZoneNodeIds", []) or [])}
 
     def _scout_objective(self, state: GameState, *, exclude_current_station: bool = False) -> str:
         me = state.me
@@ -905,6 +963,21 @@ class BaselineStrategy:
             return True
         if me.good_fruit < 78 or me.freshness < 68:
             return me.task_score_base >= self.config.target_task_score
+        return False
+
+    def _should_prepare_gate_scout(self, state: GameState) -> bool:
+        me = state.me
+        if me.verified or me.station in {None, state.gate_node}:
+            return False
+        gate_cost = self.route_planner.estimate_frames(state, me.station, state.gate_node)
+        if gate_cost >= 10**8:
+            return False
+        if state.phase in RUSH_PHASES or self._need_endgame(state) or self._opponent_pressure(state) or self._should_lock_delivery(state):
+            return True
+        if state.frame >= 240 and me.task_score_base >= self.config.target_task_score and (gate_cost <= 16 or state.turns_left < 360):
+            return True
+        if state.frame >= 240 and me.task_score_base >= self.config.target_task_score // 2 and me.freshness <= 86 and gate_cost <= 12:
+            return True
         return False
 
     def _opportunistic_guard_action(self, state: GameState) -> ActionBundle | None:
@@ -979,6 +1052,9 @@ class BaselineStrategy:
         if station is not None and station.process_type and station.process_round > 0 and station.process_type != "VERIFY":
             value += 35 + min(20, station.process_round)
             reasons.append("process")
+        if node == state.gate_node and self._should_prepare_gate_scout(state):
+            value += 95
+            reasons.append("gate_verify")
         if station is not None and station.has_obstacle:
             value += 28
             reasons.append("obstacle")

@@ -55,6 +55,7 @@ def convert_inquire_for_strategy(start_data: dict, player_id: str,
     def player_dict(pid: str, player) -> dict:
         data = {
             "playerId": pid,
+            "teamId": player.team_id,
             "state": player.status,
             "currentNodeId": player.station,
             "nextNodeId": player.target_station,
@@ -446,7 +447,7 @@ def main() -> int:
         return 1
 
     all_rows: list[dict] = []
-    base_fieldnames = None
+    fieldnames_seen: set[str] = set()
 
     for i, seed in enumerate(seeds):
         print(f"\n{'='*60}")
@@ -463,8 +464,7 @@ def main() -> int:
             row = format_player_row(pl, counts)
             row["seed"] = seed
             all_rows.append(row)
-            if base_fieldnames is None:
-                base_fieldnames = list(format_player_row(pl).keys())
+            fieldnames_seen.update(row.keys())
 
         # Print per-battle summary with action counts
         p1, p2 = od["players"][0], od["players"][1]
@@ -497,8 +497,11 @@ def main() -> int:
     print_summary(all_rows)
 
     # CSV output
-    if args.summary_csv and base_fieldnames:
-        fieldnames = ["seed"] + base_fieldnames
+    if args.summary_csv and all_rows:
+        base_fieldnames = list(format_player_row(od["players"][0]).keys())
+        action_fieldnames = sorted(name for name in fieldnames_seen if name.startswith("act_"))
+        extra_fieldnames = sorted(name for name in fieldnames_seen if name not in set(base_fieldnames) | {"seed"} and not name.startswith("act_"))
+        fieldnames = ["seed"] + base_fieldnames + extra_fieldnames + action_fieldnames
         write_summary_csv(args.summary_csv, all_rows, fieldnames)
 
     return 0

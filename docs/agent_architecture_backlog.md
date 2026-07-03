@@ -7,6 +7,18 @@ This project is moving from a rule bot to an auditable game-agent system.
 Do not blindly add more `if` branches. Every strategy change must improve at
 least one measured behavior metric without creating hidden regressions.
 
+Current review priority after the 2026-07-03 strategy audit:
+
+- P0: preserve freshness, avoid invalid/repeated actions, stop free ABSTAIN losses, and use S14 scout/INTEL when it saves gate verification frames.
+- P1: recover task score while keeping freshness gains, build weather-aware routing, and turn squad actions into a clear scout/clear/weaken/reinforce system.
+- P2: improve audit tooling, CSV/report readability, and per-seed diagnosis so each future change has evidence.
+
+Latest local screen (`run_local_battle.py --seeds 1-30`, P1 only):
+
+- Average score: 624.4; max: 778; 700+: 9/30; 750+: 4/30.
+- Average freshness: 78.7; average task score: 92.8; average delivery round: 478.4.
+- Tradeoff observed: freshness and top-end runs improved, but average task score still needs P1 recovery.
+
 Recommended loop:
 
 ```bash
@@ -71,7 +83,7 @@ Expected metric impact:
 - Lower `rejectedActionCount`.
 - Lower `idleEmptyCount` caused by invalid target/action fallback.
 
-## P2: Resource Manager
+## P1: Resource Manager
 
 Goal: resources become an economy, not scattered triggers.
 
@@ -95,7 +107,7 @@ Expected metric impact:
 - Lower `intelUnusedBeforeGateFrames`.
 - Higher freshness without killing task score.
 
-## P3: Window EV Policy
+## P1: Window EV Policy
 
 Goal: window cards are selected by expected value.
 
