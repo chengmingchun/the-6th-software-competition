@@ -31,9 +31,13 @@ class RoutePlanner:
     shortcuts can arrive earlier but may burn enough freshness to lose score;
     once a convoy has a real task score to protect, ROAD is allowed to beat a
     faster risky route.
+
+    Supports forbidden_nodes: nodes that the convoy should not enter via plain
+    MOVE (e.g. guarded chokepoints).  The planner treats them as impassable.
     """
 
-    def plan(self, state: GameState, start: str | None, target: str) -> RoutePlan | None:
+    def plan(self, state: GameState, start: str | None, target: str,
+             forbidden_nodes: frozenset[str] | None = None) -> RoutePlan | None:
         if start is None:
             return None
         if start == target:
@@ -50,6 +54,11 @@ class RoutePlanner:
             if node == target:
                 return RoutePlan(path=self._rebuild_path(prev, target), estimated_frames=cost)
             for edge, nxt in self._out_edges(state, node):
+                # Do not step into forbidden nodes via plain MOVE
+                if forbidden_nodes and nxt in forbidden_nodes:
+                    # Allowed only if it's the final target (we have to go there)
+                    if nxt != target:
+                        continue
                 next_cost = cost + self._edge_frames(state, edge) + self._node_penalty(state, nxt)
                 if next_cost < dist.get(nxt, 10**12):
                     dist[nxt] = next_cost

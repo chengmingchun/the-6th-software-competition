@@ -34,7 +34,6 @@ PROCESS_RETRY_CODES = {"PROCESS_REQUIRED", "PROCESS_INTERRUPTED", "INTERRUPTED"}
 PROCESS_HARD_REJECT_CODES = {"PROCESS_NOT_AVAILABLE", "NOT_AT_TARGET_NODE", "INVALID_TARGET"}
 TASK_TEMPLATE_REJECT_CODES = {"TASK_CONDITION_NOT_MET", "TASK_REQUIREMENT_NOT_MET", "RESOURCE_REQUIRED", "NO_HORSE"}
 SHORT_BUSY_COOLDOWN_FRAMES = 5
-LEARNED_GUARD_BLOCK_FRAMES = 999999  # permanent once learned
 WINDOW_REJECT_CODES = {
     "WINDOW_NOT_ACTIVE",
     "WINDOW_NOT_AVAILABLE",
@@ -782,9 +781,9 @@ class BaselineStrategy:
             self._cooldown_object(state, self._resource_object_key(str(node_id), str(resource_type)), f"reject:{code}")
             self.logger.info("feedback_learn", learned="resource_rejected", nodeId=node_id, resourceType=resource_type, code=code, result=raw)
         if action == "MOVE" and code == "MOVE_BLOCKED_BY_GUARD" and node:
-            until = state.frame + LEARNED_GUARD_BLOCK_FRAMES
-            self._blocked_guard_nodes[node] = until
-            self.logger.info("feedback_learn", learned="move_blocked_by_guard", nodeId=node, code=code, cooldownUntil=until, result=raw)
+            current = self._blocked_guard_nodes.get(node, 0)
+            self._blocked_guard_nodes[node] = current + 1
+            self.logger.info("feedback_learn", learned="move_blocked_by_guard", nodeId=node, count=current + 1, code=code, result=raw)
 
     def _mark_process_pending(self, node: str, state: GameState, reason: str) -> None:
         station = state.station(node)
@@ -1586,6 +1585,40 @@ class BaselineStrategy:
         self.logger.info("blocker_decision", target=me.station, blocker="opponent_route", action="SET_GUARD", reason="zero_good_fruit_chokepoint")
         return ActionBundle(main=MainAction(MainActionType.SET_GUARD, target=me.station, extra_good_fruit=0))
 
+    def _opportunistic_guard_trap(self, state: GameState) -> ActionBundle | None:
+        me = state.me
+        if me.task_score_base < self.config.target_task_score or me.freshness < 88:
+            return None
+        if me.station is None or me.status not in PLANNING_STATES:
+            return None
+        remaining = self._remaining_delivery_cost(state)
+        if remaining + 90 >= state.turns_left:
+            return None
+        if me.station not in self._key_chokepoints():
+            return None
+        target = state.terminal_node if me.verified else state.gate_node
+        plan = self.route_planner.plan(state, me.station, target)
+        if plan is not None and len(plan.path) > 2 and me.station in plan.path[2:]:
+            return None
+        if state.opponent is not None and state.opponent.station is not None:
+            opp_target = state.terminal_node if state.opponent.verified else state.gate_node
+            opp_plan = self.route_planner.plan(state, state.opponent.station, opp_target)
+            if opp_plan is not None and me.station in opp_plan.path:
+                idx = opp_plan.path.index(me.station)
+                if 1 <= idx <= 3:
+                    station = state.station(me.station)
+                    if station is not None and station.guard_owner == me.team_id and station.guard_defense > 0:
+                        if me.squad_available > 0:
+                            self.logger.info("squad_eval", action="SQUAD_REINFORCE", target=me.station, reason="trap_reinforce")
+                            return ActionBundle(squad=SquadAction(SquadActionType.SQUAD_REINFORCE, me.station))
+                        return None
+                    self.logger.info("blocker_decision", target=me.station, blocker="opponent_route", action="SET_GUARD", reason="trap")
+                    return ActionBundle(main=MainAction(MainActionType.SET_GUARD, target=me.station, extra_good_fruit=0))
+        return None
+
+    def _key_chokepoints(self) -> frozenset[str]:
+        return frozenset({"S09", "S10", "S11", "S13", "S14"})
+
     def _is_key_chokepoint(self, station: str) -> bool:
         return station in {"S09", "S10", "S11", "S13", "S14"}
 
@@ -1798,65 +1831,115 @@ class BaselineStrategy:
         return self._move_towards_node(state, target, squad=squad)
 
     def _move_towards_node(self, state: GameState, target: str, squad: SquadAction | None = None) -> ActionBundle:
+        """Plan route with forbidden_nodes, then run pre-move safety gate.
+
+        MOVING state cannot send BREAK_GUARD/FORCED_PASS/SQUAD, so all
+        interception must happen here before the MOVE command.
+        """
         if state.me.station is None:
             return wait("unknown_station", active=False)
-        next_hop = self.route_planner.next_hop_to_any(state, state.me.station, (target,))
+        forbidden = frozenset(n for n, c in self._blocked_guard_nodes.items() if c >= 2)
+        plan = self.route_planner.plan(state, state.me.station, target, forbidden_nodes=forbidden)
+        next_hop = plan.next_station if plan is not None else None
+        if next_hop is None:
+            plan = self.route_planner.plan(state, state.me.station, target)
+            next_hop = plan.next_station if plan is not None else None
         if next_hop is None:
             self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=None, reason="no_route")
             return wait("no_route", active=False)
-        alternate = self._alternate_next_hop_avoiding_blocked(state, target, next_hop)
-        if alternate is not None:
-            self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=alternate, avoided=next_hop, reason="avoid_learned_guard_block")
-            return self._move_to(state, alternate, squad=squad)
-        self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=next_hop)
-        return self._move_to(state, next_hop, squad=squad)
+        # Learned guard: try alternate before safety gate
+        if self._has_learned_guard(state, next_hop):
+            for neighbor in state.neighbors(state.me.station):
+                if neighbor == next_hop or self._has_learned_guard(state, neighbor):
+                    continue
+                s = state.station(neighbor)
+                if s is not None and s.has_obstacle:
+                    continue
+                p2 = self.route_planner.plan(state, neighbor, target)
+                if p2 is not None and next_hop not in p2.path:
+                    self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=neighbor, avoided=next_hop, reason="avoid_learned_guard")
+                    next_hop = neighbor
+                    break
+        # Safety gate: handle any blocker before MOVE
+        station = state.station(next_hop)
+        if self._has_learned_guard(state, next_hop) or (station is not None and (station.has_obstacle or station.has_enemy_guard(state.me.team_id))):
+            gate = self._pre_move_safety_gate(state, next_hop, target, squad)
+            if gate is not None:
+                return gate
+        self.logger.info("move_decision", fromNode=state.me.station, target=next_hop, action="MOVE")
+        return ActionBundle(main=MainAction(MainActionType.MOVE, target=next_hop), squad=squad)
 
-    def _move_to(self, state: GameState, target: str, squad: SquadAction | None = None) -> ActionBundle:
-        station = state.station(target)
+    def _pre_move_safety_gate(self, state: GameState, next_hop: str, objective: str,
+                               squad: SquadAction | None = None) -> ActionBundle | None:
+        """Inspect next_hop before issuing MOVE. Return intercept or None (safe MOVE).
+
+        Once in MOVING state, BREAK_GUARD/FORCED_PASS/SQUAD are forbidden,
+        so all blocker resolution must happen here.
+        """
+        station = state.station(next_hop)
+        me = state.me
+        # ── Obstacle ──
         if station is not None and station.has_obstacle:
-            t04 = self._t04_for_target(state, target)
+            t04 = self._t04_for_target(state, next_hop)
             if t04 is not None:
-                self.logger.info("blocker_decision", target=target, blocker="obstacle", action="CLAIM_TASK", taskId=t04.id)
+                self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="CLAIM_TASK", taskId=t04.id)
                 return self._claim_task(t04)
-            support = self._squad_blocker_action(state, target, "obstacle") or squad
+            support = self._squad_blocker_action(state, next_hop, "obstacle") or squad
             if support is not None and support is not squad:
-                self.logger.info("blocker_decision", target=target, blocker="obstacle", action="SQUAD_CLEAR", reason="save_good_fruit")
+                self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="SQUAD_CLEAR")
                 return ActionBundle(squad=support)
             if self._should_spend_good_fruit_to_clear(state):
-                self.logger.info("blocker_decision", target=target, blocker="obstacle", action="CLEAR", reason="deadline_over_good_fruit")
-                return ActionBundle(main=MainAction(MainActionType.CLEAR, target=target), squad=support)
-            self.logger.info("blocker_decision", target=target, blocker="obstacle", action="FORCED_PASS", reason="save_good_fruit")
-            return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=target), squad=support)
-        if self._has_enemy_guard_or_learned_block(state, target, station):
-            bad_to_spend = self._bad_fruit_to_break_guard(state, station)
-            if bad_to_spend > 0:
-                self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="BREAK_GUARD", reason="spend_bad_fruit_first", badFruit=bad_to_spend)
-                return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=target, good_fruit=0, bad_fruit=bad_to_spend), squad=squad)
-            support = self._squad_blocker_action(state, target, "enemy_guard") or squad
+                self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="CLEAR")
+                return ActionBundle(main=MainAction(MainActionType.CLEAR, target=next_hop), squad=support)
+            self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="FORCED_PASS")
+            return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=next_hop), squad=support)
+        # ── Enemy guard / learned block ──
+        enemy_guard = station is not None and station.has_enemy_guard(me.team_id)
+        learned = self._has_learned_guard(state, next_hop)
+        if enemy_guard or learned:
+            # 1. Squad weaken at key chokepoint
+            if enemy_guard and me.squad_available > 0 and next_hop in {"S10", "S11", "S13", "S14"}:
+                self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="SQUAD_WEAKEN", reason="key_chokepoint")
+                return ActionBundle(squad=SquadAction(SquadActionType.SQUAD_WEAKEN, next_hop))
+            # 2. bad fruit → BREAK_GUARD
+            bad = self._bad_fruit_to_break_guard(state, station)
+            if bad > 0:
+                self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="BREAK_GUARD", reason="bad_fruit")
+                return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=next_hop, good_fruit=0, bad_fruit=bad), squad=squad)
+            # 3. Squad weaken (general)
+            support = self._squad_blocker_action(state, next_hop, "enemy_guard") or squad
             if support is not None and support is not squad:
-                self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="SQUAD_WEAKEN", reason="save_good_fruit")
+                self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="SQUAD_WEAKEN")
                 return ActionBundle(squad=support)
+            # 4. good fruit → BREAK_GUARD
             if self._should_spend_good_fruit_to_break_guard(state, station):
-                self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="BREAK_GUARD", reason="deadline_over_good_fruit")
-                return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=target, good_fruit=1, bad_fruit=0), squad=squad)
-            self.logger.info("blocker_decision", target=target, blocker="enemy_guard", action="FORCED_PASS", reason="save_good_fruit")
-            return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=target), squad=support)
+                self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="BREAK_GUARD", reason="good_fruit")
+                return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=next_hop, good_fruit=1, bad_fruit=0), squad=squad)
+            # 5. INTEL scout
+            if me.has_resource("INTEL") and not self._has_own_scout_marker(state, next_hop):
+                self.logger.info("resource_use", resourceType="INTEL", reason="scout_blocked", target=next_hop)
+                return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, target=next_hop, resource_type="INTEL"))
+            # 6. Squad scout (first-time, not learned yet)
+            if me.squad_available > 0 and next_hop not in self._scout_dispatched and not learned:
+                self.logger.info("squad_eval", action="SQUAD_SCOUT", target=next_hop, reason="scout_blocked")
+                return ActionBundle(squad=SquadAction(SquadActionType.SQUAD_SCOUT, next_hop))
+            # 7. Default: FORCED_PASS
+            self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="FORCED_PASS", reason="default")
+            return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=next_hop), squad=squad)
+        return None  # safe to MOVE
+
+    def _move_to(self, state: GameState, target: str, squad: SquadAction | None = None) -> ActionBundle:
+        """Plain MOVE. All blocker interception is in _pre_move_safety_gate."""
         self.logger.info("move_decision", target=target, action="MOVE")
         return ActionBundle(main=MainAction(MainActionType.MOVE, target=target), squad=squad)
 
-    def _has_enemy_guard_or_learned_block(self, state: GameState, target: str, station: Station | None) -> bool:
-        if station is not None and station.has_enemy_guard(state.me.team_id):
-            return True
-        return self._is_learned_guard_blocked(state, target)
-
     def _is_learned_guard_blocked(self, state: GameState, target: str) -> bool:
-        until = self._blocked_guard_nodes.get(target)
-        if until is None:
-            return False
-        if state.frame <= until:
-            return True
-        self._blocked_guard_nodes.pop(target, None)
-        return False
+        """Whether MOVE should be banned for this node (2+ failures)."""
+        return self._blocked_guard_nodes.get(target, 0) >= 2
+
+    def _has_learned_guard(self, state: GameState, target: str) -> bool:
+        """Whether a guard was ever detected at this node (1+ failure)."""
+        return self._blocked_guard_nodes.get(target, 0) >= 1
 
     def _alternate_next_hop_avoiding_blocked(self, state: GameState, target: str, blocked_next_hop: str) -> str | None:
         if state.me.station is None or not self._is_learned_guard_blocked(state, blocked_next_hop):
