@@ -157,7 +157,10 @@ def audit_frame(audit: dict[str, int], inquire: dict[str, Any], player_id: str, 
         elif name == "DELIVER": audit["deliverCount"] += 1
     if resource_count(player, "ICE_BOX") > 0 and freshness_of(player) <= 88 and not has_action(actions, "USE_RESOURCE", "ICE_BOX"):
         audit["iceBoxUnusedLowFreshnessFrames"] += 1
-    if status in {"MOVING", "WAITING"} and (resource_count(player, "FAST_HORSE") > 0 or resource_count(player, "SHORT_HORSE") > 0) and not (has_action(actions, "USE_RESOURCE", "FAST_HORSE") or has_action(actions, "USE_RESOURCE", "SHORT_HORSE")):
+    # Latest online behavior treats MOVING as a hard no-command state. Do not
+    # pressure strategy into using horse buffs mid-edge; only flag missed horse
+    # timing while stopped/paused and still able to choose a safe action.
+    if status == "WAITING" and (resource_count(player, "FAST_HORSE") > 0 or resource_count(player, "SHORT_HORSE") > 0) and not (has_action(actions, "USE_RESOURCE", "FAST_HORSE") or has_action(actions, "USE_RESOURCE", "SHORT_HORSE")):
         audit["horseUnusedWhileMovingFrames"] += 1
     if resource_count(player, "INTEL") > 0 and task_score_of(player) >= 90 and not player.get("verified") and not has_action(actions, "USE_RESOURCE", "INTEL"):
         audit["intelUnusedBeforeGateFrames"] += 1

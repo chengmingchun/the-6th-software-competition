@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import unittest
 
-from lizhi_server.engine import GameEngine, ScoutMarker, Player, ContestWindow
+from lizhi_server.engine import GameEngine, GuardState, ScoutMarker, Player, ContestWindow
 from lizhi_server.config import FIXED_PROCESS_NODES
 
 
@@ -223,6 +223,109 @@ class TestRecvActionsUtility(unittest.TestCase):
         import socket
         self.assertTrue(hasattr(MatchRunner, "_recv_actions_pair"))
         self.assertTrue(callable(MatchRunner._recv_actions_pair))
+
+
+class TestOnlineRealismHardening(unittest.TestCase):
+    """Server rules learned from online logs should catch unsafe strategies."""
+
+    def setUp(self):
+        self.engine = GameEngine(seed=42, player1_id="1001", player2_id="1002")
+        for obs in self.engine.obstacles.values():
+            obs.cleared = True
+        for nid in self.engine.obstacles:
+            self.engine.stations[nid]["hasObstacle"] = False
+
+    def _put_player_moving(self):
+        p = self.engine.players["1001"]
+        p.station = "S01"
+        p.status = "MOVING"
+        p.target_station = "S02"
+        p.route_edge = "E01"
+        p.route_type = "ROAD"
+        p.move_accumulated = 0
+        p.move_edge_distance = 30
+        p.move_edge_coefficient = 1380
+        p.resources["FAST_HORSE"] = 1
+        return p
+
+    def test_empty_action_while_moving_keeps_progress_and_no_illegal(self):
+        """Empty heartbeat while MOVING should continue movement without penalty."""
+        p = self._put_player_moving()
+        self.engine.process_actions(10, [], [])
+        self.assertEqual(p.status, "MOVING")
+        self.assertGreater(p.move_accumulated, 0)
+        self.assertEqual(p.illegal_action_count, 0)
+        p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
+        self.assertEqual(p1_results, [], f"System wait should not emit rejection: {p1_results}")
+
+    def test_active_action_while_moving_is_illegal(self):
+        """Using resources while MOVING mirrors online illegal-action behavior."""
+        p = self._put_player_moving()
+        self.engine.process_actions(10, [{"action": "USE_RESOURCE", "resourceType": "FAST_HORSE"}], [])
+        p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
+        self.assertTrue(p1_results, "Expected a rejection result")
+        self.assertFalse(p1_results[0].get("accepted", True))
+        self.assertEqual(p1_results[0].get("code"), "STATE_MOVING_FORBIDDEN")
+        self.assertEqual(p.illegal_action_count, 1)
+        self.assertEqual(p.resources["FAST_HORSE"], 1)
+
+    def test_squad_action_while_moving_is_illegal(self):
+        """Squad commands are also unsafe while the convoy is on an edge."""
+        p = self._put_player_moving()
+        self.engine.process_actions(10, [{"action": "SQUAD_SCOUT", "targetNodeId": "S02"}], [])
+        p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
+        self.assertTrue(p1_results, "Expected a squad rejection result")
+        self.assertFalse(p1_results[0].get("accepted", True))
+        self.assertEqual(p1_results[0].get("code"), "STATE_MOVING_FORBIDDEN")
+        self.assertEqual(p.illegal_action_count, 1)
+        self.assertEqual(p.squad_available, 8)
+
+    def test_same_frame_move_and_squad_from_idle_is_legal(self):
+        """A legal frame-start IDLE packet may contain both MOVE and SQUAD."""
+        p = self.engine.players["1001"]
+        p.station = "S01"
+        p.status = "IDLE"
+        self.engine.process_actions(
+            10,
+            [
+                {"action": "MOVE", "targetNodeId": "S02"},
+                {"action": "SQUAD_SCOUT", "targetNodeId": "S02"},
+            ],
+            [],
+        )
+        p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
+        by_action = {r.get("action"): r for r in p1_results}
+        self.assertTrue(by_action["SQUAD_SCOUT"].get("accepted", False), p1_results)
+        self.assertTrue(by_action["MOVE"].get("accepted", False), p1_results)
+        self.assertEqual(p.status, "MOVING")
+        self.assertEqual(p.illegal_action_count, 0)
+
+    def test_squad_weaken_is_invalid_by_default(self):
+        """Recent online logs reject SQUAD_WEAKEN, so the simulator does too."""
+        p1 = self.engine.players["1001"]
+        p2 = self.engine.players["1002"]
+        p1.station = "S09"
+        p1.status = "IDLE"
+        p2.station = "S10"
+        p2.status = "IDLE"
+        p2.guards["S10"] = GuardState(
+            owner_team=p2.team_id,
+            defense=2,
+            cap=7,
+            completed_frame=19,
+            last_wind_frame=19,
+            wind_interval=30,
+            is_key_pass=True,
+        )
+
+        self.engine.process_actions(20, [{"action": "SQUAD_WEAKEN", "targetNodeId": "S10"}], [])
+        p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
+        self.assertTrue(p1_results, "Expected SQUAD_WEAKEN rejection")
+        self.assertFalse(p1_results[0].get("accepted", True))
+        self.assertEqual(p1_results[0].get("code"), "INVALID_ACTION_TYPE")
+        self.assertEqual(p1.illegal_action_count, 1)
+        self.assertEqual(p1.squad_available, 8)
+        self.assertEqual(p2.guards["S10"].defense, 2)
 
 
 class TestScoutConsumptionBeforeValidation(unittest.TestCase):

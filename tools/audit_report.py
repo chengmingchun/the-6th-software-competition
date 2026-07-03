@@ -31,7 +31,7 @@ WARNING_RULES = [
     ("highValueAbstainCount", 1.0, "高价值窗口弃权偏多：优先检查 WindowPolicy 价值判断和卡牌资源使用。"),
     ("rejectedActionCount", 1.0, "无效动作偏多：优先检查 LegalAction / 反馈学习 / 冷却抑制。"),
     ("iceBoxUnusedLowFreshnessFrames", 3.0, "低鲜度持有 ICE_BOX 未用：优先检查 ResourceManager 的保鲜触发。"),
-    ("horseUnusedWhileMovingFrames", 3.0, "移动中持有马未用：优先检查马 buff 冲突和使用时机。"),
+    ("horseUnusedWhileMovingFrames", 3.0, "停顿可行动时持有马未用：优先检查马 buff 冲突和出发前使用时机。"),
     ("intelUnusedBeforeGateFrames", 3.0, "90 分后持有 INTEL 未用于宫门/关键点：优先检查探路目标选择。"),
 ]
 

@@ -45,6 +45,11 @@ class AuditMetricsTest(unittest.TestCase):
         self.assertEqual(audit["idleEmptyCount"], 0)
         self.assertEqual(audit["legalSystemWaitCount"], 1)
 
+    def test_horse_unused_is_not_flagged_while_moving(self):
+        audit = new_audit()
+        audit_frame(audit, inquire(player_state="MOVING", resources={"FAST_HORSE": 1}), "1001", [])
+        self.assertEqual(audit["horseUnusedWhileMovingFrames"], 0)
+
     def test_high_value_abstain_is_counted(self):
         audit = new_audit()
         audit_frame(audit, inquire(), "1001", [{"action": "WINDOW_CARD", "contestId": "c1", "card": "ABSTAIN"}])

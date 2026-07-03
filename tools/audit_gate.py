@@ -44,7 +44,7 @@ def default_rules(side: str, *, strict: bool = False) -> list[GateRule]:
         GateRule(side, "rejectedActionCount", "<=", rejected_limit, "无效动作过多"),
         GateRule(side, "highValueAbstainCount", "<=", high_value_abstain_limit, "高价值窗口弃权过多"),
         GateRule(side, "iceBoxUnusedLowFreshnessFrames", "<=", ice_unused_limit, "低鲜度持有 ICE_BOX 未用过多"),
-        GateRule(side, "horseUnusedWhileMovingFrames", "<=", horse_unused_limit, "移动中持有马未用过多"),
+        GateRule(side, "horseUnusedWhileMovingFrames", "<=", horse_unused_limit, "停顿可行动时持有马未用过多"),
         GateRule(side, "intelUnusedBeforeGateFrames", "<=", intel_unused_limit, "90 分后 INTEL 未用于关键点过多"),
     ]
 

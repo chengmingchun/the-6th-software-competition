@@ -859,7 +859,19 @@ class GameEngine:
         # 1. Process window cards first (they happen alongside main actions)
         self._process_windows(frame, window_actions)
 
-        # 2. Process main actions
+        # 2. Process squad actions before main actions. The online protocol
+        # evaluates same-frame action slots from the frame-start state, so a
+        # legal IDLE packet containing MOVE + SQUAD_SCOUT must not become
+        # illegal merely because MOVE mutates the local state to MOVING first.
+        for pid in [self.player1_id, self.player2_id]:
+            p = self.players[pid]
+            if p.retired:
+                continue
+            act = squad_actions[pid]
+            if act is not None and not p.delivered:
+                self._process_squad_action(pid, act)
+
+        # 3. Process main actions
         for pid in [self.player1_id, self.player2_id]:
             p = self.players[pid]
             if p.delivered:
@@ -888,15 +900,6 @@ class GameEngine:
 
             atype = act.get("action", "")
             self._process_main_action(pid, atype, act)
-
-        # 3. Process squad actions
-        for pid in [self.player1_id, self.player2_id]:
-            p = self.players[pid]
-            if p.retired:
-                continue
-            act = squad_actions[pid]
-            if act is not None and not p.delivered:
-                self._process_squad_action(pid, act)
 
         # 4. Process in-flight squads arriving this frame
         self._process_arriving_squads(frame)
@@ -940,6 +943,15 @@ class GameEngine:
     def _process_main_action(self, pid: str, atype: str, act: dict[str, Any]) -> None:
         p = self.players[pid]
 
+        # Online behavior observed in July 2026: once a convoy is in MOVING,
+        # active commands cannot break, rescue, accelerate, or redirect it.
+        # Empty action lists are the only safe heartbeat; an explicit WAIT still
+        # means "pause on the edge" and is handled below.
+        if p.status == "MOVING" and atype != "WAIT":
+            self._reject_illegal_action(pid, atype, "STATE_MOVING_FORBIDDEN",
+                                        error="Cannot issue active commands while MOVING")
+            return
+
         # Check if can act (not busy)
         if p.status in ("PROCESSING", "VERIFYING", "RESTING", "FORCED_PASSING", "CONTESTING", "COST_BANKRUPT"):
             self._add_action_result(pid, atype, False, f"STATE_{p.status}_FORBIDDEN",
@@ -955,12 +967,7 @@ class GameEngine:
         if handler:
             handler(pid, act)
         else:
-            self._add_action_result(pid, atype, False, "INVALID_ACTION_TYPE")
-            p.last_action = atype
-            p.last_action_accepted = False
-            p.last_action_result = "INVALID_ACTION_TYPE"
-            p.last_action_error = "INVALID_ACTION_TYPE"
-            self._count_illegal(pid)
+            self._reject_illegal_action(pid, atype, "INVALID_ACTION_TYPE")
 
     def _do_wait(self, pid: str, act: dict[str, Any]) -> None:
         p = self.players[pid]
@@ -2041,6 +2048,18 @@ class GameEngine:
         if not target:
             return
 
+        if p.status == "MOVING":
+            self._reject_illegal_action(pid, atype, "STATE_MOVING_FORBIDDEN",
+                                        error="Cannot issue squad commands while MOVING")
+            return
+
+        if atype == "SQUAD_WEAKEN":
+            # The public protocol mentions this action, but recent online logs
+            # reject it as INVALID_ACTION_TYPE. Keep the local server strict so
+            # strategy tests do not learn a tactic that burns penalty points.
+            self._reject_illegal_action(pid, atype, "INVALID_ACTION_TYPE")
+            return
+
         if p.squad_available <= 0:
             self._add_action_result(pid, atype, False, "SQUAD_NOT_AVAILABLE")
             return
@@ -2916,6 +2935,16 @@ class GameEngine:
     def _count_illegal(self, pid: str) -> None:
         p = self.players[pid]
         p.illegal_action_count += 1
+
+    def _reject_illegal_action(self, pid: str, action: str, result: str,
+                               error: str | None = None) -> None:
+        p = self.players[pid]
+        self._add_action_result(pid, action, False, result, error=error)
+        p.last_action = action
+        p.last_action_accepted = False
+        p.last_action_result = result
+        p.last_action_error = error or result
+        self._count_illegal(pid)
 
     def _advance_buffs(self) -> None:
         for pid in [self.player1_id, self.player2_id]:
