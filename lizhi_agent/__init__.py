@@ -16,6 +16,8 @@ __all__ = [
     "utils",
 ]
 
+_PROCESS_REQUIRED_CODES = {"PROCESS_REQUIRED", "PROCESS_INTERRUPTED", "INTERRUPTED"}
+
 
 def _first_present_from_result(result: dict[str, _Any], payload: dict[str, _Any], state) -> _Any:
     """Find the real target for blocked-move feedback.
@@ -48,10 +50,10 @@ def _patch_models_action_result_normalization() -> None:
     from . import models as _models
 
     original = _models.parse_game_state
-    if getattr(original, "_guard_wait_normalized", False):
+    if getattr(original, "_feedback_normalized", False):
         return
 
-    def parse_game_state_with_guard_wait_normalization(player_id: str, start_data: dict[str, _Any], inquire_data: dict[str, _Any]):
+    def parse_game_state_with_feedback_normalization(player_id: str, start_data: dict[str, _Any], inquire_data: dict[str, _Any]):
         state = original(player_id, start_data, inquire_data)
         normalized: list[dict[str, _Any]] = []
         changed = False
@@ -79,13 +81,26 @@ def _patch_models_action_result_normalization() -> None:
                 result.setdefault("playerId", str(player_id))
                 result.setdefault("normalizedFrom", "WAIT_MOVE_BLOCKED_BY_GUARD")
                 changed = True
+            elif code in _PROCESS_REQUIRED_CODES and action == "MOVE" and state.me.station not in (None, ""):
+                # The server attaches PROCESS_REQUIRED to the attempted MOVE target,
+                # but the mandatory fixed process belongs to the current station.
+                # If we learn the target node here, the strategy repeatedly retries
+                # MOVE instead of submitting PROCESS at the station it is stuck on.
+                raw_target = result.get("targetNodeId") or payload.get("targetNodeId") or result.get("nodeId") or payload.get("nodeId")
+                if raw_target not in (None, ""):
+                    result.setdefault("rawTargetNodeId", str(raw_target))
+                result["targetNodeId"] = str(state.me.station)
+                result["nodeId"] = str(state.me.station)
+                result.setdefault("playerId", str(player_id))
+                result.setdefault("normalizedFrom", "MOVE_PROCESS_REQUIRED_CURRENT_STATION")
+                changed = True
             normalized.append(result)
         if not changed:
             return state
         return _replace(state, action_results=normalized)
 
-    parse_game_state_with_guard_wait_normalization._guard_wait_normalized = True  # type: ignore[attr-defined]
-    _models.parse_game_state = parse_game_state_with_guard_wait_normalization
+    parse_game_state_with_feedback_normalization._feedback_normalized = True  # type: ignore[attr-defined]
+    _models.parse_game_state = parse_game_state_with_feedback_normalization
 
 
 def _patch_strategy_speed_resource_usage() -> None:
@@ -116,5 +131,27 @@ def _patch_strategy_speed_resource_usage() -> None:
     _strategy.BaselineStrategy._pre_move_resource_action = pre_move_resource_action_with_delivery_speed
 
 
+def _patch_strategy_forced_process_priority() -> None:
+    from .actions import ActionBundle, MainAction, MainActionType
+    from . import strategy as _strategy
+
+    original = _strategy.BaselineStrategy._fixed_process_action
+    if getattr(original, "_forced_process_priority_patched", False):
+        return
+
+    def fixed_process_action_with_forced_priority(self, state):
+        station_id = state.me.station
+        if station_id is not None and station_id in self._forced_process_nodes and state.me.current_process is None:
+            station = state.station(station_id)
+            process_type = station.process_type if station is not None and station.process_type else "UNKNOWN"
+            self.logger.info("fixed_process_eval", station=station_id, processType=process_type, action="PROCESS", reason="server_process_required_bypass_busy_cooldown")
+            return ActionBundle(main=MainAction(MainActionType.PROCESS, target=station_id))
+        return original(self, state)
+
+    fixed_process_action_with_forced_priority._forced_process_priority_patched = True  # type: ignore[attr-defined]
+    _strategy.BaselineStrategy._fixed_process_action = fixed_process_action_with_forced_priority
+
+
 _patch_models_action_result_normalization()
 _patch_strategy_speed_resource_usage()
+_patch_strategy_forced_process_priority()
