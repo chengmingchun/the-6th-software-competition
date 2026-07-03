@@ -143,7 +143,7 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
         self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
 
-    def test_short_horse_used_while_moving_after_score_floor(self) -> None:
+    def test_moving_state_sends_empty_even_with_horse_resource(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
             frame=200,
@@ -161,8 +161,8 @@ class StrategyRouteResourceTest(unittest.TestCase):
             edges=[RouteEdge(id="E1", start="S02", end="S03", distance=1), RouteEdge(id="E2", start="S03", end="S14", distance=1)],
         )
         action = strategy.decide(state)
-        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
-        self.assertEqual(action.main.to_action()["resourceType"], "SHORT_HORSE")
+        self.assertIsNone(action.main)
+        self.assertIsNone(action.squad)
 
     def test_rush_protect_used_before_gate_to_preserve_freshness(self) -> None:
         strategy = self.make_strategy()
@@ -953,7 +953,7 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.FORCED_PASS)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
 
-    def test_squad_weaken_handles_enemy_guard_before_forced_pass(self) -> None:
+    def test_enemy_guard_does_not_use_squad_weaken(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
             frame=200,
@@ -965,10 +965,9 @@ class StrategyRouteResourceTest(unittest.TestCase):
             edges=[RouteEdge(id="E1", start="S01", end="S02", distance=1), RouteEdge(id="E2", start="S02", end="S14", distance=1)],
         )
         action = strategy.decide(state)
-        self.assertIsNone(action.main)
-        self.assertIsNotNone(action.squad)
-        self.assertEqual(action.squad.action, SquadActionType.SQUAD_WEAKEN)
-        self.assertEqual(action.squad.to_action()["targetNodeId"], "S02")
+        self.assertIsNotNone(action.main)
+        self.assertEqual(action.main.action, MainActionType.FORCED_PASS)
+        self.assertNotEqual(action.squad.action if action.squad else None, SquadActionType.SQUAD_WEAKEN)
 
     def test_enemy_guard_uses_bad_fruit_before_forced_pass(self) -> None:
         strategy = self.make_strategy()

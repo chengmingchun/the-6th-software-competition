@@ -351,6 +351,8 @@ def parse_game_state(player_id: str, start_data: dict[str, Any], inquire_data: d
     weather = _parse_weather(inquire_data)
 
     me = parse_player_state(player_id, me_raw)
+    raw_action_results = list(inquire_data.get("actionResults", []) if isinstance(inquire_data.get("actionResults"), list) else [])
+    action_results = _normalize_action_results(str(player_id), raw_action_results, me)
     return GameState(
         frame=frame,
         max_frame=max_frame,
@@ -366,9 +368,64 @@ def parse_game_state(player_id: str, start_data: dict[str, Any], inquire_data: d
         windows=windows,
         weather=weather,
         events=list(inquire_data.get("events", []) if isinstance(inquire_data.get("events"), list) else []),
-        action_results=list(inquire_data.get("actionResults", []) if isinstance(inquire_data.get("actionResults"), list) else []),
+        action_results=action_results,
         raw={"start": start_data, "inquire": inquire_data},
     )
+
+
+def _normalize_action_results(player_id: str, action_results: list[dict[str, Any]], me: PlayerState) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for item in action_results:
+        if not isinstance(item, dict):
+            continue
+        result = dict(item)
+        payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+        code = str(
+            result.get("code")
+            or result.get("errorCode")
+            or result.get("reason")
+            or result.get("message")
+            or payload.get("code")
+            or payload.get("errorCode")
+            or ""
+        ).upper()
+        action = str(result.get("action") or result.get("actionType") or result.get("type") or payload.get("action") or payload.get("actionType") or "").upper()
+        if code == "MOVE_BLOCKED_BY_GUARD" and action != "MOVE":
+            target = _blocked_move_target(result, payload, me)
+            result.setdefault("rawAction", action or "UNKNOWN")
+            result["action"] = "MOVE"
+            if target not in (None, ""):
+                result["targetNodeId"] = str(target)
+            result.setdefault("playerId", player_id)
+            result.setdefault("normalizedFrom", "WAIT_MOVE_BLOCKED_BY_GUARD")
+        elif code in {"PROCESS_REQUIRED", "PROCESS_INTERRUPTED", "INTERRUPTED"} and action == "MOVE" and me.station not in (None, ""):
+            raw_target = result.get("targetNodeId") or payload.get("targetNodeId") or result.get("nodeId") or payload.get("nodeId")
+            if raw_target not in (None, ""):
+                result.setdefault("rawTargetNodeId", str(raw_target))
+            result["targetNodeId"] = str(me.station)
+            result["nodeId"] = str(me.station)
+            result.setdefault("playerId", player_id)
+            result.setdefault("normalizedFrom", "MOVE_PROCESS_REQUIRED_CURRENT_STATION")
+        normalized.append(result)
+    return normalized
+
+
+def _blocked_move_target(result: dict[str, Any], payload: dict[str, Any], me: PlayerState) -> Any:
+    for key in ("targetNodeId", "nextNodeId", "target"):
+        value = result.get(key)
+        if value not in (None, ""):
+            return value
+    for key in ("targetNodeId", "nextNodeId", "target"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return value
+    if me.target not in (None, ""):
+        return me.target
+    for key in ("targetNodeId", "nextNodeId", "target"):
+        value = me.raw.get(key) if isinstance(me.raw, dict) else None
+        if value not in (None, ""):
+            return value
+    return result.get("nodeId") or payload.get("nodeId") or me.station
 
 
 def _parse_process_nodes(start_data: dict[str, Any]) -> dict[str, tuple[str | None, int, dict[str, Any]]]:

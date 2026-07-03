@@ -34,6 +34,18 @@ PROCESS_RETRY_CODES = {"PROCESS_REQUIRED", "PROCESS_INTERRUPTED", "INTERRUPTED"}
 PROCESS_HARD_REJECT_CODES = {"PROCESS_NOT_AVAILABLE", "NOT_AT_TARGET_NODE", "INVALID_TARGET"}
 TASK_TEMPLATE_REJECT_CODES = {"TASK_CONDITION_NOT_MET", "TASK_REQUIREMENT_NOT_MET", "RESOURCE_REQUIRED", "NO_HORSE"}
 SHORT_BUSY_COOLDOWN_FRAMES = 5
+ICE_BOX_REJECT_CODES = {
+    "INVALID_ACTION",
+    "RESOURCE_NOT_APPLICABLE",
+    "RESOURCE_TARGET_INVALID",
+    "RESOURCE_NOT_FOUND",
+    "RESOURCE_NOT_OWNED",
+    "INVALID_TARGET",
+    "NOT_AT_TARGET_NODE",
+    "FRESHNESS_FULL",
+    "RESOURCE_CONDITION_NOT_MET",
+    "RESOURCE_USE_NOT_ALLOWED",
+}
 WINDOW_REJECT_CODES = {
     "WINDOW_NOT_ACTIVE",
     "WINDOW_NOT_AVAILABLE",
@@ -491,6 +503,7 @@ class BaselineStrategy:
         self._rejected_resource_keys: set[tuple[str, str]] = set()
         self._rejected_task_templates_until: dict[str, int] = {}
         self._rejected_t04_targets_until: dict[str, int] = {}
+        self._rejected_ice_box_until = -1
         self._task_approach_nodes: dict[str, str] = {}
         self._last_attempted_task: tuple[int, str] | None = None
         self._last_attempted_resource: tuple[int, str, str] | None = None
@@ -573,9 +586,7 @@ class BaselineStrategy:
         if me.retired or me.status == ConvoyStatus.RETIRED:
             return done(wait("retired", active=False), "retired")
         if me.status in MOVING_STATES or self._is_transit_waiting(state):
-            horse = self._moving_horse_action(state)
-            if horse is not None:
-                return done(horse, "use_horse_while_moving")
+            self.logger.info("state_guard", state="MOVING", action="EMPTY", reason="moving_state_only_empty_heartbeat")
             return done(wait(f"moving:{getattr(me.status, 'value', me.status)}", active=False), f"moving:{getattr(me.status, 'value', me.status)}")
         if me.status in BUSY_STATES or me.current_process is not None:
             return done(wait(f"busy:{getattr(me.status, 'value', me.status)}", active=False), f"busy:{getattr(me.status, 'value', me.status)}")
@@ -739,6 +750,11 @@ class BaselineStrategy:
             return
         node = str(node_id or state.me.station or "")
         resource_name = str(resource_type or "")
+        if action == "USE_RESOURCE" and resource_name == "ICE_BOX" and code in ICE_BOX_REJECT_CODES:
+            until = state.frame + 30
+            self._rejected_ice_box_until = max(self._rejected_ice_box_until, until)
+            self.logger.info("feedback_learn", learned="icebox_rejected", resourceType="ICE_BOX", code=code, cooldownUntil=until, result=raw)
+            return
         if action == "USE_RESOURCE" and resource_name == "INTEL" and node:
             key = self._intel_object_key(node)
             self._cooldown_object_for(state, key, SHORT_BUSY_COOLDOWN_FRAMES, f"reject:{code}")
@@ -1028,6 +1044,12 @@ class BaselineStrategy:
         me = state.me
         if not me.has_resource("ICE_BOX"):
             return None
+        if state.frame < self._rejected_ice_box_until:
+            self.logger.info("resource_use_skip", resourceType="ICE_BOX", reason="recent_icebox_reject_cooldown", cooldownUntil=self._rejected_ice_box_until, freshness=me.freshness, taskScore=me.task_score_base)
+            return None
+        if me.task_score_base >= 120 and me.freshness <= 96:
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_premium_score_quality", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         if me.freshness <= 95 and (me.task_score_base >= self.config.target_task_score or state.phase in RUSH_PHASES or self._hot_weather_active(state) or self._weather_forecast(state, "HOT")):
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="preempt_score_quality_gap", freshness=me.freshness, taskScore=me.task_score_base, phase=state.phase, turnsLeft=state.turns_left)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
@@ -1143,21 +1165,6 @@ class BaselineStrategy:
         self.logger.info("resource_use", resourceType="INTEL", reason="gate_verify_scout_marker", target=state.gate_node)
         return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, target=state.gate_node, resource_type="INTEL"))
 
-    def _moving_horse_action(self, state: GameState) -> ActionBundle | None:
-        me = state.me
-        if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED"):
-            return None
-        if me.has_resource("FAST_HORSE"):
-            self.logger.info("resource_use", resourceType="FAST_HORSE", reason="moving_speedup")
-            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="FAST_HORSE"))
-        if me.has_resource("SHORT_HORSE"):
-            delivery_target = state.terminal_node if me.verified else state.gate_node
-            remaining_cost = self.route_planner.estimate_frames(state, me.station, delivery_target) if me.station else 10**9
-            if state.turns_left < 360 or remaining_cost >= 4 or me.task_score_base >= self.config.target_task_score:
-                self.logger.info("resource_use", resourceType="SHORT_HORSE", reason="moving_speedup", turnsLeft=state.turns_left, remainingCost=remaining_cost)
-                return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="SHORT_HORSE"))
-        return None
-
     def _fixed_process_action(self, state: GameState) -> ActionBundle | None:
         station_id = state.me.station
         station = state.station(station_id)
@@ -1178,7 +1185,7 @@ class BaselineStrategy:
         target = station_id or (station.id if station else None)
         if target is None:
             return None
-        if self._is_object_on_cooldown(state, self._process_object_key(target)):
+        if not forced and self._is_object_on_cooldown(state, self._process_object_key(target)):
             self.logger.info("fixed_process_skip", station=target, processType=station.process_type if station is not None else "UNKNOWN", reason="object_busy_short_cooldown")
             return None
         process_type = station.process_type if station is not None else "UNKNOWN"
@@ -1898,32 +1905,16 @@ class BaselineStrategy:
         learned = self._has_learned_guard(state, next_hop)
         if enemy_guard or learned:
             # 1. Squad weaken at key chokepoint
-            if enemy_guard and me.squad_available > 0 and next_hop in {"S10", "S11", "S13", "S14"}:
-                self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="SQUAD_WEAKEN", reason="key_chokepoint")
-                return ActionBundle(squad=SquadAction(SquadActionType.SQUAD_WEAKEN, next_hop))
             # 2. bad fruit → BREAK_GUARD
             bad = self._bad_fruit_to_break_guard(state, station)
             if bad > 0:
                 self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="BREAK_GUARD", reason="bad_fruit")
                 return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=next_hop, good_fruit=0, bad_fruit=bad), squad=squad)
             # 3. Squad weaken (general)
-            support = self._squad_blocker_action(state, next_hop, "enemy_guard") or squad
-            if support is not None and support is not squad:
-                self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="SQUAD_WEAKEN")
-                return ActionBundle(squad=support)
             # 4. good fruit → BREAK_GUARD
             if self._should_spend_good_fruit_to_break_guard(state, station):
                 self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="BREAK_GUARD", reason="good_fruit")
                 return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=next_hop, good_fruit=1, bad_fruit=0), squad=squad)
-            # 5. INTEL scout
-            if me.has_resource("INTEL") and not self._has_own_scout_marker(state, next_hop):
-                self.logger.info("resource_use", resourceType="INTEL", reason="scout_blocked", target=next_hop)
-                return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, target=next_hop, resource_type="INTEL"))
-            # 6. Squad scout (first-time, not learned yet)
-            if me.squad_available > 0 and next_hop not in self._scout_dispatched and not learned:
-                self.logger.info("squad_eval", action="SQUAD_SCOUT", target=next_hop, reason="scout_blocked")
-                return ActionBundle(squad=SquadAction(SquadActionType.SQUAD_SCOUT, next_hop))
-            # 7. Default: FORCED_PASS
             self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="FORCED_PASS", reason="default")
             return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=next_hop), squad=squad)
         return None  # safe to MOVE
@@ -1995,8 +1986,7 @@ class BaselineStrategy:
             self.logger.info("squad_eval", action="SQUAD_CLEAR", target=target, reason="blocked_route_obstacle")
             return SquadAction(SquadActionType.SQUAD_CLEAR, target)
         if blocker == "enemy_guard":
-            self.logger.info("squad_eval", action="SQUAD_WEAKEN", target=target, reason="blocked_route_enemy_guard")
-            return SquadAction(SquadActionType.SQUAD_WEAKEN, target)
+            return None
         return None
 
     def _t04_for_target(self, state: GameState, target: str) -> TaskInstance | None:

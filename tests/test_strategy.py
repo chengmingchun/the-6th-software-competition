@@ -160,7 +160,7 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(recovery.main.action, MainActionType.FORCED_PASS)
         self.assertEqual(recovery.main.to_action()["targetNodeId"], "S09")
 
-    def test_uses_squad_to_weaken_learned_guard_block(self) -> None:
+    def test_guard_block_does_not_use_squad_weaken(self) -> None:
         first = GameState(
             frame=100,
             phase="NORMAL",
@@ -183,10 +183,9 @@ class BaselineStrategyTest(unittest.TestCase):
             action_results=[{"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD"}],
         )
         recovery = self.strategy.decide(blocked)
-        self.assertIsNone(recovery.main)
-        self.assertIsNotNone(recovery.squad)
-        self.assertEqual(recovery.squad.action, SquadActionType.SQUAD_WEAKEN)
-        self.assertEqual(recovery.squad.to_action()["targetNodeId"], "S09")
+        self.assertIsNotNone(recovery.main)
+        self.assertEqual(recovery.main.action, MainActionType.FORCED_PASS)
+        self.assertNotEqual(recovery.squad.action if recovery.squad else None, SquadActionType.SQUAD_WEAKEN)
 
     def test_uses_official_permit_to_unblock_guard(self) -> None:
         first = GameState(
