@@ -16,6 +16,7 @@ class StrategyConfig:
     station_stall_frames: int = 18
     station_escape_frames: int = 36
     object_cooldown_frames: int = 30
+    process_start_grace_frames: int = 2
     max_window_rounds_before_abstain: int = 2
     opening_window_mix_frames: int = 120
     low_freshness_threshold: float = 75.0

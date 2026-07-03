@@ -153,7 +153,7 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
         self.assertIsNotNone(action.window)
 
-    def test_pending_process_waits_instead_of_repeating_process_or_moving(self) -> None:
+    def test_pending_process_waits_briefly_for_server_to_enter_processing(self) -> None:
         first = GameState(
             frame=57,
             phase="NORMAL",
@@ -175,6 +175,52 @@ class BaselineStrategyTest(unittest.TestCase):
         action = self.strategy.decide(second)
         self.assertIsNone(action.main)
         self.assertIsNotNone(action.window)
+
+    def test_unconfirmed_pending_process_retries_instead_of_waiting_forever(self) -> None:
+        first = GameState(
+            frame=57,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02"),
+            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
+        )
+        self.assertEqual(self.strategy.decide(first).main.action, MainActionType.PROCESS)
+
+        stalled = GameState(
+            frame=61,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02"),
+            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
+        )
+        action = self.strategy.decide(stalled)
+        self.assertEqual(action.main.action, MainActionType.PROCESS)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_confirmed_pending_process_still_waits(self) -> None:
+        first = GameState(
+            frame=57,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02"),
+            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
+        )
+        self.assertEqual(self.strategy.decide(first).main.action, MainActionType.PROCESS)
+
+        processing = GameState(
+            frame=61,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.PROCESSING,
+                station="S02",
+                current_process={"type": "TRANSFER", "targetNodeId": "S02"},
+            ),
+            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
+        )
+        action = self.strategy.decide(processing)
+        self.assertIsNone(action.main)
 
     def test_process_complete_allows_leaving_fixed_node(self) -> None:
         first = GameState(

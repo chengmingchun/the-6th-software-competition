@@ -471,10 +471,29 @@ class BaselineStrategy:
             self._pending_process_started_at.pop(station, None)
             return None
         until = self._pending_process_until[station]
+        started_at = self._pending_process_started_at.get(station, state.frame)
+        server_confirms_processing = state.me.current_process is not None or state.me.status in BUSY_STATES
+        if not server_confirms_processing and state.frame > started_at + self.config.process_start_grace_frames:
+            self.logger.info(
+                "process_pending_unconfirmed",
+                station=station,
+                startedAt=started_at,
+                frame=state.frame,
+                graceFrames=self.config.process_start_grace_frames,
+                reason="PROCESS 已提交但服务端未显示处理中，解锁重试，避免南岭驿原地空等",
+            )
+            self._pending_process_until.pop(station, None)
+            self._pending_process_started_at.pop(station, None)
+            return None
         if state.frame <= until:
-            self.logger.info("process_pending_wait", station=station, startedAt=self._pending_process_started_at.get(station), until=until, reason="PROCESS 已提交，等待 PROCESS_COMPLETE，不重复提交，不移动离站")
+            wait_reason = (
+                "服务端已显示处理中，等待 PROCESS_COMPLETE，不重复提交，不移动离站"
+                if server_confirms_processing
+                else "PROCESS 刚提交，短暂等待服务端进入处理中"
+            )
+            self.logger.info("process_pending_wait", station=station, startedAt=started_at, until=until, confirmed=server_confirms_processing, reason=wait_reason)
             return wait("pending_process", active=False)
-        self.logger.info("process_pending_timeout", station=station, startedAt=self._pending_process_started_at.get(station), until=until, reason="等待超时，允许重新提交 PROCESS")
+        self.logger.info("process_pending_timeout", station=station, startedAt=started_at, until=until, reason="等待超时，允许重新提交 PROCESS")
         self._pending_process_until.pop(station, None)
         self._pending_process_started_at.pop(station, None)
         return None
