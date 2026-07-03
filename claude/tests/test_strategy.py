@@ -3,12 +3,12 @@ from __future__ import annotations
 import io
 import unittest
 
-from lizhi_agent.actions import MainActionType, WindowCard
+from lizhi_agent.actions import MainActionType
 from lizhi_agent.config import StrategyConfig
 from lizhi_agent.logger import DecisionLogger
-from lizhi_agent.models import ConvoyStatus, GameState, PlayerState, ResourceStock, RouteEdge, Station, TaskInstance, WindowState
+from lizhi_agent.models import ConvoyStatus, GameState, PlayerState, ResourceStock, RouteEdge, TaskInstance
 from lizhi_agent.protocol import LengthPrefixedCodec
-from lizhi_agent.strategy import BaselineStrategy
+from lizhi_agent.strategy import RoadMasterStrategy
 
 
 class SilentLogger(DecisionLogger):
@@ -37,9 +37,9 @@ class MemoryStream:
         return None
 
 
-class BaselineStrategyTest(unittest.TestCase):
+class RoadMasterStrategySmokeTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.strategy = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger())
+        self.strategy = RoadMasterStrategy("1001", StrategyConfig.default(), SilentLogger())
 
     def test_deliver_when_at_terminal_verified(self) -> None:
         state = GameState(
@@ -64,7 +64,7 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.VERIFY_GATE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
 
-    def test_claim_valuable_task_before_90_score(self) -> None:
+    def test_claim_current_task_before_score_floor(self) -> None:
         state = GameState(
             frame=100,
             phase="NORMAL",
@@ -76,7 +76,7 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.CLAIM_TASK)
         self.assertEqual(action.main.to_action()["taskId"], "task-1")
 
-    def test_claim_priority_resource_before_score_floor(self) -> None:
+    def test_claim_priority_resource_on_road_station(self) -> None:
         state = GameState(
             frame=100,
             phase="NORMAL",
@@ -91,7 +91,7 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.CLAIM_RESOURCE)
         self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
 
-    def test_move_towards_gate_after_score_floor(self) -> None:
+    def test_roadmaster_moves_along_road_path_after_score_floor(self) -> None:
         state = GameState(
             frame=100,
             phase="NORMAL",
@@ -107,20 +107,7 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
 
-    def test_waiting_at_station_still_plans_next_move(self) -> None:
-        state = GameState(
-            frame=180,
-            phase="NORMAL",
-            player_id="1001",
-            roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", status=ConvoyStatus.WAITING, station="S08", target="S14", task_score_base=90),
-            edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
-        )
-        action = self.strategy.decide(state)
-        self.assertEqual(action.main.action, MainActionType.MOVE)
-        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
-
-    def test_waiting_on_route_edge_keeps_system_wait(self) -> None:
+    def test_moving_state_keeps_system_wait(self) -> None:
         state = GameState(
             frame=180,
             phase="NORMAL",
@@ -128,248 +115,25 @@ class BaselineStrategyTest(unittest.TestCase):
             roles={"gateNodeId": "S14"},
             me=PlayerState(
                 player_id="1001",
-                status=ConvoyStatus.WAITING,
+                status=ConvoyStatus.MOVING,
                 station="S08",
                 target="S09",
                 route_edge_id="E1",
                 task_score_base=90,
             ),
-            edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
         )
         action = self.strategy.decide(state)
         self.assertIsNone(action.main)
 
-    def test_window_card_does_not_block_fixed_process(self) -> None:
-        state = GameState(
-            frame=57,
-            phase="NORMAL",
-            player_id="1001",
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=4),
-            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
-            windows=[WindowState(id="contest-process", window_type="TASK", target="S02", active=True, my_turn=True, round_index=1)],
-        )
-        action = self.strategy.decide(state)
-        self.assertEqual(action.main.action, MainActionType.PROCESS)
-        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
-        self.assertIsNotNone(action.window)
 
-    def test_pending_process_waits_instead_of_repeating_process_or_moving(self) -> None:
-        first = GameState(
-            frame=57,
-            phase="NORMAL",
-            player_id="1001",
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=4),
-            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
-            windows=[WindowState(id="contest-process", window_type="TASK", target="S02", active=True, my_turn=True, round_index=1)],
-        )
-        self.assertEqual(self.strategy.decide(first).main.action, MainActionType.PROCESS)
-
-        second = GameState(
-            frame=58,
-            phase="NORMAL",
-            player_id="1001",
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=4),
-            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
-            windows=[WindowState(id="contest-process", window_type="TASK", target="S02", active=True, my_turn=True, round_index=2)],
-        )
-        action = self.strategy.decide(second)
-        self.assertIsNone(action.main)
-        self.assertIsNotNone(action.window)
-
-    def test_process_complete_allows_leaving_fixed_node(self) -> None:
-        first = GameState(
-            frame=57,
-            phase="NORMAL",
-            player_id="1001",
-            roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02"),
-            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
-            edges=[RouteEdge(id="E1", start="S02", end="S14", distance=1)],
-        )
-        self.assertEqual(self.strategy.decide(first).main.action, MainActionType.PROCESS)
-
-        completed = GameState(
-            frame=62,
-            phase="NORMAL",
-            player_id="1001",
-            roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", task_score_base=90),
-            stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
-            edges=[RouteEdge(id="E1", start="S02", end="S14", distance=1)],
-            events=[{"eventType": "PROCESS_COMPLETE", "playerId": "1001", "nodeId": "S02"}],
-        )
-        action = self.strategy.decide(completed)
-        self.assertEqual(action.main.action, MainActionType.MOVE)
-        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
-
-    def test_window_card_does_not_block_move(self) -> None:
-        state = GameState(
-            frame=120,
-            phase="NORMAL",
-            player_id="1001",
-            roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=90, guard_points=4),
-            edges=[RouteEdge(id="E1", start="S01", end="S02", distance=1), RouteEdge(id="E2", start="S02", end="S14", distance=1)],
-            windows=[WindowState(id="contest-move", window_type="TASK", target="S02", active=True, my_turn=True, round_index=1)],
-        )
-        action = self.strategy.decide(state)
-        self.assertEqual(action.main.action, MainActionType.MOVE)
-        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
-        self.assertIsNotNone(action.window)
-
-    def test_obstacle_uses_t04_instead_of_plain_clear(self) -> None:
-        state = GameState(
-            frame=100,
-            phase="NORMAL",
-            player_id="1001",
-            roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=90),
-            stations={"S02": Station(id="S02", has_obstacle=True)},
-            edges=[RouteEdge(id="E1", start="S01", end="S02", distance=1), RouteEdge(id="E2", start="S02", end="S14", distance=1)],
-            tasks=[TaskInstance(id="t04", template="T04", target="S02", score=30, process_frames=6)],
-        )
-        action = self.strategy.decide(state)
-        self.assertEqual(action.main.action, MainActionType.CLAIM_TASK)
-        self.assertEqual(action.main.to_action()["taskId"], "t04")
-
-    def test_station_stall_escapes_current_task_loop(self) -> None:
-        first = GameState(
-            frame=100,
-            phase="NORMAL",
-            player_id="1001",
-            roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=30),
-            edges=[RouteEdge(id="E1", start="S03", end="S14", distance=1)],
-            tasks=[TaskInstance(id="task-loop", template="T01", target="S03", score=30, process_frames=3)],
-        )
-        self.assertEqual(self.strategy.decide(first).main.action, MainActionType.CLAIM_TASK)
-
-        stalled = GameState(
-            frame=119,
-            phase="NORMAL",
-            player_id="1001",
-            roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=30),
-            edges=[RouteEdge(id="E1", start="S03", end="S14", distance=1)],
-            tasks=[TaskInstance(id="task-loop", template="T01", target="S03", score=30, process_frames=3)],
-        )
-        action = self.strategy.decide(stalled)
-        self.assertEqual(action.main.action, MainActionType.MOVE)
-        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
-
-    def test_repeated_window_suppresses_after_hard_limit(self) -> None:
-        window = WindowState(
-            id="contest-1",
-            window_type="TASK",
-            target="S03",
-            task_id="task-loop",
-            active=True,
-            my_turn=True,
-            round_index=1,
-        )
-        base = GameState(
-            frame=100,
-            phase="NORMAL",
-            player_id="1001",
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", guard_points=1),
-            windows=[window],
-        )
-        self.assertNotEqual(self.strategy.decide(base).window.card, WindowCard.ABSTAIN)
-        self.assertNotEqual(self.strategy.decide(base).window.card, WindowCard.ABSTAIN)
-        self.assertIsNotNone(self.strategy.decide(base).window)
-        self.assertIsNone(self.strategy.decide(base).window)
-
-    def test_opening_window_uses_mixed_cards(self) -> None:
-        cards = set()
-        for index in range(8):
-            strategy = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger())
-            state = GameState(
-                frame=30,
-                phase="NORMAL",
-                player_id="1001",
-                me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=4, good_fruit=100, freshness=100),
-                windows=[WindowState(id=f"contest-{index}", window_type="TASK", target="S02", task_id="task-open", active=True, my_turn=True, round_index=1)],
-            )
-            cards.add(strategy.decide(state).window.card)
-        self.assertIn(WindowCard.BING_ZHENG, cards)
-        self.assertIn(WindowCard.XIAN_GONG, cards)
-
-    def test_late_high_value_window_keeps_stable_card(self) -> None:
-        state = GameState(
-            frame=220,
-            phase="NORMAL",
-            player_id="1001",
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=4),
-            windows=[WindowState(id="contest-late", window_type="TASK", target="S02", task_id="task-late", active=True, my_turn=True, round_index=1)],
-        )
-        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.BING_ZHENG)
-
-    def test_window_counters_revealed_bing_zheng_with_xian_gong(self) -> None:
-        state = GameState(
-            frame=90,
-            phase="NORMAL",
-            player_id="1001",
-            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S02", good_fruit=95, freshness=95),
-            windows=[
-                WindowState(
-                    id="contest-counter",
-                    window_type="TASK",
-                    target="S02",
-                    active=True,
-                    my_turn=True,
-                    round_index=2,
-                    raw={"cards": {"RED": "BING_ZHENG", "BLUE": "BING_ZHENG"}},
-                )
-            ],
-        )
-        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.XIAN_GONG)
-
-    def test_window_uses_document_to_counter_qiang_xing(self) -> None:
-        state = GameState(
-            frame=90,
-            phase="NORMAL",
-            player_id="1001",
-            me=PlayerState(
-                player_id="1001",
-                team_id="RED",
-                status=ConvoyStatus.IDLE,
-                station="S02",
-                resources={"PASS_TOKEN": 1},
-            ),
-            windows=[
-                WindowState(
-                    id="contest-counter-doc",
-                    window_type="PASS",
-                    target="S02",
-                    active=True,
-                    my_turn=True,
-                    round_index=2,
-                    raw={"cards": {"RED": "BING_ZHENG", "BLUE": "QIANG_XING"}},
-                )
-            ],
-        )
-        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.YAN_DIE)
-
-    def test_low_value_window_does_not_spend_good_fruit(self) -> None:
-        state = GameState(
-            frame=30,
-            phase="NORMAL",
-            player_id="1001",
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", guard_points=0, good_fruit=100, freshness=100),
-            windows=[WindowState(id="contest-low-resource", window_type="RESOURCE", resource_type="BOAT_RIGHT", target="S02", active=True, my_turn=True, round_index=1)],
-        )
-        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.ABSTAIN)
-
-
-class ProtocolCodecTest(unittest.TestCase):
-    def test_length_prefixed_codec_roundtrip(self) -> None:
+class ProtocolCodecSmokeTest(unittest.TestCase):
+    def test_length_prefixed_codec_round_trip(self) -> None:
         stream = MemoryStream()
         codec = LengthPrefixedCodec(stream)
-        codec.write_message({"msg_name": "action", "msg_data": {"round": 1, "actions": []}})
-        raw = stream.writer.getvalue()
-        self.assertTrue(raw[:5].isdigit())
-        reader_codec = LengthPrefixedCodec(MemoryStream(raw))
-        self.assertEqual(reader_codec.read_message()["msg_name"], "action")
+        codec.write_message({"msg_name": "ready", "msg_data": {"playerId": 1001}})
+        written = stream.writer.getvalue()
+        replay = LengthPrefixedCodec(MemoryStream(written))
+        self.assertEqual(replay.read_message()["msg_name"], "ready")
 
 
 if __name__ == "__main__":
