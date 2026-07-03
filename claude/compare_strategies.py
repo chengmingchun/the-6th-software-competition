@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare root Baseline self-play vs Claude RoadMaster self-play.
+"""Compare root Baseline self-play vs Claude FreshnessFirst self-play.
 
 This script intentionally runs each strategy family in a separate Python
 subprocess so the two lizhi_agent packages do not collide in sys.modules.
@@ -42,8 +42,9 @@ sys.stderr = open(os.devnull, "w")
 sys.path.insert(0, r"{package_dir}")
 _pkg = Path(r"{package_dir}")
 _parent = _pkg.parent
+# Parent dir (root) goes AFTER package_dir so package_dir's lizhi_agent wins
 if str(_parent) not in sys.path:
-    sys.path.insert(0, str(_parent))
+    sys.path.append(str(_parent))
 
 from lizhi_server.engine import GameEngine as ServerEngine
 from lizhi_agent.config import StrategyConfig
@@ -105,42 +106,42 @@ def summarize(label: str, scores: list[int]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Compare root Baseline and Claude RoadMaster self-play")
+    parser = argparse.ArgumentParser(description="Compare root Baseline and Claude FreshnessFirst self-play")
     parser.add_argument("--seeds", default=None, help="Seed list like 1,2,42 or range like 1-20")
     args = parser.parse_args(argv)
 
     seeds = parse_seeds(args.seeds)
     baseline_scores: list[int] = []
-    roadmaster_scores: list[int] = []
+    freshfirst_scores: list[int] = []
 
-    print("Baseline self-play vs RoadMaster self-play")
+    print("Baseline self-play vs FreshnessFirst self-play")
     print(f"Root:   {ROOT_DIR}")
     print(f"Claude: {CLAUDE_DIR}")
     print()
 
     for seed in seeds:
         baseline = run_family(seed, ROOT_DIR, "BaselineStrategy")
-        roadmaster = run_family(seed, CLAUDE_DIR, "RoadMasterStrategy")
+        freshfirst = run_family(seed, CLAUDE_DIR, "FreshnessFirstStrategy")
         if baseline is not None:
             baseline_scores.append(baseline[0])
-        if roadmaster is not None:
-            roadmaster_scores.append(roadmaster[0])
+        if freshfirst is not None:
+            freshfirst_scores.append(freshfirst[0])
         b_avg, b1, b2 = baseline if baseline else (None, None, None)
-        r_avg, r1, r2 = roadmaster if roadmaster else (None, None, None)
-        delta = None if b_avg is None or r_avg is None else r_avg - b_avg
+        f_avg, f1, f2 = freshfirst if freshfirst else (None, None, None)
+        delta = None if b_avg is None or f_avg is None else f_avg - b_avg
         delta_text = f"{delta:+d}" if delta is not None else "None"
         print(
             f"seed={seed:>4d}: "
             f"Baseline={fmt(b_avg)} ({fmt(b1)},{fmt(b2)})  "
-            f"RoadMaster={fmt(r_avg)} ({fmt(r1)},{fmt(r2)})  "
+            f"FreshFirst={fmt(f_avg)} ({fmt(f1)},{fmt(f2)})  "
             f"delta={delta_text}"
         )
 
     print()
     summarize("Baseline", baseline_scores)
-    summarize("RoadMaster", roadmaster_scores)
-    if baseline_scores and roadmaster_scores:
-        print(f"Average delta: {statistics.mean(roadmaster_scores) - statistics.mean(baseline_scores):+.1f}")
+    summarize("FreshFirst", freshfirst_scores)
+    if baseline_scores and freshfirst_scores:
+        print(f"Average delta: {statistics.mean(freshfirst_scores) - statistics.mean(baseline_scores):+.1f}")
     return 0
 
 

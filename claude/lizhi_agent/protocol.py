@@ -11,7 +11,7 @@ from typing import Any, BinaryIO, Protocol
 from lizhi_agent.actions import ActionBundle, wait
 from lizhi_agent.logger import DecisionLogger
 from lizhi_agent.models import parse_game_state
-from lizhi_agent.strategy import RoadMasterStrategy as BaselineStrategy
+from lizhi_agent.strategy import FreshnessFirstStrategy as BaselineStrategy
 
 DEFAULT_PLAYER_NAME = "你荔枝一点"
 
