@@ -2,9 +2,14 @@
 setlocal EnableExtensions
 chcp 65001 >nul
 
-rem Launch two Claude RoadMaster clients against the local simulator.
-rem Start the server first from the repository root or claude copy:
-rem   python -m lizhi_server.run_server --port 30000 --seed 42
+rem Launch two local clients from the same current working tree against one local debug server.
+rem Use this for same-version self play. For different versions, start each version's
+rem single-client launcher manually from its own branch/worktree.
+rem
+rem Default local server: 127.0.0.1:30000
+rem Default players are inferred from local-debug start message:
+rem   RED  = 2765
+rem   BLUE = 2779
 rem
 rem Usage:
 rem   start_local_dual.bat [RED_PLAYER_ID] [BLUE_PLAYER_ID] [HOST] [PORT]
@@ -22,6 +27,9 @@ if not "%~1"=="" set "RED_PLAYER_ID=%~1"
 if not "%~2"=="" set "BLUE_PLAYER_ID=%~2"
 if not "%~3"=="" set "HOST=%~3"
 if not "%~4"=="" set "PORT=%~4"
+
+set "RED_PLAYER_NAME=%TEAM_NAME%"
+set "BLUE_PLAYER_NAME=%TEAM_NAME%"
 
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>nul
 
@@ -45,20 +53,24 @@ if "%CURRENT_BRANCH%"=="" set "CURRENT_BRANCH=unknown"
 if "%CURRENT_SHA%"=="" set "CURRENT_SHA=unknown"
 
 echo ============================================================
-echo Launching Claude RoadMaster local dual clients
+echo Launching same-version local dual clients
 echo Server: %HOST%:%PORT%
 echo Version: branch=%CURRENT_BRANCH% sha=%CURRENT_SHA%
-echo RED:    id=%RED_PLAYER_ID%  name=%TEAM_NAME%
-echo BLUE:   id=%BLUE_PLAYER_ID% name=%TEAM_NAME%
+echo RED:    id=%RED_PLAYER_ID%  name=%RED_PLAYER_NAME%
+echo BLUE:   id=%BLUE_PLAYER_ID% name=%BLUE_PLAYER_NAME%
 echo Logs:   %LOG_DIR%
 echo ============================================================
 echo.
-echo Make sure the local simulator is already listening.
+echo Make sure the local debug server is already listening.
 echo.
 
-start "claude RED %RED_PLAYER_ID%" /D "%~dp0" cmd /k "set LIZHI_DEBUG=1&& set LIZHI_RAW_LOG=1&& set LIZHI_FILE_LOG=1&& set LIZHI_FIXTURE_LOG=1&& set LIZHI_LOG_DIR=%LOG_DIR%&& set LIZHI_VERSION=claude-roadmaster-%CURRENT_BRANCH%-%CURRENT_SHA%-red&& set LIZHI_PLAYER_NAME=%TEAM_NAME%&& echo [RED] playerId=%RED_PLAYER_ID% playerName=%TEAM_NAME% host=%HOST% port=%PORT%&& %PYTHON_CMD% main.py %RED_PLAYER_ID% %HOST% %PORT%"
+start "lizhi RED %RED_PLAYER_ID%" /D "%~dp0" cmd /k "set LIZHI_DEBUG=1&& set LIZHI_RAW_LOG=1&& set LIZHI_FILE_LOG=1&& set LIZHI_FIXTURE_LOG=1&& set LIZHI_LOG_DIR=%LOG_DIR%&& set LIZHI_VERSION=%CURRENT_BRANCH%-%CURRENT_SHA%-red&& set LIZHI_PLAYER_NAME=%RED_PLAYER_NAME%&& echo [RED] playerId=%RED_PLAYER_ID% playerName=%RED_PLAYER_NAME% host=%HOST% port=%PORT%&& %PYTHON_CMD% main.py %RED_PLAYER_ID% %HOST% %PORT%"
 timeout /t 1 /nobreak >nul
-start "claude BLUE %BLUE_PLAYER_ID%" /D "%~dp0" cmd /k "set LIZHI_DEBUG=1&& set LIZHI_RAW_LOG=1&& set LIZHI_FILE_LOG=1&& set LIZHI_FIXTURE_LOG=1&& set LIZHI_LOG_DIR=%LOG_DIR%&& set LIZHI_VERSION=claude-roadmaster-%CURRENT_BRANCH%-%CURRENT_SHA%-blue&& set LIZHI_PLAYER_NAME=%TEAM_NAME%&& echo [BLUE] playerId=%BLUE_PLAYER_ID% playerName=%TEAM_NAME% host=%HOST% port=%PORT%&& %PYTHON_CMD% main.py %BLUE_PLAYER_ID% %HOST% %PORT%"
+start "lizhi BLUE %BLUE_PLAYER_ID%" /D "%~dp0" cmd /k "set LIZHI_DEBUG=1&& set LIZHI_RAW_LOG=1&& set LIZHI_FILE_LOG=1&& set LIZHI_FIXTURE_LOG=1&& set LIZHI_LOG_DIR=%LOG_DIR%&& set LIZHI_VERSION=%CURRENT_BRANCH%-%CURRENT_SHA%-blue&& set LIZHI_PLAYER_NAME=%BLUE_PLAYER_NAME%&& echo [BLUE] playerId=%BLUE_PLAYER_ID% playerName=%BLUE_PLAYER_NAME% host=%HOST% port=%PORT%&& %PYTHON_CMD% main.py %BLUE_PLAYER_ID% %HOST% %PORT%"
 
-echo [INFO] Two Claude RoadMaster client windows launched.
+echo [INFO] Two same-version client windows launched.
+echo [INFO] Expected server logs:
+echo        Registered player ... playerId=%RED_PLAYER_ID% ... playerName=%RED_PLAYER_NAME%
+echo        Registered player ... playerId=%BLUE_PLAYER_ID% ... playerName=%BLUE_PLAYER_NAME%
+echo [INFO] If the server still stops at ready, check both client windows and both log files.
 pause
