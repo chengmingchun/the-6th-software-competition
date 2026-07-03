@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Claude RoadMaster competition client entrypoint.
+"""Competition client entrypoint.
 
 Usage:
     python3 main.py <playerId> <host> <port>
 
 When host/port are present the client uses the official TCP protocol:
-5 decimal length bytes plus a UTF-8 JSON body. Without host/port it falls back
+5 decimal length bytes plus a UTF-8 JSON body.  Without host/port it falls back
 to JSON-lines on stdin/stdout for local strategy fixtures.
 """
 
@@ -16,7 +16,7 @@ import sys
 from lizhi_agent.config import StrategyConfig
 from lizhi_agent.logger import DecisionLogger
 from lizhi_agent.protocol import CompetitionClient
-from lizhi_agent.strategy import RoadMasterStrategy
+from lizhi_agent.strategy import BaselineStrategy
 
 
 def main(argv: list[str]) -> int:
@@ -26,7 +26,7 @@ def main(argv: list[str]) -> int:
 
     logger = DecisionLogger(player_id=player_id)
     config = StrategyConfig.default()
-    strategy = RoadMasterStrategy(player_id=player_id, config=config, logger=logger)
+    strategy = BaselineStrategy(player_id=player_id, config=config, logger=logger)
     client = CompetitionClient(player_id=player_id, strategy=strategy, logger=logger)
 
     if host and port:
