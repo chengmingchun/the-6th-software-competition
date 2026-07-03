@@ -45,7 +45,7 @@ UNBLOCK_RESOURCE_REJECT_CODES = {
 TASK_TEMPLATE_REJECT_CODES = {"TASK_CONDITION_NOT_MET", "TASK_REQUIREMENT_NOT_MET", "RESOURCE_REQUIRED", "NO_HORSE"}
 SHORT_BUSY_COOLDOWN_FRAMES = 5
 UNBLOCK_RESOURCE_COOLDOWN_FRAMES = 40
-LEARNED_GUARD_BLOCK_FRAMES = 70
+LEARNED_GUARD_BLOCK_FRAMES = 999999  # permanent once learned
 WINDOW_REJECT_CODES = {
     "WINDOW_NOT_ACTIVE",
     "WINDOW_NOT_AVAILABLE",
@@ -533,7 +533,7 @@ class BaselineStrategy:
             round=state.frame,
             phase=state.phase,
             station=state.me.station,
-            status=state.me.status.value,
+            status=getattr(state.me.status, 'value', state.me.status),
             score=state.me.total_score,
             taskScore=state.me.task_score_base,
             freshness=state.me.freshness,
@@ -589,9 +589,9 @@ class BaselineStrategy:
             horse = self._moving_horse_action(state)
             if horse is not None:
                 return done(horse, "use_horse_while_moving")
-            return done(wait(f"moving:{me.status.value}", active=False), f"moving:{me.status.value}")
+            return done(wait(f"moving:{getattr(me.status, 'value', me.status)}", active=False), f"moving:{getattr(me.status, 'value', me.status)}")
         if me.status in BUSY_STATES or me.current_process is not None:
-            return done(wait(f"busy:{me.status.value}", active=False), f"busy:{me.status.value}")
+            return done(wait(f"busy:{getattr(me.status, 'value', me.status)}", active=False), f"busy:{getattr(me.status, 'value', me.status)}")
         pending = self._pending_process_wait_action(state)
         if pending is not None:
             return done(pending, "wait_pending_process")
@@ -930,7 +930,7 @@ class BaselineStrategy:
             "state_snapshot",
             round=state.frame,
             phase=state.phase,
-            status=me.status.value,
+            status=getattr(me.status, 'value', me.status),
             stateClass=self._state_class(me.status),
             station=me.station,
             target=me.target,
@@ -1024,6 +1024,12 @@ class BaselineStrategy:
         target = state.terminal_node if me.verified else state.gate_node
         remaining_cost = self.route_planner.estimate_frames(state, me.station, target)
         has_speed_resource = me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")
+        # If stuck behind guard with high score + low-ish freshness, protect NOW.
+        # The FORCED_PASS contest and tax frames will drain more freshness.
+        stuck_behind_guard = bool(self._blocked_guard_nodes)
+        if not me.has_buff("RUSH_PROTECT") and stuck_behind_guard and me.task_score_base >= self.config.target_task_score:
+            self.logger.info("rush_tactic", action="RUSH_PROTECT", reason="protect_freshness_while_stuck_behind_guard", freshness=me.freshness, taskScore=me.task_score_base)
+            return ActionBundle(main=MainAction(MainActionType.RUSH_PROTECT))
         if not me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") and not has_speed_resource and me.good_fruit >= 88 and me.freshness >= 88:
             if remaining_cost >= 8 and state.turns_left <= remaining_cost + 32:
                 self.logger.info("rush_tactic", action="RUSH_SPEED", reason="deadline_speedup", remainingCost=remaining_cost, turnsLeft=state.turns_left)
@@ -1096,12 +1102,14 @@ class BaselineStrategy:
         if not me.has_resource("INTEL") or me.status not in PLANNING_STATES or me.station is None:
             return None
         target = self._intel_target(state)
+        is_blocked_guard_target = target is not None and self._is_learned_guard_blocked(state, target)
         should_spend_intel = (
             state.phase in RUSH_PHASES
             or self._should_lock_delivery(state)
             or state.frame >= 220
             or self._route_has_blocker_risk(state)
             or target in {state.gate_node, "S10", "S11", "S13"}
+            or is_blocked_guard_target
         )
         if me.squad_available > 0 and not should_spend_intel:
             return None
@@ -1118,7 +1126,24 @@ class BaselineStrategy:
         forbidden = self._scout_forbidden(state)
         objective = self._current_route_objective(state)
         target, _ = self._priority_scout_target(state, objective, forbidden)
-        return target
+        if target is not None:
+            return target
+        me = state.me
+        if me.station is not None:
+            best_blocked: tuple[int, str] | None = None
+            for blocked_node, until in self._blocked_guard_nodes.items():
+                if state.frame > until:
+                    continue
+                if blocked_node in forbidden:
+                    continue
+                cost = self.route_planner.estimate_frames(state, me.station, blocked_node)
+                if cost >= 10**8:
+                    continue
+                if best_blocked is None or cost < best_blocked[0]:
+                    best_blocked = (cost, blocked_node)
+            if best_blocked is not None:
+                return best_blocked[1]
+        return None
 
     def _gate_intel_action(self, state: GameState) -> ActionBundle | None:
         me = state.me
@@ -1796,7 +1821,7 @@ class BaselineStrategy:
         if next_hop is None:
             self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=None, reason="no_route")
             return wait("no_route", active=False)
-        alternate = None if self._has_available_unblock_resource(state, next_hop) else self._alternate_next_hop_avoiding_blocked(state, target, next_hop)
+        alternate = self._alternate_next_hop_avoiding_blocked(state, target, next_hop)
         if alternate is not None:
             self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=alternate, avoided=next_hop, reason="avoid_learned_guard_block")
             return self._move_to(state, alternate, squad=squad)
