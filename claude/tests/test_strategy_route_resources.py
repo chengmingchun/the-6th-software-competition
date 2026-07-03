@@ -46,18 +46,26 @@ class RoadMasterRouteResourceSmokeTest(unittest.TestCase):
             roles={"gateNodeId": "S14"},
             me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02"),
             stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
-            edges=[RouteEdge(id="E1", start="S02", end="S03", distance=1)],
+            edges=[
+                RouteEdge(id="E1", start="S02", end="S03", distance=1),
+                RouteEdge(id="E2", start="S03", end="S14", distance=1),
+                RouteEdge(id="E3", start="S14", end="S15", distance=1),
+            ],
         )
         self.assertEqual(strategy.decide(first).main.action, MainActionType.PROCESS)
 
         completed = GameState(
-            frame=62,
+            frame=80,
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
             me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S02", task_score_base=90),
             stations={"S02": Station(id="S02", process_type="TRANSFER", process_round=4)},
-            edges=[RouteEdge(id="E1", start="S02", end="S03", distance=1)],
+            edges=[
+                RouteEdge(id="E1", start="S02", end="S03", distance=1),
+                RouteEdge(id="E2", start="S03", end="S14", distance=1),
+                RouteEdge(id="E3", start="S14", end="S15", distance=1),
+            ],
             events=[{"type": "PROCESS_COMPLETE", "playerId": "1001", "nodeId": "S02"}],
         )
         action = strategy.decide(completed)

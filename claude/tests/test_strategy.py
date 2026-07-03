@@ -69,8 +69,13 @@ class RoadMasterStrategySmokeTest(unittest.TestCase):
             frame=100,
             phase="NORMAL",
             player_id="1001",
+            roles={"gateNodeId": "S14"},
             me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=30),
             tasks=[TaskInstance(id="task-1", template="T01", target="S03", score=30, process_frames=3)],
+            edges=[
+                RouteEdge(id="E1", start="S03", end="S14", distance=1),
+                RouteEdge(id="E2", start="S14", end="S15", distance=1),
+            ],
         )
         action = self.strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.CLAIM_TASK)
@@ -81,10 +86,15 @@ class RoadMasterStrategySmokeTest(unittest.TestCase):
             frame=100,
             phase="NORMAL",
             player_id="1001",
+            roles={"gateNodeId": "S14"},
             me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=30),
             resources=[
                 ResourceStock(station="S03", resource_type="BOAT_RIGHT", amount=1),
                 ResourceStock(station="S03", resource_type="ICE_BOX", amount=1),
+            ],
+            edges=[
+                RouteEdge(id="E1", start="S03", end="S14", distance=1),
+                RouteEdge(id="E2", start="S14", end="S15", distance=1),
             ],
         )
         action = self.strategy.decide(state)

@@ -16,10 +16,13 @@ import sys
 import time
 from pathlib import Path
 
-# Ensure we can import from project root
-ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+# Path setup: claude dir first (for lizhi_agent), parent for lizhi_server
+CLAUDE_DIR = Path(__file__).resolve().parent
+ROOT_DIR = CLAUDE_DIR.parent
+if str(CLAUDE_DIR) not in sys.path:
+    sys.path.insert(0, str(CLAUDE_DIR))
+if str(ROOT_DIR) not in sys.path:
+    sys.path.append(str(ROOT_DIR))
 
 from lizhi_server.engine import GameEngine as ServerEngine
 

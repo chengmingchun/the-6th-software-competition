@@ -34,11 +34,16 @@ def run_family(seed: int, package_dir: Path, strategy_class: str) -> tuple[int, 
     code = f'''
 from __future__ import annotations
 import os
+from pathlib import Path
 import sys
 
 os.environ["LIZHI_DEBUG"] = "0"
 sys.stderr = open(os.devnull, "w")
 sys.path.insert(0, r"{package_dir}")
+_pkg = Path(r"{package_dir}")
+_parent = _pkg.parent
+if str(_parent) not in sys.path:
+    sys.path.insert(0, str(_parent))
 
 from lizhi_server.engine import GameEngine as ServerEngine
 from lizhi_agent.config import StrategyConfig
