@@ -613,7 +613,7 @@ class BaselineStrategyTest(unittest.TestCase):
         action = self.strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.SET_GUARD)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
-        self.assertEqual(action.main.to_action()["extraGoodFruit"], 0)
+        self.assertEqual(action.main.to_action()["extraGoodFruit"], 1)
 
     def test_repeated_window_suppresses_after_hard_limit(self) -> None:
         window = WindowState(

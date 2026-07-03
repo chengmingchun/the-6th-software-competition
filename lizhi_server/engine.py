@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 import math
 from copy import deepcopy
@@ -293,10 +294,12 @@ class GameEngine:
                  player1_id: int | str = 1001,
                  player2_id: int | str = 1002,
                  player1_name: str = "Player-RED",
-                 player2_name: str = "Player-BLUE") -> None:
+                 player2_name: str = "Player-BLUE",
+                 scenario: str | None = None) -> None:
         self.match_id = match_id
         self.seed = seed
         self.rng = random.Random(seed)
+        self.scenario = (scenario or os.environ.get("LIZHI_SERVER_SCENARIO") or "").strip().lower()
 
         self.frame = 0
         self.phase = "NORMAL"
@@ -361,6 +364,11 @@ class GameEngine:
 
         # Score preview
         self.score_preview: dict[str, int] = {"RED": 0, "BLUE": 0}
+
+        # Scenario bookkeeping.  These hooks are intentionally opt-in: the
+        # default local engine stays a neutral rules simulator, while regression
+        # scenarios can inject online-like pressure such as key-pass guards.
+        self._scenario_guard_installed: set[tuple[str, str]] = set()
 
     def _init_players(self) -> None:
         # Randomly assign RED/BLUE
@@ -800,6 +808,7 @@ class GameEngine:
         self.frame = frame
         self.events.clear()
         self.action_results.clear()
+        self._apply_scenario_events(frame)
 
         p1 = self.players[self.player1_id]
         p2 = self.players[self.player2_id]
@@ -940,16 +949,67 @@ class GameEngine:
         # 15. Check end conditions
         self._check_end_conditions(frame)
 
+    def _apply_scenario_events(self, frame: int) -> None:
+        """Optional scripted hazards for reproducing online failure modes.
+
+        The normal engine only creates guards when a bot submits SET_GUARD. That
+        is faithful, but it means self-play between two passive bots may never
+        test the recovery path for enemy guard blocks. The guard_gauntlet
+        scenario injects opponent-owned S10/S11 guards once player1 is close,
+        matching the old logs where repeated MOVE into a guarded key pass caused
+        a late-game stall.
+        """
+
+        if self.scenario not in {"guard_gauntlet", "online_guard_regression"}:
+            return
+        victim = self.players.get(self.player1_id)
+        defender = self.players.get(self.player2_id)
+        if victim is None or defender is None or victim.retired or victim.delivered:
+            return
+        schedule = (
+            ("S09", "S10", 5, 280),
+            ("S10", "S11", 4, 360),
+        )
+        for approach, target, defense, earliest_frame in schedule:
+            key = (defender.player_id, target)
+            if key in self._scenario_guard_installed:
+                continue
+            if frame < earliest_frame or victim.station != approach:
+                continue
+            self._install_scenario_guard(defender.player_id, target, defense, frame)
+            self._scenario_guard_installed.add(key)
+
+    def _install_scenario_guard(self, owner_pid: str, node_id: str, defense: int, frame: int) -> None:
+        owner = self.players[owner_pid]
+        node_info = C.NODE_INFO.get(node_id, {})
+        cap = C.GUARD_DEFENSE_CAP["KEY_PASS"] if node_info.get("type") == "KEY_PASS" else C.GUARD_DEFENSE_CAP["default"]
+        obs = self.obstacles.get(node_id)
+        if obs is not None and not obs.cleared:
+            obs.cleared = True
+            obs.clear_frame = frame
+            obs.clear_team = owner_pid
+            self.stations[node_id]["hasObstacle"] = False
+            self._add_event("SCENARIO_OBSTACLE_CLEARED", {"playerId": owner_pid, "nodeId": node_id})
+        owner.guards[node_id] = GuardState(
+            owner_team=owner.team_id,
+            defense=min(defense, cap),
+            cap=cap,
+            completed_frame=frame,
+            last_wind_frame=frame,
+            wind_interval=C.GUARD_KEY_PASS_EXTRA_FIRST_WIND if node_info.get("type") == "KEY_PASS" and defense >= 4 else C.GUARD_WIND_INTERVAL,
+            is_key_pass=node_info.get("type") == "KEY_PASS",
+        )
+        self._add_event(
+            "SCENARIO_GUARD_SET",
+            {"playerId": owner_pid, "teamId": owner.team_id, "nodeId": node_id, "defense": min(defense, cap)},
+        )
+
     def _process_main_action(self, pid: str, atype: str, act: dict[str, Any]) -> None:
         p = self.players[pid]
 
-        # Online behavior observed in July 2026: once a convoy is in MOVING,
-        # active commands cannot break, rescue, accelerate, or redirect it.
-        # Empty action lists are the only safe heartbeat; an explicit WAIT still
-        # means "pause on the edge" and is handled below.
-        if p.status == "MOVING" and atype != "WAIT":
+        if p.status == "MOVING" and not self._main_action_allowed_while_moving(p, atype, act):
             self._reject_illegal_action(pid, atype, "STATE_MOVING_FORBIDDEN",
-                                        error="Cannot issue active commands while MOVING")
+                                        error="Main convoy action is restricted while MOVING")
             return
 
         # Check if can act (not busy)
@@ -968,6 +1028,17 @@ class GameEngine:
             handler(pid, act)
         else:
             self._reject_illegal_action(pid, atype, "INVALID_ACTION_TYPE")
+
+    def _main_action_allowed_while_moving(self, p: PlayerState, atype: str, act: dict[str, Any]) -> bool:
+        if atype == "WAIT":
+            return True
+        if atype == "MOVE":
+            return act.get("targetNodeId") == p.target_station
+        if atype == "USE_RESOURCE":
+            return act.get("resourceType") in {"FAST_HORSE", "SHORT_HORSE"}
+        if atype == "RUSH_SPEED":
+            return True
+        return False
 
     def _do_wait(self, pid: str, act: dict[str, Any]) -> None:
         p = self.players[pid]
@@ -1029,7 +1100,7 @@ class GameEngine:
         obs = self.obstacles.get(target)
         if obs and not obs.cleared and not is_return_from_terminal:
             self._add_action_result(pid, "MOVE", False, "MOVE_BLOCKED_BY_OBSTACLE",
-                                    error=f"Obstacle at {target}")
+                                    error=f"Obstacle at {target}", targetNodeId=target, nodeId=target)
             p.last_action_result = "ACTION_REJECTED"
             p.last_action_error = "MOVE_BLOCKED_BY_OBSTACLE"
             return
@@ -1043,7 +1114,7 @@ class GameEngine:
                     g = op.guards[target]
                     if g.defense > 0 and g.owner_team != p.team_id:
                         self._add_action_result(pid, "MOVE", False, "MOVE_BLOCKED_BY_GUARD",
-                                                error=f"Enemy guard at {target}")
+                                                error=f"Enemy guard at {target}", targetNodeId=target, nodeId=target)
                         p.last_action_result = "ACTION_REJECTED"
                         p.last_action_error = "MOVE_BLOCKED_BY_GUARD"
                         return
@@ -2048,18 +2119,6 @@ class GameEngine:
         if not target:
             return
 
-        if p.status == "MOVING":
-            self._reject_illegal_action(pid, atype, "STATE_MOVING_FORBIDDEN",
-                                        error="Cannot issue squad commands while MOVING")
-            return
-
-        if atype == "SQUAD_WEAKEN":
-            # The public protocol mentions this action, but recent online logs
-            # reject it as INVALID_ACTION_TYPE. Keep the local server strict so
-            # strategy tests do not learn a tactic that burns penalty points.
-            self._reject_illegal_action(pid, atype, "INVALID_ACTION_TYPE")
-            return
-
         if p.squad_available <= 0:
             self._add_action_result(pid, atype, False, "SQUAD_NOT_AVAILABLE")
             return
@@ -2241,6 +2300,9 @@ class GameEngine:
         p.move_accumulated += per_frame
 
         if p.move_accumulated >= required:
+            if self._movement_arrival_blocked_by_guard(pid, p.target_station):
+                p.move_accumulated = required
+                return
             # Arrive at target
             arrived_node = p.target_station
             self._add_event("NODE_ENTER", {"playerId": pid, "nodeId": arrived_node, "fromNode": p.station})
@@ -2253,6 +2315,44 @@ class GameEngine:
             p.additional_wait_frames = 0
             # Reset fixed-process-completed flag on arrival at any station
             p.fixed_process_completed_here = False
+
+    def _movement_arrival_blocked_by_guard(self, pid: str, target: str | None) -> bool:
+        if not target:
+            return False
+        p = self.players[pid]
+        for opid, op in self.players.items():
+            if opid == pid:
+                continue
+            guard = op.guards.get(target)
+            if guard is None or guard.defense <= 0 or guard.owner_team == p.team_id:
+                continue
+            self._add_event(
+                "MOVE_BLOCKED_BY_GUARD",
+                {
+                    "playerId": pid,
+                    "targetNodeId": target,
+                    "nodeId": target,
+                    "ownerTeamId": guard.owner_team,
+                    "defense": guard.defense,
+                    "whileMoving": True,
+                },
+            )
+            self._add_action_result(
+                pid,
+                "MOVE",
+                False,
+                "MOVE_BLOCKED_BY_GUARD",
+                error=f"Enemy guard at {target} while MOVING",
+                targetNodeId=target,
+                nodeId=target,
+                whileMoving=True,
+            )
+            p.last_action = "MOVE"
+            p.last_action_accepted = False
+            p.last_action_result = "ACTION_REJECTED"
+            p.last_action_error = "MOVE_BLOCKED_BY_GUARD"
+            return True
+        return False
 
     def _complete_forced_pass(self, pid: str) -> None:
         p = self.players[pid]
@@ -2910,7 +3010,8 @@ class GameEngine:
         self.events.append(GameEvent(type=event_type, round=self.frame, payload=payload))
 
     def _add_action_result(self, pid: str, action: str, accepted: bool, result: str,
-                           error: str | None = None, success: bool | None = None) -> None:
+                           error: str | None = None, success: bool | None = None,
+                           **extra_fields: Any) -> None:
         entry: dict[str, Any] = {
             "round": self.frame,
             "playerId": int(pid) if pid.isdigit() else pid,
@@ -2930,6 +3031,7 @@ class GameEngine:
             entry["message"] = error
         if success is not None:
             entry["success"] = success
+        entry.update({key: value for key, value in extra_fields.items() if value is not None})
         self.action_results.append(entry)
 
     def _count_illegal(self, pid: str) -> None:

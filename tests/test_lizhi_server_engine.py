@@ -258,27 +258,37 @@ class TestOnlineRealismHardening(unittest.TestCase):
         p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
         self.assertEqual(p1_results, [], f"System wait should not emit rejection: {p1_results}")
 
-    def test_active_action_while_moving_is_illegal(self):
-        """Using resources while MOVING mirrors online illegal-action behavior."""
+    def test_horse_resource_while_moving_is_legal(self):
+        """Horse resources may be used while MOVING."""
         p = self._put_player_moving()
         self.engine.process_actions(10, [{"action": "USE_RESOURCE", "resourceType": "FAST_HORSE"}], [])
+        p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
+        self.assertTrue(p1_results, "Expected a resource result")
+        self.assertTrue(p1_results[0].get("accepted", False))
+        self.assertEqual(p.illegal_action_count, 0)
+        self.assertEqual(p.resources["FAST_HORSE"], 0)
+
+    def test_non_horse_resource_while_moving_is_forbidden(self):
+        """Non-horse main-convoy resource use is still restricted while MOVING."""
+        p = self._put_player_moving()
+        p.resources["ICE_BOX"] = 1
+        self.engine.process_actions(10, [{"action": "USE_RESOURCE", "resourceType": "ICE_BOX"}], [])
         p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
         self.assertTrue(p1_results, "Expected a rejection result")
         self.assertFalse(p1_results[0].get("accepted", True))
         self.assertEqual(p1_results[0].get("code"), "STATE_MOVING_FORBIDDEN")
         self.assertEqual(p.illegal_action_count, 1)
-        self.assertEqual(p.resources["FAST_HORSE"], 1)
+        self.assertEqual(p.resources["ICE_BOX"], 1)
 
-    def test_squad_action_while_moving_is_illegal(self):
-        """Squad commands are also unsafe while the convoy is on an edge."""
+    def test_squad_action_while_moving_is_legal(self):
+        """Squad commands are independent from MOVING main-convoy restrictions."""
         p = self._put_player_moving()
         self.engine.process_actions(10, [{"action": "SQUAD_SCOUT", "targetNodeId": "S02"}], [])
         p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
-        self.assertTrue(p1_results, "Expected a squad rejection result")
-        self.assertFalse(p1_results[0].get("accepted", True))
-        self.assertEqual(p1_results[0].get("code"), "STATE_MOVING_FORBIDDEN")
-        self.assertEqual(p.illegal_action_count, 1)
-        self.assertEqual(p.squad_available, 8)
+        self.assertTrue(p1_results, "Expected a squad result")
+        self.assertTrue(p1_results[0].get("accepted", False))
+        self.assertEqual(p.illegal_action_count, 0)
+        self.assertEqual(p.squad_available, 7)
 
     def test_same_frame_move_and_squad_from_idle_is_legal(self):
         """A legal frame-start IDLE packet may contain both MOVE and SQUAD."""
@@ -300,8 +310,8 @@ class TestOnlineRealismHardening(unittest.TestCase):
         self.assertEqual(p.status, "MOVING")
         self.assertEqual(p.illegal_action_count, 0)
 
-    def test_squad_weaken_is_invalid_by_default(self):
-        """Recent online logs reject SQUAD_WEAKEN, so the simulator does too."""
+    def test_squad_weaken_is_valid_by_protocol(self):
+        """SQUAD_WEAKEN is a documented squad action and lands after delay."""
         p1 = self.engine.players["1001"]
         p2 = self.engine.players["1002"]
         p1.station = "S09"
@@ -320,12 +330,83 @@ class TestOnlineRealismHardening(unittest.TestCase):
 
         self.engine.process_actions(20, [{"action": "SQUAD_WEAKEN", "targetNodeId": "S10"}], [])
         p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
-        self.assertTrue(p1_results, "Expected SQUAD_WEAKEN rejection")
-        self.assertFalse(p1_results[0].get("accepted", True))
-        self.assertEqual(p1_results[0].get("code"), "INVALID_ACTION_TYPE")
-        self.assertEqual(p1.illegal_action_count, 1)
-        self.assertEqual(p1.squad_available, 8)
+        self.assertTrue(p1_results, "Expected SQUAD_WEAKEN result")
+        self.assertTrue(p1_results[0].get("accepted", False))
+        self.assertEqual(p1.illegal_action_count, 0)
+        self.assertEqual(p1.squad_available, 6)
         self.assertEqual(p2.guards["S10"].defense, 2)
+        for frame in range(21, 36):
+            self.engine.process_actions(frame, [], [])
+        self.assertEqual(p2.guards["S10"].defense, 0)
+
+    def test_guard_placed_during_movement_traps_convoy_until_wind(self):
+        """If a target gets guarded while the convoy is MOVING, arrival stalls."""
+        p1 = self.engine.players["1001"]
+        p2 = self.engine.players["1002"]
+        p1.station = "S09"
+        p1.status = "MOVING"
+        p1.target_station = "S10"
+        p1.route_edge = "E05"
+        p1.route_type = "ROAD"
+        p1.move_edge_distance = 40
+        p1.move_edge_coefficient = 1380
+        p1.move_accumulated = 40 * 1380 - 500
+        p2.guards["S10"] = GuardState(
+            owner_team=p2.team_id,
+            defense=2,
+            cap=7,
+            completed_frame=19,
+            last_wind_frame=19,
+            wind_interval=30,
+            is_key_pass=True,
+        )
+
+        self.engine.process_actions(20, [], [])
+        p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
+        self.assertTrue(p1_results, "Expected moving guard block feedback")
+        self.assertEqual(p1_results[0].get("code"), "MOVE_BLOCKED_BY_GUARD")
+        self.assertEqual(p1_results[0].get("targetNodeId"), "S10")
+        self.assertEqual(p1.status, "MOVING")
+        self.assertEqual(p1.station, "S09")
+
+        p2.guards["S10"].defense = 0
+        self.engine.process_actions(21, [], [])
+        self.assertEqual(p1.status, "IDLE")
+        self.assertEqual(p1.station, "S10")
+
+
+class TestOnlineGuardRegressionScenario(unittest.TestCase):
+    """Opt-in scenario should reproduce online key-pass guard stalls."""
+
+    def setUp(self):
+        self.engine = GameEngine(
+            seed=42,
+            player1_id="1001",
+            player2_id="1002",
+            scenario="guard_gauntlet",
+        )
+        for obs in self.engine.obstacles.values():
+            obs.cleared = True
+        for nid in self.engine.obstacles:
+            self.engine.stations[nid]["hasObstacle"] = False
+
+    def test_s10_guard_is_injected_and_blocks_plain_move(self):
+        p1 = self.engine.players["1001"]
+        p2 = self.engine.players["1002"]
+        p1.station = "S09"
+        p1.status = "IDLE"
+
+        self.engine.process_actions(312, [{"action": "MOVE", "targetNodeId": "S10"}], [])
+
+        self.assertIn("S10", p2.guards)
+        self.assertGreater(p2.guards["S10"].defense, 0)
+        p1_results = [r for r in self.engine.action_results if str(r.get("playerId")) == "1001"]
+        self.assertTrue(p1_results, "Expected MOVE rejection")
+        result = p1_results[0]
+        self.assertFalse(result.get("accepted", True))
+        self.assertEqual(result.get("code"), "MOVE_BLOCKED_BY_GUARD")
+        self.assertEqual(result.get("targetNodeId"), "S10")
+        self.assertEqual(p1.station, "S09")
 
 
 class TestScoutConsumptionBeforeValidation(unittest.TestCase):

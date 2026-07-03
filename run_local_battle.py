@@ -213,7 +213,7 @@ def convert_inquire_for_strategy(start_data: dict, player_id: str,
 
 def run_battle(seed: int = 42, player1_id: str = "1001", player2_id: str = "1002",
                log_dir: str = "logs", fast: bool = True,
-               strategy_cls=None) -> dict:
+               strategy_cls=None, scenario: str | None = None) -> dict:
     """Run a full match between two strategies.
 
     Returns the over payload dict with results.
@@ -227,6 +227,7 @@ def run_battle(seed: int = 42, player1_id: str = "1001", player2_id: str = "1002
         seed=seed,
         player1_id=player1_id,
         player2_id=player2_id,
+        scenario=scenario,
     )
 
     # Get start data (same for both players)
@@ -430,6 +431,7 @@ def main() -> int:
     parser.add_argument("--seed-list", type=str, default=None, help="Comma-separated seeds, e.g. 1,2,3,42")
     parser.add_argument("--summary-csv", type=str, default=None, help="CSV output path")
     parser.add_argument("--log-dir", type=str, default="logs", help="Log directory")
+    parser.add_argument("--scenario", type=str, default=None, help="Optional server scenario, e.g. guard_gauntlet")
     args = parser.parse_args()
 
     os.makedirs(args.log_dir, exist_ok=True)
@@ -454,7 +456,7 @@ def main() -> int:
         print(f"Battle {i+1}/{len(seeds)}: Seed={seed}")
         print(f"{'='*60}")
 
-        over = run_battle(seed=seed, log_dir=args.log_dir)
+        over = run_battle(seed=seed, log_dir=args.log_dir, scenario=args.scenario)
         od = over["msg_data"]
         action_counts = over.get("_action_counts", {})
 
