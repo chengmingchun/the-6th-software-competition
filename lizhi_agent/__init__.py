@@ -17,6 +17,18 @@ __all__ = [
 ]
 
 _PROCESS_REQUIRED_CODES = {"PROCESS_REQUIRED", "PROCESS_INTERRUPTED", "INTERRUPTED"}
+_ICE_BOX_REJECT_CODES = {
+    "INVALID_ACTION",
+    "RESOURCE_NOT_APPLICABLE",
+    "RESOURCE_TARGET_INVALID",
+    "RESOURCE_NOT_FOUND",
+    "RESOURCE_NOT_OWNED",
+    "INVALID_TARGET",
+    "NOT_AT_TARGET_NODE",
+    "FRESHNESS_FULL",
+    "RESOURCE_CONDITION_NOT_MET",
+    "RESOURCE_USE_NOT_ALLOWED",
+}
 
 
 def _first_present_from_result(result: dict[str, _Any], payload: dict[str, _Any], state) -> _Any:
@@ -107,26 +119,46 @@ def _patch_strategy_freshness_protection() -> None:
     from .actions import ActionBundle, MainAction, MainActionType
     from . import strategy as _strategy
 
-    original = _strategy.BaselineStrategy._freshness_action
-    if getattr(original, "_score_quality_patched", False):
+    original_freshness = _strategy.BaselineStrategy._freshness_action
+    original_learn = _strategy.BaselineStrategy._learn_error_code
+    if getattr(original_freshness, "_score_quality_patched_v2", False):
         return
+
+    def _icebox_rejected_until(self) -> int:
+        return int(getattr(self, "_rejected_ice_box_until", -1))
 
     def freshness_action_with_score_quality(self, state):
         me = state.me
         if not me.has_resource("ICE_BOX"):
             return None
+        if state.frame < _icebox_rejected_until(self):
+            self.logger.info("resource_skip", resourceType="ICE_BOX", reason="recent_icebox_reject_cooldown", cooldownUntil=_icebox_rejected_until(self), freshness=me.freshness, taskScore=me.task_score_base)
+            return original_freshness(self, state)
         protect_quality = me.task_score_base >= self.config.target_task_score or self._should_lock_delivery(state) or state.phase in _strategy.RUSH_PHASES
         premium_quality = me.task_score_base >= 120 or self._should_lock_delivery(state)
-        if premium_quality and me.freshness <= 98:
+        # Keep ICE_BOX as a quality tool, but do not fire at 98/97 where the
+        # judge may reject it as too early and create a per-frame rejection loop.
+        if premium_quality and me.freshness <= 96:
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_premium_score_quality", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
-        if protect_quality and me.freshness <= 97:
+        if protect_quality and me.freshness <= 95:
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_score_quality", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
-        return original(self, state)
+        return original_freshness(self, state)
 
-    freshness_action_with_score_quality._score_quality_patched = True  # type: ignore[attr-defined]
+    def learn_error_code_with_icebox_cooldown(self, state, action, code, node_id, task_id, resource_type, raw):
+        resource_name = str(resource_type or "")
+        code_text = str(code or "").upper()
+        if action == "USE_RESOURCE" and resource_name == "ICE_BOX" and code_text in _ICE_BOX_REJECT_CODES:
+            until = state.frame + 30
+            setattr(self, "_rejected_ice_box_until", until)
+            self.logger.info("feedback_learn", learned="icebox_rejected", resourceType="ICE_BOX", code=code_text, cooldownUntil=until, result=raw)
+            return
+        return original_learn(self, state, action, code, node_id, task_id, resource_type, raw)
+
+    freshness_action_with_score_quality._score_quality_patched_v2 = True  # type: ignore[attr-defined]
     _strategy.BaselineStrategy._freshness_action = freshness_action_with_score_quality
+    _strategy.BaselineStrategy._learn_error_code = learn_error_code_with_icebox_cooldown
 
 
 def _patch_strategy_speed_resource_usage() -> None:
