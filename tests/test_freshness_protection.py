@@ -21,7 +21,7 @@ class SilentLogger(DecisionLogger):
 
 
 class FreshnessProtectionTest(unittest.TestCase):
-    def test_icebox_protects_score_quality_after_target_score(self) -> None:
+    def test_icebox_waits_at_high_freshness_after_target_score(self) -> None:
         state = GameState(
             frame=220,
             phase="NORMAL",
@@ -36,10 +36,9 @@ class FreshnessProtectionTest(unittest.TestCase):
             ),
         )
         action = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger()).decide(state)
-        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
-        self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
+        self.assertTrue(action.main is None or action.main.action != MainActionType.USE_RESOURCE)
 
-    def test_icebox_protects_premium_score_quality_before_big_drop(self) -> None:
+    def test_icebox_waits_at_high_freshness_even_with_premium_score(self) -> None:
         state = GameState(
             frame=260,
             phase="NORMAL",
@@ -50,6 +49,23 @@ class FreshnessProtectionTest(unittest.TestCase):
                 station="S09",
                 task_score_base=135,
                 freshness=96,
+                resources={"ICE_BOX": 1},
+            ),
+        )
+        action = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger()).decide(state)
+        self.assertTrue(action.main is None or action.main.action != MainActionType.USE_RESOURCE)
+
+    def test_icebox_uses_at_low_freshness_after_target_score(self) -> None:
+        state = GameState(
+            frame=260,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(
+                player_id="1001",
+                status="IDLE",
+                station="S09",
+                task_score_base=120,
+                freshness=74,
                 resources={"ICE_BOX": 1},
             ),
         )

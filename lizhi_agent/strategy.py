@@ -147,7 +147,7 @@ class WindowStrategy:
             if counter is not None:
                 return WindowChoice(counter, "COUNTER_LAST_CARD", f"counter previous opponent card {opponent_card.value}")
         if self._is_opening_fight(state, window, config):
-            options = self._opening_options(state, high_value)
+            options = self._opening_options(state, window, high_value, value)
             card, roll = self._weighted_pick(state, window, options)
             return WindowChoice(card, "OPENING_MIX", f"开局窗口混合策略，候选={self._options_text(options)}", roll)
         options = self._ev_options(state, window, high_value, value)
@@ -166,16 +166,17 @@ class WindowStrategy:
             return False
         return window.window_type in {"TASK", "RESOURCE", "PASS", "UNKNOWN"} or window.resource_type is not None
 
-    def _opening_options(self, state: GameState, high_value: bool) -> list[tuple[WindowCard, int]]:
+    def _opening_options(self, state: GameState, window: WindowState, high_value: bool, value: int) -> list[tuple[WindowCard, int]]:
         me = state.me
+        my_score, opp_score = self._score_state(state, window)
         options: list[tuple[WindowCard, int]] = []
         if me.guard_points > 1 or (high_value and me.guard_points > 0):
             options.append((WindowCard.BING_ZHENG, 28 if high_value else 10))
-        if high_value and me.freshness >= 82 and me.good_fruit >= 75:
+        if high_value and me.freshness >= 82 and me.good_fruit >= 75 and self._should_spend_expensive_window_card(state, window, WindowCard.XIAN_GONG, value, my_score, opp_score, high_value):
             options.append((WindowCard.XIAN_GONG, 42 if high_value else 28))
-        if high_value and (me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")):
+        if high_value and (me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")) and self._should_spend_expensive_window_card(state, window, WindowCard.QIANG_XING, value, my_score, opp_score, high_value):
             options.append((WindowCard.QIANG_XING, 28))
-        if high_value and (me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT")):
+        if high_value and (me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT")) and self._should_spend_expensive_window_card(state, window, WindowCard.YAN_DIE, value, my_score, opp_score, high_value):
             options.append((WindowCard.YAN_DIE, 26))
         if not high_value or me.freshness < 75 or me.good_fruit < 70:
             options.append((WindowCard.ABSTAIN, 60 if not high_value else 18))
@@ -334,7 +335,7 @@ class WindowStrategy:
             for task in state.tasks:
                 if task.id == window.task_id and task.score >= 30:
                     return True
-        if my_score is not None and opp_score is not None and my_score <= opp_score and value >= 60:
+        if my_score is not None and opp_score is not None and my_score <= opp_score and value >= 60 and (ctype in {"TASK", "PASS", "GATE"} or window.task_id):
             return True
         return False
 
@@ -344,8 +345,6 @@ class WindowStrategy:
         if self._is_critical_window(state, window, value, my_score, opp_score):
             return True
         if my_score < opp_score and high_value:
-            return True
-        if card == WindowCard.XIAN_GONG and state.me.good_fruit >= 98 and state.me.freshness >= 96 and value >= 70:
             return True
         return False
 
@@ -470,6 +469,32 @@ class WindowStrategy:
             except ValueError:
                 continue
         return None
+
+    def _opponent_memory_key(self, state: GameState, window: WindowState) -> str:
+        opponent_id = str(state.opponent.player_id) if state.opponent is not None else ""
+        opponent_team = str(state.opponent.team_id) if state.opponent is not None else ""
+        raw = window.raw
+        if not opponent_id:
+            my_team = str(state.me.team_id or "")
+            if my_team == "RED":
+                opponent_id = str(raw.get("bluePlayerId") or "")
+                opponent_team = "BLUE"
+            elif my_team == "BLUE":
+                opponent_id = str(raw.get("redPlayerId") or "")
+                opponent_team = "RED"
+        return opponent_id or opponent_team or "opponent"
+
+    def _remember_opponent_card_profile(self, state: GameState, window: WindowState, card: WindowCard) -> None:
+        memory_key = self._opponent_memory_key(state, window)
+        observation = "|".join([memory_key, str(window.id), str(window.round_index or 1), card.value])
+        if observation in self._seen_opponent_card_observations:
+            return
+        self._seen_opponent_card_observations.add(observation)
+        counts = self._opponent_card_counts.setdefault(memory_key, {})
+        counts[card] = counts.get(card, 0) + 1
+
+    def _opponent_memory(self, state: GameState, window: WindowState) -> dict[WindowCard, int]:
+        return self._opponent_card_counts.get(self._opponent_memory_key(state, window), {})
 
     def _counter_card(self, state: GameState, window: WindowState, opponent_card: WindowCard, high_value: bool, value: int) -> WindowCard | None:
         me = state.me
@@ -1172,15 +1197,6 @@ class BaselineStrategy:
         if state.frame < self._rejected_ice_box_until:
             self.logger.info("resource_use_skip", resourceType="ICE_BOX", reason="recent_icebox_reject_cooldown", cooldownUntil=self._rejected_ice_box_until, freshness=me.freshness, taskScore=me.task_score_base)
             return None
-        if me.task_score_base >= 120 and me.freshness <= 96:
-            self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_premium_score_quality", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
-            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
-        if me.freshness <= 95 and (me.task_score_base >= self.config.target_task_score or state.phase in RUSH_PHASES or self._hot_weather_active(state) or self._weather_forecast(state, "HOT")):
-            self.logger.info("resource_use", resourceType="ICE_BOX", reason="preempt_score_quality_gap", freshness=me.freshness, taskScore=me.task_score_base, phase=state.phase, turnsLeft=state.turns_left)
-            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
-        if me.freshness <= 92 and (me.task_score_base >= 45 or state.turns_left < 420):
-            self.logger.info("resource_use", resourceType="ICE_BOX", reason="early_freshness_protection", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
-            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         if me.freshness <= self.config.critical_freshness_threshold:
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="critical_freshness", freshness=me.freshness)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
@@ -1190,16 +1206,13 @@ class BaselineStrategy:
         if me.freshness <= 82 and (me.task_score_base >= self.config.target_task_score or state.turns_left < 320):
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_quality_before_delivery", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
-        if me.freshness <= 88 and me.task_score_base >= self.config.target_task_score:
-            self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_target_score_quality", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
-            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
-        if me.freshness <= 92 and me.task_score_base >= self.config.target_task_score and (self._weather_forecast(state, "HOT") or state.turns_left < 260):
-            self.logger.info("resource_use", resourceType="ICE_BOX", reason="preempt_hot_or_late_freshness_loss", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
-            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
-        if me.freshness <= 90 and (state.phase in RUSH_PHASES or self._should_lock_delivery(state) or self._hot_weather_active(state)):
+        if (me.freshness <= 88 and (state.phase in RUSH_PHASES or self._should_lock_delivery(state))) or (me.freshness <= 90 and self._hot_weather_active(state)):
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_quality_in_pressure_or_hot", freshness=me.freshness, taskScore=me.task_score_base, phase=state.phase, weather=state.weather.active_types if state.weather else ())
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
-        if me.freshness <= 90 and me.task_score_base >= self.config.competitive_task_score:
+        if me.freshness <= 90 and me.task_score_base >= self.config.target_task_score and (self._weather_forecast(state, "HOT") or state.turns_left < 260):
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="preempt_hot_or_late_freshness_loss", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        if me.freshness <= 86 and me.task_score_base >= self.config.competitive_task_score:
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_high_score_quality", freshness=me.freshness, taskScore=me.task_score_base)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         return None
@@ -1731,32 +1744,6 @@ class BaselineStrategy:
         self.logger.info("squad_eval", action=None, reason="no_valuable_route_scout_target", objective=objective, candidates=candidates)
         return None
 
-    def _opponent_memory_key(self, state: GameState, window: WindowState) -> str:
-        opponent_id = str(state.opponent.player_id) if state.opponent is not None else ""
-        opponent_team = str(state.opponent.team_id) if state.opponent is not None else ""
-        raw = window.raw
-        if not opponent_id:
-            my_team = str(state.me.team_id or "")
-            if my_team == "RED":
-                opponent_id = str(raw.get("bluePlayerId") or "")
-                opponent_team = "BLUE"
-            elif my_team == "BLUE":
-                opponent_id = str(raw.get("redPlayerId") or "")
-                opponent_team = "RED"
-        return opponent_id or opponent_team or "opponent"
-
-    def _remember_opponent_card_profile(self, state: GameState, window: WindowState, card: WindowCard) -> None:
-        memory_key = self._opponent_memory_key(state, window)
-        observation = "|".join([memory_key, str(window.id), str(window.round_index or 1), card.value])
-        if observation in self._seen_opponent_card_observations:
-            return
-        self._seen_opponent_card_observations.add(observation)
-        counts = self._opponent_card_counts.setdefault(memory_key, {})
-        counts[card] = counts.get(card, 0) + 1
-
-    def _opponent_memory(self, state: GameState, window: WindowState) -> dict[WindowCard, int]:
-        return self._opponent_card_counts.get(self._opponent_memory_key(state, window), {})
-
     def _route_support_squad_action(self, state: GameState, *, after_current_action: bool = False) -> SquadAction | None:
         return self._proactive_squad_clear_action(state, after_current_action=after_current_action) or self._squad_scout_action(state, after_current_action=after_current_action)
 
@@ -1769,7 +1756,13 @@ class BaselineStrategy:
             return None
         if not self._can_spend_squad(state, SquadActionType.SQUAD_CLEAR, "proactive_route_obstacle"):
             return None
-        objective = (state.terminal_node if me.verified else state.gate_node) if rush_delivery_lock else self._scout_objective(state, exclude_current_station=after_current_action)
+        if rush_delivery_lock:
+            objective = state.terminal_node if me.verified else state.gate_node
+        else:
+            objective = self._scout_objective(state, exclude_current_station=after_current_action)
+            objective_t04 = self._t04_for_target(state, objective)
+            if after_current_action and objective_t04 is not None and self._can_claim_task_from_station(state, objective_t04, me.station):
+                objective = state.terminal_node if me.verified else state.gate_node
         plan = self.route_planner.plan(state, me.station, objective)
         if plan is None:
             return None

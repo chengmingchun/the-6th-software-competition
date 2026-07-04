@@ -626,7 +626,7 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.PROCESS)
 
-    def test_high_score_uses_ice_box_before_quality_drops_too_far(self) -> None:
+    def test_high_score_waits_on_ice_box_above_pressure_threshold(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
             frame=260,
@@ -642,10 +642,9 @@ class StrategyRouteResourceTest(unittest.TestCase):
             ),
         )
         action = strategy.decide(state)
-        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
-        self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
+        self.assertTrue(action.main is None or action.main.action != MainActionType.USE_RESOURCE)
 
-    def test_target_score_uses_ice_box_at_eighty_eight_freshness(self) -> None:
+    def test_target_score_waits_on_ice_box_at_eighty_eight_freshness_without_pressure(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
             frame=260,
@@ -661,10 +660,9 @@ class StrategyRouteResourceTest(unittest.TestCase):
             ),
         )
         action = strategy.decide(state)
-        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
-        self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
+        self.assertTrue(action.main is None or action.main.action != MainActionType.USE_RESOURCE)
 
-    def test_target_score_uses_ice_box_before_freshness_gap_opens(self) -> None:
+    def test_target_score_waits_on_ice_box_before_freshness_gap_opens(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
             frame=220,
@@ -680,8 +678,7 @@ class StrategyRouteResourceTest(unittest.TestCase):
             ),
         )
         action = strategy.decide(state)
-        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
-        self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
+        self.assertTrue(action.main is None or action.main.action != MainActionType.USE_RESOURCE)
 
     def test_urgent_station_resource_before_task(self) -> None:
         strategy = self.make_strategy()
@@ -787,7 +784,7 @@ class StrategyRouteResourceTest(unittest.TestCase):
                 player_id="1001",
                 status=ConvoyStatus.IDLE,
                 station="S03",
-                freshness=92,
+                freshness=90,
                 task_score_base=90,
                 resources={"ICE_BOX": 1},
             ),
@@ -1634,6 +1631,32 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertIsNotNone(action.main)
         self.assertEqual(action.main.action, MainActionType.FORCED_PASS)
+        self.assertNotEqual(action.squad.action if action.squad else None, SquadActionType.SQUAD_WEAKEN)
+
+    def test_moving_learned_guard_without_public_guard_does_not_squad_weaken(self) -> None:
+        strategy = self.make_strategy()
+        learned = GameState(
+            frame=208,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, squad_available=4),
+            stations={"S09": Station(id="S09")},
+            edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
+            action_results=[{"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD", "targetNodeId": "S09"}],
+        )
+        strategy.decide(learned)
+
+        moving = GameState(
+            frame=209,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.MOVING, station="S08", target="S09", task_score_base=95, squad_available=4),
+            stations={"S09": Station(id="S09")},
+            edges=learned.edges,
+        )
+        action = strategy.decide(moving)
         self.assertNotEqual(action.squad.action if action.squad else None, SquadActionType.SQUAD_WEAKEN)
 
     def test_heavy_enemy_guard_on_mandatory_chokepoint_uses_squad_before_fruit_combo(self) -> None:
