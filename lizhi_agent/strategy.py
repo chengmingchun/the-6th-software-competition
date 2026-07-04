@@ -60,7 +60,7 @@ WINDOW_REJECT_CODES = {
 WINDOW_TERMINAL_STATUSES = {"SUPPRESSED", "RESOLVED", "FINISHED", "FINISH", "ENDED", "END", "CLOSED", "COMPLETED", "COMPLETE", "SETTLED"}
 WINDOW_HARD_MAX_SENDS = 3
 SCOUT_PATH_LOOKAHEAD = 3
-PROACTIVE_CLEAR_MIN_PATH_INDEX = 3
+PROACTIVE_CLEAR_MIN_PATH_INDEX = 2
 PROACTIVE_CLEAR_MAX_PATH_INDEX = 5
 PROACTIVE_CLEAR_HIGH_DETOUR = 10
 INTEL_MAX_ROUTE_DISTANCE = 15
@@ -619,12 +619,12 @@ class BaselineStrategy:
             speed = self._moving_speed_resource_action(state)
             if speed is not None:
                 if squad is not None:
-                    self.logger.info("state_guard", state="MOVING", action="USE_RESOURCE+SQUAD_WEAKEN", target=squad.target, resourceType=speed.main.resource_type if speed.main else None, reason="moving_horse_and_squad_weaken")
-                    return done(ActionBundle(main=speed.main, squad=squad), "moving_horse_and_squad_weaken")
+                    self.logger.info("state_guard", state="MOVING", action=f"USE_RESOURCE+{squad.action.value}", target=squad.target, resourceType=speed.main.resource_type if speed.main else None, reason="moving_horse_and_squad_support")
+                    return done(ActionBundle(main=speed.main, squad=squad), "moving_horse_and_squad_support")
                 return done(speed, "moving_speed_resource")
             if squad is not None:
-                self.logger.info("state_guard", state="MOVING", action="SQUAD_WEAKEN", target=squad.target, reason="moving_squad_weaken_guard")
-                return done(ActionBundle(squad=squad), "moving_squad_weaken_guard")
+                self.logger.info("state_guard", state="MOVING", action=squad.action.value, target=squad.target, reason="moving_squad_support")
+                return done(ActionBundle(squad=squad), "moving_squad_support")
             self.logger.info("state_guard", state="MOVING", action="EMPTY", reason="moving_state_heartbeat")
             return done(wait(f"moving:{getattr(me.status, 'value', me.status)}", active=False), f"moving:{getattr(me.status, 'value', me.status)}")
         if me.status in BUSY_STATES or me.current_process is not None:
@@ -660,23 +660,23 @@ class BaselineStrategy:
                 return done(rush_resource, "use_rush_route_resource")
         if self._need_endgame(state) or self._opponent_pressure(state) or self._must_lock_delivery(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_deadline_delivery_first")
-            scout = self._proactive_squad_clear_action(state) or self._squad_scout_action(state)
+            scout = self._route_support_squad_action(state)
             return done(self._move_towards_delivery(state, squad=scout), "delivery_guard")
         if self._is_station_escape_active(state):
             self.logger.info("stall_breaker", kind="station", station=me.station, stayFrames=self._station_stay_frames(state), escapeUntil=self._station_escape_until.get(me.station or ""), action="MOVE_MAINLINE", reason="当前站点停留过久，暂停本地任务资源，直奔主线")
-            scout = self._proactive_squad_clear_action(state) or self._squad_scout_action(state)
+            scout = self._route_support_squad_action(state)
             return done(self._move_towards_delivery(state, squad=scout), "station_stall_escape")
         urgent_resource = self._best_urgent_station_resource(state)
         if urgent_resource is not None:
-            scout = self._squad_scout_action(state, after_current_action=True)
+            scout = self._route_support_squad_action(state, after_current_action=True)
             return done(self._claim_resource(urgent_resource, squad=scout), f"claim_urgent_resource:{urgent_resource.resource_type}")
         station_task = self._best_station_task(state)
         if station_task is not None:
-            scout = self._squad_scout_action(state, after_current_action=True)
+            scout = self._route_support_squad_action(state, after_current_action=True)
             return done(self._claim_task(station_task, squad=scout), f"claim_task:{station_task.template}:{station_task.id}")
         station_resource = self._best_station_resource(state)
         if station_resource is not None:
-            scout = self._squad_scout_action(state, after_current_action=True)
+            scout = self._route_support_squad_action(state, after_current_action=True)
             return done(self._claim_resource(station_resource, squad=scout), f"claim_resource:{station_resource.resource_type}")
         chokepoint_guard = self._defensive_chokepoint_guard_action(state)
         if chokepoint_guard is not None:
@@ -692,13 +692,13 @@ class BaselineStrategy:
             return done(pre_move_resource, "use_route_resource")
         pressure_ice = self._best_reachable_ice_box(state)
         if pressure_ice is not None:
-            scout = self._proactive_squad_clear_action(state) or self._squad_scout_action(state)
+            scout = self._route_support_squad_action(state)
             return done(self._move_towards_node(state, pressure_ice.station, squad=scout), "move_to_pressure_ice_box")
         if self._should_lock_delivery(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_quality_delivery_first")
-            scout = self._proactive_squad_clear_action(state) or self._squad_scout_action(state)
+            scout = self._route_support_squad_action(state)
             return done(self._move_towards_delivery(state, squad=scout), "delivery_guard")
-        scout = self._proactive_squad_clear_action(state) or self._squad_scout_action(state)
+        scout = self._route_support_squad_action(state)
         route_task = self._best_reachable_task(state)
         if route_task is not None:
             approach = self._task_approach_nodes.get(route_task.id, route_task.target)
@@ -1643,8 +1643,12 @@ class BaselineStrategy:
     def _squad_reserve(self, state: GameState, action: SquadActionType, purpose: str) -> int:
         if purpose in {"late_aggressive_reinforce", "moving_guard_rescue"}:
             return 0
-        if purpose in {"blocked_route_obstacle", "proactive_route_obstacle"}:
+        if purpose == "blocked_route_obstacle":
             return 4 if state.me.task_score_base < self.config.target_task_score and self._has_uncrossed_critical_pass(state) else 0
+        if purpose == "proactive_route_obstacle":
+            if state.me.task_score_base >= self.config.target_task_score or self._need_endgame(state) or self._must_lock_delivery(state) or self._should_lock_delivery(state):
+                return 0
+            return 1 if self._has_uncrossed_critical_pass(state) else 0
         if action == SquadActionType.SQUAD_REINFORCE and self._can_attack_with_spare_squad(state):
             return 0
         if (
@@ -1693,13 +1697,19 @@ class BaselineStrategy:
         self.logger.info("squad_eval", action=None, reason="no_valuable_route_scout_target", objective=objective, candidates=candidates)
         return None
 
-    def _proactive_squad_clear_action(self, state: GameState) -> SquadAction | None:
+    def _route_support_squad_action(self, state: GameState, *, after_current_action: bool = False) -> SquadAction | None:
+        return self._proactive_squad_clear_action(state, after_current_action=after_current_action) or self._squad_scout_action(state, after_current_action=after_current_action)
+
+    def _proactive_squad_clear_action(self, state: GameState, *, after_current_action: bool = False) -> SquadAction | None:
         me = state.me
-        if state.phase in RUSH_PHASES or me.station is None:
+        if me.station is None:
+            return None
+        rush_delivery_lock = state.phase in RUSH_PHASES and (self._need_endgame(state) or self._must_lock_delivery(state) or self._should_lock_delivery(state))
+        if state.phase in RUSH_PHASES and not rush_delivery_lock:
             return None
         if not self._can_spend_squad(state, SquadActionType.SQUAD_CLEAR, "proactive_route_obstacle"):
             return None
-        objective = self._current_route_objective(state)
+        objective = (state.terminal_node if me.verified else state.gate_node) if rush_delivery_lock else self._scout_objective(state, exclude_current_station=after_current_action)
         plan = self.route_planner.plan(state, me.station, objective)
         if plan is None:
             return None
