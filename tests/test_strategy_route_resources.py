@@ -680,6 +680,92 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertTrue(action.main is None or action.main.action != MainActionType.USE_RESOURCE)
 
+    def test_high_score_delivery_lock_uses_ice_box_at_eighty_eight_freshness(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=240,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S08",
+                freshness=88,
+                task_score_base=120,
+                resources={"ICE_BOX": 1},
+            ),
+            edges=[
+                RouteEdge(id="E1", start="S08", end="S09", distance=4),
+                RouteEdge(id="E2", start="S09", end="S14", distance=4),
+                RouteEdge(id="E3", start="S14", end="S15", distance=2),
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
+        self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
+
+    def test_normal_midgame_does_not_use_ice_box_at_eighty_eight_point_six(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S03",
+                freshness=88.6,
+                task_score_base=60,
+                resources={"ICE_BOX": 1},
+            ),
+        )
+        action = strategy.decide(state)
+        self.assertTrue(action.main is None or action.main.action != MainActionType.USE_RESOURCE)
+
+    def test_target_score_uses_ice_box_at_eighty_two_freshness(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=260,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S03",
+                freshness=82,
+                task_score_base=90,
+                resources={"ICE_BOX": 1},
+            ),
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
+        self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
+
+    def test_hot_weather_low_score_with_time_does_not_use_ice_box(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S03",
+                freshness=90,
+                task_score_base=20,
+                resources={"ICE_BOX": 1},
+            ),
+            edges=[
+                RouteEdge(id="E1", start="S03", end="S14", distance=2),
+                RouteEdge(id="E2", start="S14", end="S15", distance=2),
+            ],
+            weather=WeatherState(active_types=("HOT",)),
+        )
+        action = strategy.decide(state)
+        self.assertTrue(action.main is None or action.main.action != MainActionType.USE_RESOURCE)
+
     def test_urgent_station_resource_before_task(self) -> None:
         strategy = self.make_strategy()
         state = GameState(

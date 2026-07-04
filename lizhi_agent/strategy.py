@@ -1206,8 +1206,21 @@ class BaselineStrategy:
         if me.freshness <= 82 and (me.task_score_base >= self.config.target_task_score or state.turns_left < 320):
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_quality_before_delivery", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
-        if (me.freshness <= 88 and (state.phase in RUSH_PHASES or self._should_lock_delivery(state))) or (me.freshness <= 90 and self._hot_weather_active(state)):
-            self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_quality_in_pressure_or_hot", freshness=me.freshness, taskScore=me.task_score_base, phase=state.phase, weather=state.weather.active_types if state.weather else ())
+        remaining_delivery = self._remaining_delivery_cost(state)
+        if (
+            me.task_score_base >= 120
+            and me.freshness <= 88
+            and (
+                self._should_lock_delivery(state)
+                or self._need_endgame(state)
+                or state.phase in RUSH_PHASES
+                or remaining_delivery >= 6
+            )
+        ):
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_high_score_delivery_quality", freshness=me.freshness, taskScore=me.task_score_base, remainingCost=remaining_delivery, phase=state.phase, turnsLeft=state.turns_left)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        if me.freshness <= 90 and self._hot_weather_active(state) and (me.task_score_base >= self.config.target_task_score // 2 or self._should_lock_delivery(state) or self._need_endgame(state)):
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_quality_in_hot_weather", freshness=me.freshness, taskScore=me.task_score_base, phase=state.phase, weather=state.weather.active_types if state.weather else ())
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         if me.freshness <= 90 and me.task_score_base >= self.config.target_task_score and (self._weather_forecast(state, "HOT") or state.turns_left < 260):
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="preempt_hot_or_late_freshness_loss", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
