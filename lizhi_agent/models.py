@@ -530,7 +530,7 @@ def _parse_edges(start_data: dict[str, Any], inquire_data: dict[str, Any]) -> li
             start=str(start),
             end=str(end),
             route_type=str(_first_present(item, "routeType", "type", default="ROAD")),
-            distance=max(1, _as_int(_first_present(item, "distance", "length", default=1), 1)),
+            distance=max(1, _as_int(_first_present(item, "distance", "length", "dist", default=1), 1)),
             bidirectional=bidirectional,
         ))
     return edges

@@ -6,6 +6,10 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from tools.audit_report import avg, load_rows, pct
 
 
@@ -34,6 +38,7 @@ def default_rules(side: str, *, strict: bool = False) -> list[GateRule]:
     idle_limit = 0.5 if strict else 2.0
     rejected_limit = 0.5 if strict else 2.0
     high_value_abstain_limit = 1.0 if strict else 4.0
+    guard_block_streak_limit = 2.0 if strict else 4.0
     ice_unused_limit = 2.0 if strict else 8.0
     horse_unused_limit = 3.0 if strict else 10.0
     intel_unused_limit = 3.0 if strict else 10.0
@@ -42,6 +47,7 @@ def default_rules(side: str, *, strict: bool = False) -> list[GateRule]:
         GateRule(side, "deliveredPct", ">=", min_deliver, "送达率不足"),
         GateRule(side, "idleEmptyCount", "<=", idle_limit, "IDLE 空动作过多"),
         GateRule(side, "rejectedActionCount", "<=", rejected_limit, "无效动作过多"),
+        GateRule(side, "maxGuardBlockedMoveStreak", "<=", guard_block_streak_limit, "MOVE 被守卫连续阻塞过多"),
         GateRule(side, "highValueAbstainCount", "<=", high_value_abstain_limit, "高价值窗口弃权过多"),
         GateRule(side, "iceBoxUnusedLowFreshnessFrames", "<=", ice_unused_limit, "低鲜度持有 ICE_BOX 未用过多"),
         GateRule(side, "horseUnusedWhileMovingFrames", "<=", horse_unused_limit, "停顿可行动时持有马未用过多"),

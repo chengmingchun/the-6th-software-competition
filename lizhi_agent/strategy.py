@@ -36,7 +36,8 @@ TASK_TEMPLATE_REJECT_CODES = {"TASK_CONDITION_NOT_MET", "TASK_REQUIREMENT_NOT_ME
 TASK_TAKEN_REJECT_CODES = {"TASK_ALREADY_TAKEN", "ALREADY_TAKEN", "TASK_NOT_AVAILABLE", "TASK_NOT_FOUND"}
 SHORT_BUSY_COOLDOWN_FRAMES = 5
 GUARD_BLOCKED_COOLDOWN_FRAMES = 28
-GUARD_MEMORY_TTL_FRAMES = 90
+GUARD_MEMORY_TTL_FRAMES = 60
+KEY_GUARD_MEMORY_TTL_FRAMES = 90
 ICE_BOX_REJECT_CODES = {
     "INVALID_ACTION",
     "RESOURCE_NOT_APPLICABLE",
@@ -163,7 +164,7 @@ class WindowStrategy:
             if loss_streak >= 1:
                 options = self._bias_options_against_memory(state, window, options)
             card, roll = self._weighted_pick(state, window, options)
-            return WindowChoice(card, "OPENING_MIX", f"开局窗口混合策略，候选={self._options_text(options)}", roll)
+            return WindowChoice(card, "OPENING_MIX", f"opening window mix, options={self._options_text(options)}", roll)
         options = self._ev_options(state, window, high_value, value)
         if loss_streak >= 1:
             options = self._bias_options_against_memory(state, window, options)
@@ -675,6 +676,7 @@ class BaselineStrategy:
         self._rejected_task_templates_until: dict[str, int] = {}
         self._rejected_t04_targets_until: dict[str, int] = {}
         self._rejected_ice_box_until = -1
+        self._rejected_resource_use_until: dict[str, int] = {}
         self._task_approach_nodes: dict[str, str] = {}
         self._last_attempted_task: tuple[int, str] | None = None
         self._last_attempted_resource: tuple[int, str, str] | None = None
@@ -738,7 +740,7 @@ class BaselineStrategy:
         seen = self._window_seen.get(object_key, 0) + 1
         self._window_seen[object_key] = seen
         if object_key in self._suppressed_window_keys or status in WINDOW_TERMINAL_STATUSES:
-            self.logger.info("stall_breaker", kind="window", station=window.target or state.me.station, objectKey=object_key, action="SUPPRESS", reason="窗口已熔断/已结束，不再发送 WINDOW_CARD")
+            self.logger.info("stall_breaker", kind="window", station=window.target or state.me.station, objectKey=object_key, action="SUPPRESS", reason="window_suppressed", suppressReason="terminal_or_already_suppressed")
             return None, None
         if seen > WINDOW_HARD_MAX_SENDS or window.round_index > 3:
             self._suppress_window(object_key, state, f"window_repeated:{seen}:roundIndex={window.round_index}")
@@ -753,7 +755,7 @@ class BaselineStrategy:
     def _suppress_window(self, object_key: str, state: GameState, reason: str) -> None:
         self._suppressed_window_keys.add(object_key)
         self._cooldown_object(state, object_key, reason)
-        self.logger.info("stall_breaker", kind="window", station=state.me.station, objectKey=object_key, action="SUPPRESS", reason=f"窗口熔断：{reason}；后续不再发送 WINDOW_CARD/ABSTAIN")
+        self.logger.info("stall_breaker", kind="window", station=state.me.station, objectKey=object_key, action="SUPPRESS", reason="window_suppressed", suppressReason=reason)
 
     def _attach_window(self, bundle: ActionBundle, window: WindowAction | None) -> ActionBundle:
         if window is None or bundle.window is not None:
@@ -805,8 +807,11 @@ class BaselineStrategy:
                     return done(gate_intel, "use_intel_before_verify")
                 if self._can_verify_gate(state):
                     return done(self._verify_action(state), "verify_gate")
-                return done(wait("at_gate_before_rush", active=False), "at_gate_before_rush")
+                return done(wait("at_gate_before_rush", active=True), "at_gate_before_rush")
             return done(self._move_to(state, state.terminal_node), "gate_to_terminal")
+        pre_process_intel = self._pre_process_intel_action(state)
+        if pre_process_intel is not None:
+            return done(pre_process_intel, "use_intel_before_process")
         fixed_process = self._fixed_process_action(state)
         if fixed_process is not None:
             return done(fixed_process, "fixed_process")
@@ -821,6 +826,8 @@ class BaselineStrategy:
             pressure_ice = self._best_reachable_ice_box(state)
             if pressure_ice is not None:
                 scout = self._route_support_squad_action(state)
+                if pressure_ice.station == me.station:
+                    return done(self._claim_resource(pressure_ice, squad=scout), "claim_pressure_ice_box")
                 return done(self._move_towards_node(state, pressure_ice.station, squad=scout), "move_to_pressure_ice_box")
         catchup_task = self._race_catchup_task_action(state)
         if catchup_task is not None:
@@ -833,7 +840,7 @@ class BaselineStrategy:
             scout = self._route_support_squad_action(state)
             return done(self._move_towards_delivery(state, squad=scout), "delivery_guard")
         if self._is_station_escape_active(state):
-            self.logger.info("stall_breaker", kind="station", station=me.station, stayFrames=self._station_stay_frames(state), escapeUntil=self._station_escape_until.get(me.station or ""), action="MOVE_MAINLINE", reason="当前站点停留过久，暂停本地任务资源，直奔主线")
+            self.logger.info("stall_breaker", kind="station", station=me.station, stayFrames=self._station_stay_frames(state), escapeUntil=self._station_escape_until.get(me.station or ""), action="MOVE_MAINLINE", reason="station_stall_escape_to_mainline")
             scout = self._route_support_squad_action(state)
             return done(self._move_towards_delivery(state, squad=scout), "station_stall_escape")
         urgent_resource = self._best_urgent_station_resource(state)
@@ -863,6 +870,8 @@ class BaselineStrategy:
         pressure_ice = self._best_reachable_ice_box(state)
         if pressure_ice is not None:
             scout = self._route_support_squad_action(state)
+            if pressure_ice.station == me.station:
+                return done(self._claim_resource(pressure_ice, squad=scout), "claim_pressure_ice_box")
             return done(self._move_towards_node(state, pressure_ice.station, squad=scout), "move_to_pressure_ice_box")
         if self._should_lock_delivery(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_quality_delivery_first")
@@ -991,12 +1000,20 @@ class BaselineStrategy:
             self._scout_dispatched.discard(node)
             self.logger.info("feedback_learn", learned="intel_target_rejected", resourceType=resource_name, nodeId=node, code=code, result=raw)
             return
+        if action == "USE_RESOURCE" and resource_name:
+            until = state.frame + 30
+            self._rejected_resource_use_until[resource_name] = max(self._rejected_resource_use_until.get(resource_name, 0), until)
+            self.logger.info("feedback_learn", learned="resource_use_rejected", resourceType=resource_name, code=code, cooldownUntil=until, result=raw)
+            return
         if code == "OBJECT_BUSY":
             self._short_busy_cooldown(state, action, node, task_id, resource_name)
             if action in {"PROCESS", "DOCK"}:
                 self._pending_process_until.pop(node, None)
                 self._pending_process_started_at.pop(node, None)
                 self.logger.info("feedback_learn", learned="object_busy_process_cooldown", nodeId=node, code=code, result=raw)
+                return
+            if action == "CLAIM_RESOURCE":
+                self.logger.info("feedback_learn", learned="resource_object_busy_short_cooldown", nodeId=node, resourceType=resource_name, code=code, result=raw)
                 return
         if code in PROCESS_RETRY_CODES:
             if node:
@@ -1054,7 +1071,7 @@ class BaselineStrategy:
             self._blocked_guard_last_frame[node] = state.frame
             until = state.frame + GUARD_BLOCKED_COOLDOWN_FRAMES
             self._guard_blocked_until[node] = max(self._guard_blocked_until.get(node, 0), until)
-            self.logger.info("feedback_learn", learned="move_blocked_by_guard", nodeId=node, count=current + 1, code=code, guardBlockedUntil=until, guardMemoryLastFrame=state.frame, guardMemoryTtl=GUARD_MEMORY_TTL_FRAMES, result=raw)
+            self.logger.info("feedback_learn", learned="move_blocked_by_guard", nodeId=node, count=current + 1, code=code, guardBlockedUntil=until, guardMemoryLastFrame=state.frame, guardMemoryTtl=self._guard_memory_ttl(state, node), result=raw)
         if action in {"FORCED_PASS", "BREAK_GUARD", "CLEAR"} and code == "NO_BLOCKER":
             blocker_node = node
             if self._last_attempted_blocker_action is not None:
@@ -1115,9 +1132,9 @@ class BaselineStrategy:
             self._last_attempted_resource = (state.frame, bundle.main.target, bundle.main.resource_type)
         elif bundle.main.action == MainActionType.MOVE and bundle.main.target:
             self._last_attempted_move = (state.frame, bundle.main.target)
-        elif bundle.main.action == MainActionType.USE_RESOURCE and bundle.main.resource_type and bundle.main.target:
-            self._last_attempted_use_resource = (state.frame, bundle.main.target, bundle.main.resource_type)
-            if bundle.main.resource_type == "INTEL":
+        elif bundle.main.action == MainActionType.USE_RESOURCE and bundle.main.resource_type:
+            self._last_attempted_use_resource = (state.frame, bundle.main.target or "", bundle.main.resource_type)
+            if bundle.main.resource_type == "INTEL" and bundle.main.target:
                 self._scout_dispatched.add(bundle.main.target)
         elif bundle.main.action in {MainActionType.FORCED_PASS, MainActionType.BREAK_GUARD, MainActionType.CLEAR} and bundle.main.target:
             self._last_attempted_blocker_action = (state.frame, bundle.main.action.value, bundle.main.target)
@@ -1261,20 +1278,20 @@ class BaselineStrategy:
                 startedAt=started_at,
                 frame=state.frame,
                 graceFrames=self.config.process_start_grace_frames,
-                reason="PROCESS 已提交但服务端未显示处理中，解锁重试，避免南岭驿原地空等",
+                reason="process_submitted_but_server_not_processing_retry",
             )
             self._pending_process_until.pop(station, None)
             self._pending_process_started_at.pop(station, None)
             return None
         if state.frame <= until:
             wait_reason = (
-                "服务端已显示处理中，等待 PROCESS_COMPLETE，不重复提交，不移动离站"
+                "server_processing_wait_for_process_complete"
                 if server_confirms_processing
-                else "PROCESS 刚提交，短暂等待服务端进入处理中"
+                else "process_recently_submitted_wait_for_server_state"
             )
             self.logger.info("process_pending_wait", station=station, startedAt=started_at, until=until, confirmed=server_confirms_processing, reason=wait_reason)
             return wait("pending_process", active=False)
-        self.logger.info("process_pending_timeout", station=station, startedAt=started_at, until=until, reason="等待超时，允许重新提交 PROCESS")
+        self.logger.info("process_pending_timeout", station=station, startedAt=started_at, until=until, reason="process_pending_timeout_allow_retry")
         self._pending_process_until.pop(station, None)
         self._pending_process_started_at.pop(station, None)
         return None
@@ -1446,6 +1463,7 @@ class BaselineStrategy:
         if extra_cost > max_extra:
             return None
         next_hop = str(best["path"][1])
+        objective = state.gate_node
         scout = self._route_support_squad_action(state)
         self.logger.info(
             "route_package_eval",
@@ -1458,9 +1476,10 @@ class BaselineStrategy:
             scoreGap=score_gap,
             extraCost=extra_cost,
             nextHop=next_hop,
+            objective=objective,
             reason="high_task_score_route_package",
         )
-        return self._move_towards_node(state, next_hop, squad=scout)
+        return self._move_to_next_hop_with_objective(state, next_hop, objective, squad=scout)
 
     def _route_packages_to_gate(self, state: GameState) -> list[dict[str, Any]]:
         me = state.me
@@ -1507,12 +1526,29 @@ class BaselineStrategy:
             station = state.station(end)
             if station is not None:
                 if station.has_obstacle:
-                    cost += 12
+                    cost += self._route_package_obstacle_penalty(state, end)
                 if station.has_enemy_guard(state.me.team_id):
-                    cost += 10 + station.guard_defense * 5
+                    cost += self._route_package_guard_penalty(state, end, station.guard_defense, learned=False)
             if self._is_learned_guard_blocked(state, end):
-                cost += 25
+                guard_defense = station.guard_defense if station is not None else 0
+                cost += self._route_package_guard_penalty(state, end, guard_defense, learned=True)
         return cost + self._path_task_process_cost(state, path)
+
+    def _route_package_obstacle_penalty(self, state: GameState, target: str) -> int:
+        penalty = 12
+        if self._is_key_chokepoint_for_state(state, target):
+            penalty += 16
+            if state.me.squad_available < SQUAD_COST[SquadActionType.SQUAD_CLEAR]:
+                penalty += 12
+        return penalty
+
+    def _route_package_guard_penalty(self, state: GameState, target: str, guard_defense: int, *, learned: bool) -> int:
+        penalty = (25 if learned else 10) + max(0, guard_defense) * 5
+        if self._is_key_chokepoint_for_state(state, target):
+            penalty += 25
+            if state.me.squad_available < SQUAD_COST[SquadActionType.SQUAD_WEAKEN]:
+                penalty += 20
+        return penalty
 
     def _path_route_type(self, state: GameState, path: tuple[str, ...]) -> str:
         counts: dict[str, int] = {}
@@ -1681,10 +1717,10 @@ class BaselineStrategy:
             return None
         target = self._current_route_objective(state)
         remaining_cost = self.route_planner.estimate_frames(state, me.station, target)
-        if remaining_cost >= 5 and me.has_resource("FAST_HORSE"):
+        if remaining_cost >= 5 and me.has_resource("FAST_HORSE") and not self._is_resource_use_on_cooldown(state, "FAST_HORSE"):
             self.logger.info("resource_use", resourceType="FAST_HORSE", reason="pre_move_long_route", target=target, remainingCost=remaining_cost)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="FAST_HORSE"))
-        if remaining_cost >= 3 and me.has_resource("SHORT_HORSE") and (me.task_score_base >= 60 or state.turns_left < 420):
+        if remaining_cost >= 3 and me.has_resource("SHORT_HORSE") and not self._is_resource_use_on_cooldown(state, "SHORT_HORSE") and (me.task_score_base >= 60 or state.turns_left < 420):
             self.logger.info("resource_use", resourceType="SHORT_HORSE", reason="pre_move_medium_route", target=target, remainingCost=remaining_cost)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="SHORT_HORSE"))
         return None
@@ -1701,10 +1737,10 @@ class BaselineStrategy:
         if leg_cost <= 0:
             leg_cost = self.route_planner.estimate_frames(state, me.target, state.gate_node)
         remaining_cost = self._remaining_delivery_cost(state)
-        if me.has_resource("FAST_HORSE") and (leg_cost >= 4 or remaining_cost >= 8 or self._need_endgame(state)):
+        if me.has_resource("FAST_HORSE") and not self._is_resource_use_on_cooldown(state, "FAST_HORSE") and (leg_cost >= 4 or remaining_cost >= 8 or self._need_endgame(state)):
             self.logger.info("resource_use", resourceType="FAST_HORSE", reason="moving_allowed_horse_long_leg", target=me.target, legCost=leg_cost, remainingCost=remaining_cost)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="FAST_HORSE"))
-        if me.has_resource("SHORT_HORSE") and (leg_cost >= 3 or remaining_cost >= 6 or self._need_endgame(state)):
+        if me.has_resource("SHORT_HORSE") and not self._is_resource_use_on_cooldown(state, "SHORT_HORSE") and (leg_cost >= 3 or remaining_cost >= 6 or self._need_endgame(state)):
             self.logger.info("resource_use", resourceType="SHORT_HORSE", reason="moving_allowed_horse_medium_leg", target=me.target, legCost=leg_cost, remainingCost=remaining_cost)
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="SHORT_HORSE"))
         return None
@@ -1824,6 +1860,35 @@ class BaselineStrategy:
             return None
         self.logger.info("resource_use", resourceType="INTEL", reason="gate_verify_scout_marker", target=state.gate_node)
         return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, target=state.gate_node, resource_type="INTEL"))
+
+    def _pre_process_intel_action(self, state: GameState) -> ActionBundle | None:
+        me = state.me
+        station_id = me.station
+        if not me.has_resource("INTEL") or me.status not in PLANNING_STATES or station_id is None:
+            return None
+        station = state.station(station_id)
+        if station is None or not station.process_type or station.process_type == "VERIFY" or station.process_round <= 0:
+            return None
+        if station_id in self._completed_fixed_process_nodes or station_id in self._pending_process_until:
+            return None
+        if station_id in self._scout_dispatched or self._has_own_scout_marker(state, station_id):
+            return None
+        if self._is_object_on_cooldown(state, self._intel_object_key(station_id)):
+            self.logger.info("resource_use_skip", resourceType="INTEL", reason="process_target_reject_cooldown", target=station_id)
+            return None
+        if not self._intel_target_in_range(state, station_id):
+            self.logger.info("resource_use_skip", resourceType="INTEL", reason="process_target_too_far", target=station_id)
+            return None
+        route_critical = station_id in {"S11", "S13"} or self._should_lock_delivery(state) or self._must_lock_delivery(state) or self._need_endgame(state) or state.phase in RUSH_PHASES
+        worthwhile = (
+            me.task_score_base >= self.config.target_task_score
+            or route_critical
+            or (station.process_round >= 6 and state.frame >= 180)
+        )
+        if not worthwhile:
+            return None
+        self.logger.info("resource_use", resourceType="INTEL", reason="fixed_process_scout_marker", target=station_id, processType=station.process_type, processRound=station.process_round)
+        return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, target=station_id, resource_type="INTEL"))
 
     def _fixed_process_action(self, state: GameState) -> ActionBundle | None:
         station_id = state.me.station
@@ -2797,7 +2862,7 @@ class BaselineStrategy:
             return
         until = state.frame + self.config.station_escape_frames
         self._station_escape_until[station] = until
-        self.logger.info("stall_breaker", kind="station", station=station, stayFrames=stay_frames, escapeUntil=until, action="ARM_ESCAPE", reason="同一站点停留过久，疑似任务/资源争抢循环")
+        self.logger.info("stall_breaker", kind="station", station=station, stayFrames=stay_frames, escapeUntil=until, action="ARM_ESCAPE", reason="same_station_stall_possible_task_or_resource_loop")
 
     def _station_stay_frames(self, state: GameState) -> int:
         if self._station_since_frame is None:
@@ -2848,6 +2913,16 @@ class BaselineStrategy:
         if state.frame <= until:
             return True
         self._object_cooldown_until.pop(object_key, None)
+        return False
+
+    def _is_resource_use_on_cooldown(self, state: GameState, resource_type: str) -> bool:
+        until = self._rejected_resource_use_until.get(resource_type)
+        if until is None:
+            return False
+        if state.frame <= until:
+            self.logger.info("resource_use_skip", resourceType=resource_type, reason="recent_resource_use_reject_cooldown", cooldownUntil=until)
+            return True
+        self._rejected_resource_use_until.pop(resource_type, None)
         return False
 
     def _task_object_key(self, task_id: str) -> str:
@@ -2933,7 +3008,7 @@ class BaselineStrategy:
                 self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=next_hop, reason="push_delivery_live_guard_trap")
             elif not self._must_lock_delivery(state) and state.phase not in RUSH_PHASES:
                 self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=None, avoided=next_hop, reason="wait_live_guard_trap")
-                return wait("wait_live_guard_trap", active=False)
+                return wait("wait_live_guard_trap", active=True)
         # Learned guard: try alternate before safety gate
         if self._has_learned_guard(state, next_hop) or self._guard_blocked_until.get(next_hop, -1) > state.frame:
             for neighbor in state.neighbors(state.me.station):
@@ -2951,7 +3026,7 @@ class BaselineStrategy:
         station = state.station(next_hop)
         if self._squad_weaken_until.get(next_hop, -1) > state.frame:
             self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="WAIT", reason="wait_squad_weaken_arrival_before_move", until=self._squad_weaken_until[next_hop])
-            return wait("wait_squad_weaken", active=False)
+            return wait("wait_squad_weaken", active=True)
         if self._no_blocker_until.get(next_hop, -1) > state.frame:
             self.logger.info("blocker_decision", target=next_hop, blocker="stale", action="MOVE", reason="recent_no_blocker_feedback")
             return ActionBundle(main=MainAction(MainActionType.MOVE, target=next_hop), squad=squad)
@@ -2960,6 +3035,52 @@ class BaselineStrategy:
             if gate is not None:
                 return gate
         self.logger.info("move_decision", fromNode=state.me.station, target=next_hop, action="MOVE")
+        return ActionBundle(main=MainAction(MainActionType.MOVE, target=next_hop), squad=squad)
+
+    def _move_to_next_hop_with_objective(self, state: GameState, next_hop: str, objective: str, squad: SquadAction | None = None) -> ActionBundle:
+        if state.me.station is None:
+            return wait("unknown_station", active=False)
+        if self._is_live_guard_trap_risk(state, next_hop):
+            alternate = self._alternate_next_hop_avoiding_live_trap(state, objective, next_hop)
+            if alternate is not None:
+                self.logger.info("route_decision", fromNode=state.me.station, target=objective, nextHop=alternate, avoided=next_hop, reason="route_package_avoid_live_guard_trap")
+                next_hop = alternate
+            elif objective in {state.gate_node, state.terminal_node} and (
+                (next_hop in {"S10", "S11", state.gate_node} and self._next_hop_is_mandatory(state, objective, next_hop))
+                or state.me.task_score_base < self.config.target_task_score // 2
+                or self._station_stay_frames(state) >= 12
+                or self._need_endgame(state)
+                or self._must_lock_delivery(state)
+                or state.phase in RUSH_PHASES
+            ):
+                self.logger.info("route_decision", fromNode=state.me.station, target=objective, nextHop=next_hop, reason="route_package_push_live_guard_trap")
+            elif not self._must_lock_delivery(state) and state.phase not in RUSH_PHASES:
+                self.logger.info("route_decision", fromNode=state.me.station, target=objective, nextHop=None, avoided=next_hop, reason="route_package_wait_live_guard_trap")
+                return wait("wait_live_guard_trap", active=True)
+        if self._has_learned_guard(state, next_hop) or self._guard_blocked_until.get(next_hop, -1) > state.frame:
+            for neighbor in state.neighbors(state.me.station):
+                if neighbor == next_hop or self._has_learned_guard(state, neighbor) or self._guard_blocked_until.get(neighbor, -1) > state.frame:
+                    continue
+                station = state.station(neighbor)
+                if station is not None and station.has_obstacle:
+                    continue
+                plan = self.route_planner.plan(state, neighbor, objective, forbidden_nodes=frozenset({next_hop}))
+                if plan is not None and next_hop not in plan.path and state.me.station not in plan.path[1:]:
+                    self.logger.info("route_decision", fromNode=state.me.station, target=objective, nextHop=neighbor, avoided=next_hop, reason="route_package_avoid_learned_or_cooling_guard")
+                    next_hop = neighbor
+                    break
+        station = state.station(next_hop)
+        if self._squad_weaken_until.get(next_hop, -1) > state.frame:
+            self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="WAIT", reason="wait_squad_weaken_arrival_before_route_package_move", until=self._squad_weaken_until[next_hop])
+            return wait("wait_squad_weaken", active=True)
+        if self._no_blocker_until.get(next_hop, -1) > state.frame:
+            self.logger.info("blocker_decision", target=next_hop, blocker="stale", action="MOVE", reason="recent_no_blocker_feedback_route_package")
+            return ActionBundle(main=MainAction(MainActionType.MOVE, target=next_hop), squad=squad)
+        if self._has_learned_guard(state, next_hop) or self._guard_blocked_until.get(next_hop, -1) > state.frame or (station is not None and (station.has_obstacle or station.has_enemy_guard(state.me.team_id))):
+            gate = self._pre_move_safety_gate(state, next_hop, objective, squad)
+            if gate is not None:
+                return gate
+        self.logger.info("move_decision", fromNode=state.me.station, target=next_hop, objective=objective, action="MOVE", reason="route_package_next_hop")
         return ActionBundle(main=MainAction(MainActionType.MOVE, target=next_hop), squad=squad)
 
     def _pre_move_safety_gate(self, state: GameState, next_hop: str, objective: str,
@@ -2972,11 +3093,11 @@ class BaselineStrategy:
         """
         station = state.station(next_hop)
         me = state.me
-        # ── Obstacle ──
+        # Obstacle
         if station is not None and station.has_obstacle:
             if self._squad_clear_until.get(next_hop, -1) > state.frame:
                 self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="WAIT", reason="wait_squad_clear_arrival", until=self._squad_clear_until[next_hop])
-                return wait("wait_squad_clear", active=False)
+                return wait("wait_squad_clear", active=True)
             t04 = self._t04_for_target(state, next_hop)
             if t04 is not None:
                 self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="CLAIM_TASK", taskId=t04.id)
@@ -2999,13 +3120,13 @@ class BaselineStrategy:
                 return ActionBundle(main=MainAction(MainActionType.CLEAR, target=next_hop), squad=support)
             self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="FORCED_PASS")
             return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=next_hop), squad=support)
-        # ── Enemy guard / learned block ──
+        # Enemy guard / learned block
         enemy_guard = station is not None and station.has_enemy_guard(me.team_id)
         learned = self._has_learned_guard(state, next_hop) or self._guard_blocked_until.get(next_hop, -1) > state.frame
         if enemy_guard or learned:
             if self._squad_weaken_until.get(next_hop, -1) > state.frame:
                 self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="WAIT", reason="wait_squad_weaken_arrival", until=self._squad_weaken_until[next_hop])
-                return wait("wait_squad_weaken", active=False)
+                return wait("wait_squad_weaken", active=True)
             support = self._squad_blocker_action(state, next_hop, "enemy_guard") or squad
             if support is not None and support is not squad:
                 good, bad = self._fruit_to_break_guard(state, station, next_hop, objective)
@@ -3022,13 +3143,13 @@ class BaselineStrategy:
                 self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="SQUAD_WEAKEN")
                 return ActionBundle(squad=support)
             # 1. Squad weaken at key chokepoint
-            # 2. bad fruit → BREAK_GUARD
+            # 2. bad fruit 鈫?BREAK_GUARD
             good, bad = self._fruit_to_break_guard(state, station, next_hop, objective)
             if good > 0 or bad > 0:
                 self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="BREAK_GUARD", reason="fruit_combo", goodFruit=good, badFruit=bad)
                 return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=next_hop, good_fruit=good, bad_fruit=bad), squad=support)
             # 3. Squad weaken (general)
-            # 4. good fruit → BREAK_GUARD
+            # 4. good fruit 鈫?BREAK_GUARD
             self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="FORCED_PASS", reason="default")
             return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=next_hop), squad=support)
         return None  # safe to MOVE
@@ -3070,13 +3191,22 @@ class BaselineStrategy:
         last_frame = self._blocked_guard_last_frame.get(target)
         if last_frame is None:
             return False
-        if state.frame - last_frame <= GUARD_MEMORY_TTL_FRAMES:
+        ttl = self._guard_memory_ttl(state, target)
+        if state.frame - last_frame <= ttl:
             return True
         self._blocked_guard_nodes.pop(target, None)
         self._blocked_guard_last_frame.pop(target, None)
         self._guard_blocked_until.pop(target, None)
-        self.logger.info("feedback_learn", learned="guard_memory_expired", nodeId=target, lastFrame=last_frame, frame=state.frame, ttl=GUARD_MEMORY_TTL_FRAMES)
+        self.logger.info("feedback_learn", learned="guard_memory_expired", nodeId=target, lastFrame=last_frame, frame=state.frame, ttl=ttl)
         return False
+
+    def _guard_memory_ttl(self, state: GameState, target: str) -> int:
+        if self._is_key_chokepoint_for_state(state, target):
+            return KEY_GUARD_MEMORY_TTL_FRAMES
+        return GUARD_MEMORY_TTL_FRAMES
+
+    def _is_key_chokepoint_for_state(self, state: GameState, target: str) -> bool:
+        return target in self._terminal_chokepoints(state) or self._is_key_chokepoint(target)
 
     def _is_live_guard_trap_risk(self, state: GameState, target: str) -> bool:
         opponent = state.opponent
@@ -3176,7 +3306,7 @@ class BaselineStrategy:
         for neighbor in state.neighbors(state.me.station):
             if neighbor == blocked_next_hop or self._is_learned_guard_blocked(state, neighbor):
                 continue
-            # Skip obstacle nodes — they also block movement.
+            # Skip obstacle nodes 鈥?they also block movement.
             station = state.station(neighbor)
             if station is not None and station.has_obstacle:
                 continue

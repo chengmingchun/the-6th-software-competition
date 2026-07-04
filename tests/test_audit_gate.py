@@ -20,6 +20,7 @@ class AuditGateTest(unittest.TestCase):
                 "b_delivered": "True",
                 "b_idleEmptyCount": "0",
                 "b_rejectedActionCount": "0",
+                "b_maxGuardBlockedMoveStreak": "0",
                 "b_highValueAbstainCount": "1",
                 "b_iceBoxUnusedLowFreshnessFrames": "0",
                 "b_horseUnusedWhileMovingFrames": "0",
@@ -29,6 +30,7 @@ class AuditGateTest(unittest.TestCase):
                 "b_delivered": "True",
                 "b_idleEmptyCount": "0",
                 "b_rejectedActionCount": "0",
+                "b_maxGuardBlockedMoveStreak": "0",
                 "b_highValueAbstainCount": "1",
                 "b_iceBoxUnusedLowFreshnessFrames": "0",
                 "b_horseUnusedWhileMovingFrames": "0",
@@ -44,6 +46,7 @@ class AuditGateTest(unittest.TestCase):
                 "b_delivered": "False",
                 "b_idleEmptyCount": "5",
                 "b_rejectedActionCount": "3",
+                "b_maxGuardBlockedMoveStreak": "8",
                 "b_highValueAbstainCount": "9",
                 "b_iceBoxUnusedLowFreshnessFrames": "12",
                 "b_horseUnusedWhileMovingFrames": "0",
@@ -56,6 +59,7 @@ class AuditGateTest(unittest.TestCase):
         self.assertIn("FAIL", text)
         self.assertIn("送达率不足", text)
         self.assertIn("IDLE 空动作过多", text)
+        self.assertIn("MOVE 被守卫连续阻塞过多", text)
 
     def test_custom_rule_execution(self):
         rows = [{"a_totalScore": "800"}, {"a_totalScore": "700"}]

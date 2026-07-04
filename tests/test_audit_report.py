@@ -20,6 +20,7 @@ class AuditReportTest(unittest.TestCase):
                 "a_idleEmptyCount": "2",
                 "a_highValueAbstainCount": "3",
                 "a_rejectedActionCount": "0",
+                "a_maxGuardBlockedMoveStreak": "5",
                 "a_iceBoxUnusedLowFreshnessFrames": "4",
                 "a_horseUnusedWhileMovingFrames": "0",
                 "a_intelUnusedBeforeGateFrames": "0",
@@ -30,6 +31,7 @@ class AuditReportTest(unittest.TestCase):
         text = "\n".join(side_warnings(rows, "a"))
         self.assertIn("IDLE 空动作", text)
         self.assertIn("高价值窗口弃权", text)
+        self.assertIn("MOVE 被守卫连续阻塞", text)
         self.assertIn("ICE_BOX", text)
         self.assertIn("任务分未稳定过保底线", text)
         self.assertIn("鲜度明显偏低", text)

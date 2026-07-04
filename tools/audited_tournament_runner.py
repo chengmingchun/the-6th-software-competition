@@ -56,16 +56,30 @@ def run_match(seed: int, bot_a: Path, bot_b: Path, port: int, swap: bool = False
     proc_a = start_bot(bot_a, a_id, port)
     proc_b = start_bot(bot_b, b_id, port)
     try:
-        conn_a, addr_a = server_sock.accept()
-        conn_b, addr_b = server_sock.accept()
+        conn_1, addr_1 = server_sock.accept()
+        conn_2, addr_2 = server_sock.accept()
+        codec_1 = FrameCodec(conn_1, "A?")
+        codec_2 = FrameCodec(conn_2, "B?")
+        reg_1 = codec_1.recv(5.0)
+        reg_2 = codec_2.recv(5.0)
+        registered: dict[str, tuple[Any, Any, FrameCodec]] = {}
+        for conn, addr, codec, reg in ((conn_1, addr_1, codec_1, reg_1), (conn_2, addr_2, codec_2, reg_2)):
+            if not reg or reg.get("msg_name") != "registration":
+                raise RuntimeError(f"missing registration from {addr}: {reg!r}")
+            player_id = str(reg.get("msg_data", {}).get("playerId"))
+            registered[player_id] = (conn, addr, codec)
+        if a_id not in registered or b_id not in registered:
+            raise RuntimeError(f"registration/player mismatch: expected {a_id},{b_id}; got {sorted(registered)}")
+        conn_a, addr_a, codec_a = registered[a_id]
+        conn_b, addr_b, codec_b = registered[b_id]
+        codec_a.name = "A"
+        codec_b.name = "B"
         engine = GameEngine(match_id=f"audit_{seed}", seed=seed, player1_id=a_id, player2_id=b_id)
         runner = MatchRunner(conn_a, addr_a, conn_b, addr_b, match_id=f"audit_{seed}", seed=seed)
         runner.player1_id = a_id
         runner.player2_id = b_id
-        codec_a = FrameCodec(conn_a, "A")
-        codec_b = FrameCodec(conn_b, "B")
-        codec_a.recv(5.0)
-        codec_b.recv(5.0)
+        runner.codec1 = codec_a
+        runner.codec2 = codec_b
         codec_a.send(engine.get_start_payload(a_id))
         codec_b.send(engine.get_start_payload(b_id))
         codec_a.recv(5.0)
@@ -98,10 +112,13 @@ def run_match(seed: int, bot_a: Path, bot_b: Path, port: int, swap: bool = False
         }
         if p1.total_score > p2.total_score:
             result["winnerBotDir"] = str(bot_a.resolve())
+            result["winnerSide"] = "A"
         elif p2.total_score > p1.total_score:
             result["winnerBotDir"] = str(bot_b.resolve())
+            result["winnerSide"] = "B"
         else:
             result["winnerBotDir"] = "DRAW"
+            result["winnerSide"] = "DRAW"
         return result
     finally:
         for proc in (proc_a, proc_b):
@@ -188,24 +205,24 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     scores_a = [r["players"][0]["totalScore"] for r in results]
     scores_b = [r["players"][1]["totalScore"] for r in results]
-    wins_a = sum(1 for r in results if r.get("winnerBotDir") == str(bot_a.resolve()))
-    wins_b = sum(1 for r in results if r.get("winnerBotDir") == str(bot_b.resolve()))
-    draws = sum(1 for r in results if r.get("winnerBotDir") == "DRAW")
+    wins_a = sum(1 for r in results if r.get("winnerSide") == "A")
+    wins_b = sum(1 for r in results if r.get("winnerSide") == "B")
+    draws = sum(1 for r in results if r.get("winnerSide") == "DRAW")
     n = len(results)
     print("\nSummary")
     print(score_summary(bot_a.name, scores_a))
     print(score_summary(bot_b.name, scores_b))
     print(f"wins: A={wins_a/n*100:.0f}% B={wins_b/n*100:.0f}% draw={draws/n*100:.0f}%")
     print("behavior averages:")
-    for key in ["idleEmptyCount", "legalSystemWaitCount", "highValueAbstainCount", "abstainCount", "useResourceCount", "claimTaskCount", "claimResourceCount", "rejectedActionCount", "iceBoxUnusedLowFreshnessFrames", "horseUnusedWhileMovingFrames", "intelUnusedBeforeGateFrames"]:
+    for key in ["idleEmptyCount", "legalSystemWaitCount", "highValueAbstainCount", "abstainCount", "useResourceCount", "claimTaskCount", "claimResourceCount", "rejectedActionCount", "guardBlockedMoveResultCount", "maxGuardBlockedMoveStreak", "iceBoxUnusedLowFreshnessFrames", "horseUnusedWhileMovingFrames", "intelUnusedBeforeGateFrames"]:
         print(f"  {key:<34} A={mean(results, 0, key):6.1f} B={mean(results, 1, key):6.1f}")
     if args.summary_csv:
         base_fields = ["playerId", "teamId", "botDir", "totalScore", "delivered", "deliverRound", "freshness", "goodFruit", "badFruit", "taskScore", "bountyScore", "penaltyScore", *ACTION_FIELDS, "rejectedActionCount"]
-        fieldnames = ["run", "seed", "swap", *[f"a_{field}" for field in base_fields], *[f"b_{field}" for field in base_fields], "winnerBotDir"]
+        fieldnames = ["run", "seed", "swap", *[f"a_{field}" for field in base_fields], *[f"b_{field}" for field in base_fields], "winnerBotDir", "winnerSide"]
         rows = []
         for result in results:
             pa, pb = result["players"]
-            row = {"run": result["run"], "seed": result["seed"], "swap": result["swap"], "winnerBotDir": result.get("winnerBotDir", "")}
+            row = {"run": result["run"], "seed": result["seed"], "swap": result["swap"], "winnerBotDir": result.get("winnerBotDir", ""), "winnerSide": result.get("winnerSide", "")}
             for field in base_fields:
                 row[f"a_{field}"] = pa.get(field)
                 row[f"b_{field}"] = pb.get(field)
