@@ -29,13 +29,13 @@ CORE_METRICS = [
 ]
 
 WARNING_RULES = [
-    ("idleEmptyCount", 1.0, "存在 IDLE 空动作：优先检查无路径、状态误判、目标为空、异常兜底。"),
-    ("highValueAbstainCount", 1.0, "高价值窗口弃权偏多：优先检查 WindowPolicy 价值判断和卡牌资源使用。"),
-    ("rejectedActionCount", 1.0, "无效动作偏多：优先检查 LegalAction / 反馈学习 / 冷却抑制。"),
-    ("maxGuardBlockedMoveStreak", 3.0, "MOVE 被守卫连续阻塞：优先检查 guard 反馈绑定、冷却、绕路或小分队支援。"),
-    ("iceBoxUnusedLowFreshnessFrames", 3.0, "低鲜度持有 ICE_BOX 未用：优先检查 ResourceManager 的保鲜触发。"),
-    ("horseUnusedWhileMovingFrames", 3.0, "停顿可行动时持有马未用：优先检查马 buff 冲突和出发前使用时机。"),
-    ("intelUnusedBeforeGateFrames", 3.0, "90 分后持有 INTEL 未用于宫门/关键点：优先检查探路目标选择。"),
+    ("idleEmptyCount", 1.0, "IDLE empty actions: check no-route fallback, state detection, empty target, and exception fallback."),
+    ("highValueAbstainCount", 1.0, "High-value window abstains: check WindowPolicy value scoring and card resource use."),
+    ("rejectedActionCount", 1.0, "Rejected actions: check legal-action gate, feedback learning, and reject cooldowns."),
+    ("maxGuardBlockedMoveStreak", 3.0, "Repeated MOVE_BLOCKED_BY_GUARD: check guard feedback target binding, cooldown, reroute, and squad support."),
+    ("iceBoxUnusedLowFreshnessFrames", 3.0, "ICE_BOX held at low freshness: check freshness protection and delivery-quality resource timing."),
+    ("horseUnusedWhileMovingFrames", 3.0, "Horse held while stopped and actionable: check pre-departure speed-resource timing."),
+    ("intelUnusedBeforeGateFrames", 3.0, "INTEL held after 90 task score before gate: check blocked-target and chokepoint scouting."),
 ]
 
 
@@ -83,7 +83,7 @@ def metric_line(rows: list[dict[str, str]], metric: str) -> str:
     a = avg(rows, "a", metric)
     b = avg(rows, "b", metric)
     delta = a - b
-    return f"{metric:<34} A={a:8.2f}  B={b:8.2f}  ΔA-B={delta:+8.2f}"
+    return f"{metric:<34} A={a:8.2f}  B={b:8.2f}  deltaA-B={delta:+8.2f}"
 
 
 def side_warnings(rows: list[dict[str, str]], side: str) -> list[str]:
@@ -91,15 +91,15 @@ def side_warnings(rows: list[dict[str, str]], side: str) -> list[str]:
     for metric, threshold, message in WARNING_RULES:
         value = avg(rows, side, metric)
         if value >= threshold:
-            warnings.append(f"{metric}={value:.2f}：{message}")
+            warnings.append(f"{metric}={value:.2f}: {message}")
     task = avg(rows, side, "taskScore")
     fresh = avg(rows, side, "freshness")
     if task < 90:
-        warnings.append(f"taskScore={task:.1f}：任务分未稳定过保底线，优先检查任务选择/绕路收益。")
+        warnings.append(f"taskScore={task:.1f}: task score is below the safety floor; check task selection and detour EV.")
     elif task < 120:
-        warnings.append(f"taskScore={task:.1f}：任务分偏低，可能送太早或任务 EV 太保守。")
+        warnings.append(f"taskScore={task:.1f}: task score is low; delivery may be too early or task EV too conservative.")
     if fresh < 75:
-        warnings.append(f"freshness={fresh:.1f}：鲜度明显偏低，优先检查送达锁、冰鉴和绕路。")
+        warnings.append(f"freshness={fresh:.1f}: freshness is low; check delivery lock, ICE_BOX timing, and reroute cost.")
     return warnings
 
 
@@ -136,29 +136,29 @@ def print_report(rows: list[dict[str, str]]) -> None:
         print(metric_line(rows, metric))
     print("-" * 78)
     print("A warnings:")
-    for warning in side_warnings(rows, "a") or ["无明显行为审计告警。"]:
+    for warning in side_warnings(rows, "a") or ["No obvious behavior audit warnings."]:
         print(f"  - {warning}")
     print("B warnings:")
-    for warning in side_warnings(rows, "b") or ["无明显行为审计告警。"]:
+    for warning in side_warnings(rows, "b") or ["No obvious behavior audit warnings."]:
         print(f"  - {warning}")
     print("-" * 78)
     print("Priority hints:")
     if avg(rows, "a", "idleEmptyCount") > avg(rows, "b", "idleEmptyCount") + 1:
-        print("  - A 的 IDLE 空动作更多，先查 A 的目标生成/路径/状态判断。")
+        print("  - A has more IDLE empty actions; inspect A target generation, route planning, and state checks.")
     if avg(rows, "b", "idleEmptyCount") > avg(rows, "a", "idleEmptyCount") + 1:
-        print("  - B 的 IDLE 空动作更多，先查 B 的目标生成/路径/状态判断。")
+        print("  - B has more IDLE empty actions; inspect B target generation, route planning, and state checks.")
     if avg(rows, "a", "highValueAbstainCount") > avg(rows, "b", "highValueAbstainCount") + 1:
-        print("  - A 高价值弃权更多，先调 A 的窗口 EV。")
+        print("  - A abstains from high-value windows more often; tune A window EV and counter policy.")
     if avg(rows, "b", "highValueAbstainCount") > avg(rows, "a", "highValueAbstainCount") + 1:
-        print("  - B 高价值弃权更多，先调 B 的窗口 EV。")
+        print("  - B abstains from high-value windows more often; tune B window EV and counter policy.")
     if avg(rows, "a", "taskScore") + 20 < avg(rows, "b", "taskScore"):
-        print("  - A 任务分显著低于 B，先查 A 的任务 EV / detour 阈值。")
+        print("  - A task score is much lower than B; inspect A task EV and detour thresholds.")
     if avg(rows, "b", "taskScore") + 20 < avg(rows, "a", "taskScore"):
-        print("  - B 任务分显著低于 A，先查 B 的任务 EV / detour 阈值。")
+        print("  - B task score is much lower than A; inspect B task EV and detour thresholds.")
     if avg(rows, "a", "freshness") + 8 < avg(rows, "b", "freshness"):
-        print("  - A 鲜度显著低于 B，先查 A 的送达锁和资源使用。")
+        print("  - A freshness is much lower than B; inspect A delivery lock and resource timing.")
     if avg(rows, "b", "freshness") + 8 < avg(rows, "a", "freshness"):
-        print("  - B 鲜度显著低于 A，先查 B 的送达锁和资源使用。")
+        print("  - B freshness is much lower than A; inspect B delivery lock and resource timing.")
     print("=" * 78)
 
 

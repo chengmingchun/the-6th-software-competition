@@ -740,6 +740,31 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
         self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
 
+    def test_rush_low_score_uses_spare_ice_box_to_protect_delivery_quality(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=413,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S13",
+                freshness=85.9,
+                task_score_base=30,
+                resources={"ICE_BOX": 1},
+            ),
+            stations={"S13": Station(id="S13", process_type="PALACE_TRANSFER", process_round=5)},
+            edges=[
+                RouteEdge(id="E1", start="S13", end="S14", distance=1),
+                RouteEdge(id="E2", start="S14", end="S15", distance=1),
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.USE_RESOURCE)
+        self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
+
     def test_normal_midgame_does_not_use_ice_box_at_eighty_eight_point_six(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
@@ -1008,6 +1033,154 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_remote_low_value_task_does_not_wait_on_blocked_path(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=160,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", freshness=96),
+            stations={"S02": Station(id="S02", has_obstacle=True)},
+            edges=[
+                RouteEdge(id="D", start="S01", end="S14", distance=1),
+                RouteEdge(id="T1", start="S01", end="S02", distance=1),
+                RouteEdge(id="T2", start="S02", end="S14", distance=1),
+            ],
+            tasks=[TaskInstance(id="low-remote", template="T13", target="S02", score=15, process_frames=5)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
+
+    def test_remote_low_value_task_skips_mandatory_live_guard_trap_wait(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=251,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S09", task_score_base=30, freshness=86),
+            opponent=PlayerState(player_id="1002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S10", good_fruit=1),
+            stations={"S09": Station(id="S09"), "S10": Station(id="S10", node_type="KEY_PASS"), "S12": Station(id="S12"), "S14": Station(id="S14")},
+            edges=[
+                RouteEdge(id="E1", start="S09", end="S10", route_type="ROAD", distance=1),
+                RouteEdge(id="E2", start="S10", end="S12", route_type="ROAD", distance=1),
+                RouteEdge(id="E3", start="S12", end="S14", route_type="ROAD", distance=1),
+            ],
+            tasks=[TaskInstance(id="low-live-trap", template="T13", target="S12", score=15, process_frames=5)],
+        )
+
+        action = strategy.decide(state)
+
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S10")
+
+    def test_first_low_value_task_can_still_pull_convoy_through_live_guard_risk(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=160,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S09", task_score_base=0, freshness=94),
+            opponent=PlayerState(player_id="1002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S10", good_fruit=1),
+            stations={"S09": Station(id="S09"), "S10": Station(id="S10", node_type="KEY_PASS"), "S12": Station(id="S12"), "S14": Station(id="S14")},
+            edges=[
+                RouteEdge(id="E1", start="S09", end="S10", route_type="ROAD", distance=1),
+                RouteEdge(id="E2", start="S10", end="S12", route_type="ROAD", distance=1),
+                RouteEdge(id="E3", start="S12", end="S14", route_type="ROAD", distance=1),
+                RouteEdge(id="D1", start="S09", end="S14", route_type="ROAD", distance=1),
+            ],
+            tasks=[TaskInstance(id="first-low-live-trap", template="T13", target="S12", score=15, process_frames=5)],
+        )
+
+        task = strategy._best_reachable_task(state)
+
+        self.assertIsNotNone(task)
+        self.assertEqual(task.id, "first-low-live-trap")
+
+    def test_second_low_value_task_skips_live_guard_risk_without_milestone(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=297,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S10", task_score_base=15, freshness=84),
+            opponent=PlayerState(player_id="1002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S11", good_fruit=1),
+            stations={"S10": Station(id="S10"), "S11": Station(id="S11"), "S12": Station(id="S12"), "S14": Station(id="S14")},
+            edges=[
+                RouteEdge(id="E1", start="S10", end="S11", route_type="ROAD", distance=1),
+                RouteEdge(id="E2", start="S11", end="S12", route_type="ROAD", distance=1),
+                RouteEdge(id="E3", start="S12", end="S14", route_type="ROAD", distance=1),
+                RouteEdge(id="D1", start="S10", end="S14", route_type="ROAD", distance=2),
+            ],
+            tasks=[TaskInstance(id="second-low-live-trap", template="T13", target="S12", score=15, process_frames=5)],
+        )
+
+        action = strategy.decide(state)
+
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
+
+    def test_remote_thirty_point_task_can_still_pull_convoy_for_score_floor(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=160,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", freshness=96),
+            edges=[
+                RouteEdge(id="D", start="S01", end="S14", distance=1),
+                RouteEdge(id="T1", start="S01", end="S02", distance=1),
+                RouteEdge(id="T2", start="S02", end="S14", distance=1),
+            ],
+            tasks=[TaskInstance(id="score-floor", template="T08", target="S02", score=30, process_frames=5)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_reachable_task_allows_extra_detour_to_cross_task_milestone(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=160,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=45, freshness=96),
+            edges=[
+                RouteEdge(id="D", start="S01", end="S14", distance=1),
+                RouteEdge(id="T1", start="S01", end="S02", distance=8),
+                RouteEdge(id="T2", start="S02", end="S14", distance=12),
+            ],
+            tasks=[TaskInstance(id="milestone-60", template="T13", target="S02", score=15, process_frames=5)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_reachable_task_still_skips_same_detour_without_task_milestone(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=160,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=30, freshness=96),
+            edges=[
+                RouteEdge(id="D", start="S01", end="S14", distance=1),
+                RouteEdge(id="T1", start="S01", end="S02", distance=8),
+                RouteEdge(id="T2", start="S02", end="S14", distance=12),
+            ],
+            tasks=[TaskInstance(id="no-milestone", template="T13", target="S02", score=15, process_frames=5)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
 
     def test_delivery_deadline_skips_far_ice_box(self) -> None:
         strategy = self.make_strategy()
@@ -1527,7 +1700,8 @@ class StrategyRouteResourceTest(unittest.TestCase):
         )
         action = strategy.decide(state)
         self.assertIsNotNone(action.main)
-        self.assertEqual(action.main.action, MainActionType.WAIT)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
 
     def test_pushes_mandatory_chokepoint_instead_of_waiting_live_trap(self) -> None:
         strategy = self.make_strategy()
@@ -1548,6 +1722,25 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S10")
+
+    def test_pushes_mandatory_delivery_next_hop_instead_of_stall_waiting(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=398,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S12", task_score_base=45, good_fruit=96, freshness=96),
+            opponent=PlayerState(player_id="2002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S13", task_score_base=90, good_fruit=95),
+            edges=[
+                RouteEdge(id="PASS1", start="S12", end="S13", distance=1),
+                RouteEdge(id="PASS2", start="S13", end="S14", distance=1),
+            ],
+            stations={"S13": Station(id="S13"), "S14": Station(id="S14")},
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S13")
 
     def test_skips_reachable_task_when_target_is_live_trap(self) -> None:
         strategy = self.make_strategy()
@@ -2343,6 +2536,143 @@ class StrategyRouteResourceTest(unittest.TestCase):
         road = next(package for package in packages if package["path"] == ("S01", "S02", "S14"))
         mountain = next(package for package in packages if package["path"] == ("S01", "S08", "S14"))
         self.assertGreaterEqual(road["cost"] - mountain["cost"], 75)
+
+    def test_route_package_values_delivery_score_jump_to_ninety_tasks(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=120,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=0, squad_available=0),
+            edges=[
+                RouteEdge(id="LOW1", start="S01", end="S08", route_type="MOUNTAIN", distance=1),
+                RouteEdge(id="LOW2", start="S08", end="S14", route_type="MOUNTAIN", distance=1),
+                RouteEdge(id="HIGH1", start="S01", end="S02", route_type="ROAD", distance=2),
+                RouteEdge(id="HIGH2", start="S02", end="S03", route_type="ROAD", distance=1),
+                RouteEdge(id="HIGH3", start="S03", end="S14", route_type="ROAD", distance=1),
+            ],
+            tasks=[
+                TaskInstance(id="low-60", template="T08", target="S08", score=60, process_frames=4),
+                TaskInstance(id="high-45-a", template="T08", target="S02", score=45, process_frames=4),
+                TaskInstance(id="high-45-b", template="T08", target="S03", score=45, process_frames=4),
+            ],
+        )
+        packages = strategy._route_packages_to_gate(state)
+        low = next(package for package in packages if package["path"] == ("S01", "S08", "S14"))
+        high = next(package for package in packages if package["path"] == ("S01", "S02", "S03", "S14"))
+        self.assertEqual(high["task_score"] - low["task_score"], 30)
+        self.assertGreaterEqual(high["score_value"] - low["score_value"], 70)
+
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_route_package_score_value_includes_time_task_coefficient(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=120,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=0),
+            edges=[RouteEdge(id="GT", start="S14", end="S15", route_type="ROAD", distance=1)],
+        )
+
+        score_75 = strategy._route_package_score_value(state, 75, 10)
+        score_90 = strategy._route_package_score_value(state, 90, 10)
+        fast_90 = strategy._route_package_score_value(state, 90, 10)
+        slow_90 = strategy._route_package_score_value(state, 90, 100)
+
+        self.assertGreater(score_90 - score_75, 55)
+        self.assertGreater(fast_90, slow_90)
+
+    def test_route_package_allows_large_detour_when_delivery_score_value_gap_is_large(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=171,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S07", task_score_base=30, freshness=91, squad_available=0),
+            edges=[
+                RouteEdge(id="D1", start="S07", end="S09", route_type="ROAD", distance=1),
+                RouteEdge(id="D2", start="S09", end="S10", route_type="ROAD", distance=1),
+                RouteEdge(id="D3", start="S10", end="S11", route_type="ROAD", distance=1),
+                RouteEdge(id="D4", start="S11", end="S12", route_type="ROAD", distance=1),
+                RouteEdge(id="D5", start="S12", end="S13", route_type="ROAD", distance=1),
+                RouteEdge(id="D6", start="S13", end="S14", route_type="ROAD", distance=1),
+                RouteEdge(id="H1", start="S07", end="S08", route_type="ROAD", distance=45),
+                RouteEdge(id="H2", start="S08", end="S10", route_type="ROAD", distance=1),
+            ],
+            tasks=[
+                TaskInstance(id="high-45", template="T08", target="S08", score=45, process_frames=4),
+                TaskInstance(id="high-30", template="T11", target="S08", score=30, process_frames=4),
+            ],
+        )
+        packages = strategy._route_packages_to_gate(state)
+        direct = next(package for package in packages if package["path"] == ("S07", "S09", "S10", "S11", "S12", "S13", "S14"))
+        high = next(package for package in packages if package["path"] == ("S07", "S08", "S10", "S11", "S12", "S13", "S14"))
+        self.assertGreaterEqual(high["score_value"] - direct["score_value"], 150)
+        self.assertGreater(high["cost"] - direct["cost"], 36)
+
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S08")
+
+    def test_route_package_score_value_detour_tightens_under_freshness_pressure(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=171,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S07", task_score_base=30, freshness=76, squad_available=0),
+            edges=[
+                RouteEdge(id="D1", start="S07", end="S09", route_type="ROAD", distance=1),
+                RouteEdge(id="D2", start="S09", end="S10", route_type="ROAD", distance=1),
+                RouteEdge(id="D3", start="S10", end="S11", route_type="ROAD", distance=1),
+                RouteEdge(id="D4", start="S11", end="S12", route_type="ROAD", distance=1),
+                RouteEdge(id="D5", start="S12", end="S13", route_type="ROAD", distance=1),
+                RouteEdge(id="D6", start="S13", end="S14", route_type="ROAD", distance=1),
+                RouteEdge(id="H1", start="S07", end="S08", route_type="ROAD", distance=45),
+                RouteEdge(id="H2", start="S08", end="S10", route_type="ROAD", distance=1),
+            ],
+            tasks=[
+                TaskInstance(id="high-45", template="T08", target="S08", score=45, process_frames=4),
+                TaskInstance(id="high-30", template="T11", target="S08", score=30, process_frames=4),
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
+
+    def test_route_package_large_score_value_detour_requires_deadline_buffer(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=500,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S07", task_score_base=30, freshness=91, squad_available=0),
+            edges=[
+                RouteEdge(id="D1", start="S07", end="S09", route_type="ROAD", distance=1),
+                RouteEdge(id="D2", start="S09", end="S10", route_type="ROAD", distance=1),
+                RouteEdge(id="D3", start="S10", end="S11", route_type="ROAD", distance=1),
+                RouteEdge(id="D4", start="S11", end="S12", route_type="ROAD", distance=1),
+                RouteEdge(id="D5", start="S12", end="S13", route_type="ROAD", distance=1),
+                RouteEdge(id="D6", start="S13", end="S14", route_type="ROAD", distance=1),
+                RouteEdge(id="H1", start="S07", end="S08", route_type="ROAD", distance=45),
+                RouteEdge(id="H2", start="S08", end="S10", route_type="ROAD", distance=1),
+            ],
+            tasks=[
+                TaskInstance(id="high-45", template="T08", target="S08", score=45, process_frames=4),
+                TaskInstance(id="high-30", template="T11", target="S08", score=30, process_frames=4),
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
 
     def test_route_package_penalizes_key_learned_guard_without_squad(self) -> None:
         strategy = self.make_strategy()

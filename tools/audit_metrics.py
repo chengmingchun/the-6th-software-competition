@@ -46,6 +46,12 @@ def new_audit() -> dict[str, int]:
     return {key: 0 for key in ACTION_FIELDS}
 
 
+def _append_detail(audit: dict[str, Any], key: str, detail: dict[str, Any]) -> None:
+    details = audit.setdefault(key, [])
+    if isinstance(details, list):
+        details.append(detail)
+
+
 def player_payload(inquire: dict[str, Any], player_id: str) -> dict[str, Any]:
     data = inquire.get("msg_data", {}) if isinstance(inquire.get("msg_data"), dict) else {}
     for player in data.get("players", []) or []:
@@ -206,6 +212,8 @@ def resource_actionable_status(player: dict[str, Any]) -> bool:
     status = status_of(player)
     if status not in {"IDLE", "WAITING"}:
         return False
+    if player.get("routeEdgeId") or player.get("targetNodeId") or player.get("target"):
+        return False
     return not bool(player.get("currentProcess"))
 
 
@@ -343,6 +351,20 @@ def audit_frame(audit: dict[str, int], inquire: dict[str, Any], player_id: str, 
     resource_actionable = resource_actionable_status(player)
     if resource_actionable and resource_count(player, "ICE_BOX") > 0 and should_warn_ice_box_unused(inquire, player) and not has_action(actions, "USE_RESOURCE", "ICE_BOX"):
         audit["iceBoxUnusedLowFreshnessFrames"] += 1
+        _append_detail(
+            audit,
+            "_iceBoxUnusedDetails",
+            {
+                "frame": _payload(inquire).get("round") or _payload(inquire).get("frame") or inquire.get("round"),
+                "status": status,
+                "station": current_node_of(player),
+                "target": player.get("targetNodeId") or player.get("target"),
+                "routeEdgeId": player.get("routeEdgeId"),
+                "freshness": freshness_of(player),
+                "taskScore": task_score_of(player),
+                "actions": [action.get("action") for action in actions if isinstance(action, dict)],
+            },
+        )
     # Latest online behavior treats MOVING as a hard no-command state. Do not
     # pressure strategy into using horse buffs mid-edge; only flag missed horse
     # timing while stopped/paused and still able to choose a safe action.
@@ -350,4 +372,18 @@ def audit_frame(audit: dict[str, int], inquire: dict[str, Any], player_id: str, 
         audit["horseUnusedWhileMovingFrames"] += 1
     if resource_actionable and resource_count(player, "INTEL") > 0 and task_score_of(player) >= 90 and not player.get("verified") and intel_actionable_target_exists(inquire, player) and not has_action(actions, "USE_RESOURCE", "INTEL"):
         audit["intelUnusedBeforeGateFrames"] += 1
+        _append_detail(
+            audit,
+            "_intelUnusedDetails",
+            {
+                "frame": _payload(inquire).get("round") or _payload(inquire).get("frame") or inquire.get("round"),
+                "status": status,
+                "station": current_node_of(player),
+                "target": player.get("targetNodeId") or player.get("target"),
+                "routeEdgeId": player.get("routeEdgeId"),
+                "freshness": freshness_of(player),
+                "taskScore": task_score_of(player),
+                "actions": [action.get("action") for action in actions if isinstance(action, dict)],
+            },
+        )
     audit_action_results(audit, inquire, player_id)

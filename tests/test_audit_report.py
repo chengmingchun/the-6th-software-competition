@@ -29,12 +29,12 @@ class AuditReportTest(unittest.TestCase):
             }
         ]
         text = "\n".join(side_warnings(rows, "a"))
-        self.assertIn("IDLE 空动作", text)
-        self.assertIn("高价值窗口弃权", text)
-        self.assertIn("MOVE 被守卫连续阻塞", text)
+        self.assertIn("IDLE empty actions", text)
+        self.assertIn("High-value window abstains", text)
+        self.assertIn("Repeated MOVE_BLOCKED_BY_GUARD", text)
         self.assertIn("ICE_BOX", text)
-        self.assertIn("任务分未稳定过保底线", text)
-        self.assertIn("鲜度明显偏低", text)
+        self.assertIn("task score is below the safety floor", text)
+        self.assertIn("freshness is low", text)
 
     def test_winner_summary(self):
         rows = [

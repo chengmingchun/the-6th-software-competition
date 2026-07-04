@@ -69,6 +69,7 @@ PROACTIVE_CLEAR_MAX_PATH_INDEX = 5
 PROACTIVE_CLEAR_HIGH_DETOUR = 10
 INTEL_MAX_ROUTE_DISTANCE = 15
 HEAVY_RAIN_PROCESS_EXTRA = 4
+TASK_SCORE_MILESTONES: tuple[tuple[int, int], ...] = ((60, 15), (90, 20), (110, 15))
 ROUTE_RESOURCE_TYPES = {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE", "INTEL"}
 SQUAD_COST = {
     SquadActionType.SQUAD_SCOUT: 1,
@@ -1453,13 +1454,24 @@ class BaselineStrategy:
         direct_plan = self.route_planner.plan(state, me.station, state.gate_node)
         if direct_plan is None or len(direct_plan.path) < 2:
             return None
-        current = min(packages, key=lambda item: (item["cost"], -item["task_score"]))
-        best = max(packages, key=lambda item: (item["task_score"], -item["cost"]))
+        current = min(packages, key=lambda item: (item["cost"], -item["score_value"], -item["task_score"]))
+        best = max(packages, key=lambda item: (item["score_value"], item["task_score"], -item["cost"]))
         score_gap = int(best["task_score"]) - int(current["task_score"])
+        score_value_gap = int(best["score_value"]) - int(current["score_value"])
         extra_cost = int(best["cost"]) - int(current["cost"])
-        if score_gap < 60:
+        if score_gap < 60 and score_value_gap < 70:
             return None
-        max_extra = 36 if score_gap >= 90 else 24
+        base_extra = 36 if score_gap >= 90 or score_value_gap >= 95 else 24
+        max_extra = base_extra
+        if score_value_gap >= 70:
+            max_extra = max(max_extra, min(90, score_value_gap // 2))
+        freshness_pressure = self._freshness_pressure(state)
+        if freshness_pressure >= 2:
+            max_extra = min(max_extra, 30)
+        elif freshness_pressure == 1:
+            max_extra = min(max_extra, 54)
+        if extra_cost > base_extra and state.turns_left <= int(best["cost"]) + 80:
+            return None
         if extra_cost > max_extra:
             return None
         next_hop = str(best["path"][1])
@@ -1470,14 +1482,17 @@ class BaselineStrategy:
             chosenRouteType=best["route_type"],
             chosenPath=list(best["path"]),
             chosenTaskScore=best["task_score"],
+            chosenScoreValue=best["score_value"],
             currentRouteType=current["route_type"],
             currentPath=list(current["path"]),
             currentTaskScore=current["task_score"],
+            currentScoreValue=current["score_value"],
             scoreGap=score_gap,
+            scoreValueGap=score_value_gap,
             extraCost=extra_cost,
             nextHop=next_hop,
             objective=objective,
-            reason="high_task_score_route_package",
+            reason="high_task_score_route_package" if score_gap >= 60 else "high_delivery_score_value_route_package",
         )
         return self._move_to_next_hop_with_objective(state, next_hop, objective, squad=scout)
 
@@ -1495,9 +1510,38 @@ class BaselineStrategy:
                 continue
             route_type = self._path_route_type(state, path)
             task_score = self._path_task_score(state, path)
-            packages.append({"path": path, "cost": cost, "route_type": route_type, "task_score": task_score})
-        self.logger.info("route_package_eval", candidates=[{"routeType": p["route_type"], "path": list(p["path"]), "cost": p["cost"], "taskScore": p["task_score"]} for p in packages[:8]])
+            score_value = self._route_package_score_value(state, task_score, cost)
+            packages.append({"path": path, "cost": cost, "route_type": route_type, "task_score": task_score, "score_value": score_value})
+        self.logger.info("route_package_eval", candidates=[{"routeType": p["route_type"], "path": list(p["path"]), "cost": p["cost"], "taskScore": p["task_score"], "scoreValue": p["score_value"]} for p in packages[:8]])
         return packages
+
+    def _route_package_score_value(self, state: GameState, path_task_score: int, package_cost: int) -> int:
+        projected_task_base = min(self.config.greed_task_score, state.me.task_score_base + max(0, path_task_score))
+        return self._delivery_base_score(projected_task_base) + self._task_award_score(projected_task_base) + self._time_score_value(state, projected_task_base, package_cost)
+
+    def _delivery_base_score(self, task_score_base: int) -> int:
+        return min(240, 120 + (max(0, task_score_base) * 4 // 3))
+
+    def _task_award_score(self, task_score_base: int) -> int:
+        score = max(0, task_score_base)
+        if score >= 110:
+            bonus = 50
+        elif score >= 90:
+            bonus = 35
+        elif score >= 60:
+            bonus = 15
+        else:
+            bonus = 0
+        return min(180, score + bonus)
+
+    def _time_score_value(self, state: GameState, task_score_base: int, package_cost: int) -> int:
+        gate_to_terminal = self.route_planner.estimate_frames(state, state.gate_node, state.terminal_node)
+        if gate_to_terminal >= 10**8:
+            gate_to_terminal = 0
+        verify_cost = 0 if state.me.verified else 6
+        estimated_deliver_frame = state.frame + max(0, package_cost) + verify_cost + gate_to_terminal
+        raw_time_score = max(0, (600 - estimated_deliver_frame) * 70 // 600)
+        return raw_time_score * min(max(0, task_score_base), 90) // 90
 
     def _simple_paths(self, state: GameState, start: str, target: str, *, max_depth: int, max_paths: int) -> list[tuple[str, ...]]:
         paths: list[tuple[str, ...]] = []
@@ -1669,6 +1713,14 @@ class BaselineStrategy:
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="projected_mid_score_delivery_freshness_protection", freshness=me.freshness, projectedFreshness=projected, taskScore=me.task_score_base, remainingCost=self._remaining_delivery_cost(state))
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         remaining_delivery = self._remaining_delivery_cost(state)
+        if (
+            state.phase in RUSH_PHASES
+            and me.freshness <= 86
+            and (projected <= 86 or (me.verified and me.station == state.terminal_node))
+            and state.turns_left > max(2, remaining_delivery + 1)
+        ):
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="rush_delivery_quality_spare_ice", freshness=me.freshness, projectedFreshness=projected, taskScore=me.task_score_base, remainingCost=remaining_delivery, turnsLeft=state.turns_left)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         if (
             me.task_score_base >= 120
             and me.freshness <= 88
@@ -2019,12 +2071,31 @@ class BaselineStrategy:
                     continue
                 to_task = self.route_planner.estimate_frames(state, state.me.station, approach)
                 to_gate = self.route_planner.estimate_frames(state, approach, state.gate_node)
+                plan_to_task = self.route_planner.plan(state, state.me.station, approach)
+                if to_task >= 10**8 or to_gate >= 10**8 or plan_to_task is None:
+                    continue
                 detour = to_task + task.process_frames + to_gate - direct
+                milestone_bonus = self._task_milestone_bonus(state.me.task_score_base, task.score)
+                first_hop = plan_to_task.next_station
+                if (
+                    task.score < 30
+                    and state.me.task_score_base >= 15
+                    and milestone_bonus <= 0
+                    and first_hop is not None
+                    and self._is_live_guard_trap_risk(state, first_hop)
+                    and self._alternate_next_hop_avoiding_live_trap(state, approach, first_hop) is None
+                ):
+                    continue
+                if task.score < 30 and approach != state.me.station:
+                    if self._path_has_action_blocker(state, plan_to_task.path):
+                        continue
                 max_detour = self.config.max_task_detour_frames + (12 if task.score >= 30 else 0)
                 if catch_up_mode and task.score >= 30:
                     max_detour += 18 if task.score < 45 else 28
                 if task.template == "T04" and task.score >= 30:
                     max_detour += 18
+                if milestone_bonus > 0:
+                    max_detour += min(20, milestone_bonus)
                 if state.me.task_score_base >= self.config.target_task_score and task.score >= 30:
                     max_detour = max(max_detour, self.config.max_competitive_task_detour_frames)
                 if freshness_pressure >= 2:
@@ -2037,6 +2108,8 @@ class BaselineStrategy:
                         value += 40
                     if task.template == "T04":
                         value += 35
+                    if milestone_bonus > 0:
+                        value += milestone_bonus * 4
                     if state.me.task_score_base >= self.config.target_task_score:
                         value += 20
                     if catch_up_mode and task.score >= 30:
@@ -2051,6 +2124,25 @@ class BaselineStrategy:
         self._task_approach_nodes[chosen.id] = chosen_approach
         self.logger.info("task_eval_reachable", directToGate=direct, candidates=[{"taskId": t.id, "template": t.template, "target": t.target, "approach": a, "score": t.score, "value": v, "detour": d, "toTask": tt, "toGate": tg} for v, t, a, d, tt, tg in sorted(candidates, key=lambda item: item[0], reverse=True)[:5]], chosen=chosen.id, chosenApproach=chosen_approach, chosenValue=chosen_value, chosenDetour=chosen_detour, chosenToTask=chosen_to_task, chosenToGate=chosen_to_gate)
         return chosen
+
+    def _task_milestone_bonus(self, current_score: int, task_score: int) -> int:
+        next_score = current_score + task_score
+        return sum(
+            bonus
+            for threshold, bonus in TASK_SCORE_MILESTONES
+            if current_score < threshold <= next_score
+        )
+
+    def _path_has_action_blocker(self, state: GameState, path: tuple[str, ...]) -> bool:
+        for node in path[1:]:
+            station = state.station(node)
+            if station is not None and (station.has_obstacle or station.has_enemy_guard(state.me.team_id)):
+                return True
+            if self._squad_clear_until.get(node, -1) > state.frame or self._squad_weaken_until.get(node, -1) > state.frame:
+                return True
+            if self._has_learned_guard(state, node) or self._guard_blocked_until.get(node, -1) > state.frame:
+                return True
+        return False
 
     def _can_claim_task_from_station(self, state: GameState, task: TaskInstance, station: str | None) -> bool:
         if station is None or not self._task_requirements_met(state, task):
@@ -2998,7 +3090,7 @@ class BaselineStrategy:
                 self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=alternate, avoided=next_hop, reason="avoid_live_guard_trap")
                 next_hop = alternate
             elif target in {state.gate_node, state.terminal_node} and (
-                (next_hop in {"S10", "S11", state.gate_node} and self._next_hop_is_mandatory(state, target, next_hop))
+                self._next_hop_is_mandatory(state, target, next_hop)
                 or state.me.task_score_base < self.config.target_task_score // 2
                 or self._station_stay_frames(state) >= 12
                 or self._need_endgame(state)
@@ -3046,7 +3138,7 @@ class BaselineStrategy:
                 self.logger.info("route_decision", fromNode=state.me.station, target=objective, nextHop=alternate, avoided=next_hop, reason="route_package_avoid_live_guard_trap")
                 next_hop = alternate
             elif objective in {state.gate_node, state.terminal_node} and (
-                (next_hop in {"S10", "S11", state.gate_node} and self._next_hop_is_mandatory(state, objective, next_hop))
+                self._next_hop_is_mandatory(state, objective, next_hop)
                 or state.me.task_score_base < self.config.target_task_score // 2
                 or self._station_stay_frames(state) >= 12
                 or self._need_endgame(state)

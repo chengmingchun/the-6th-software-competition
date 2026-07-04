@@ -14,6 +14,7 @@ def inquire(
     phase: str = "NORMAL",
     current_node: str = "S03",
     edges: list[dict] | None = None,
+    route_edge_id: str | None = None,
 ):
     return {
         "msg_name": "inquire",
@@ -25,7 +26,7 @@ def inquire(
                     "playerId": "1001",
                     "state": player_state,
                     "currentNodeId": current_node,
-                    "routeEdgeId": "E1" if player_state == "MOVING" else None,
+                    "routeEdgeId": route_edge_id if route_edge_id is not None else ("E1" if player_state == "MOVING" else None),
                     "freshness": freshness,
                     "taskScore": task_score,
                     "verified": verified,
@@ -72,6 +73,11 @@ class AuditMetricsTest(unittest.TestCase):
         audit = new_audit()
         audit_frame(audit, inquire(player_state="MOVING", resources={"ICE_BOX": 1}, freshness=80), "1001", [])
         audit_frame(audit, inquire(player_state="PROCESSING", resources={"ICE_BOX": 1}, freshness=80), "1001", [])
+        self.assertEqual(audit["iceBoxUnusedLowFreshnessFrames"], 0)
+
+    def test_ice_box_unused_is_not_flagged_while_waiting_on_route_edge(self):
+        audit = new_audit()
+        audit_frame(audit, inquire(player_state="WAITING", resources={"ICE_BOX": 1}, freshness=80, route_edge_id="E10"), "1001", [])
         self.assertEqual(audit["iceBoxUnusedLowFreshnessFrames"], 0)
 
     def test_high_value_abstain_is_counted(self):
