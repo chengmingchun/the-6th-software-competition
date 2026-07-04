@@ -20,6 +20,17 @@ class SilentLogger(DecisionLogger):
         return None
 
 
+class RecordingLogger(DecisionLogger):
+    def __init__(self) -> None:
+        self.records = []
+
+    def info(self, event: str, **fields):
+        self.records.append((event, fields))
+
+    def close(self) -> None:
+        return None
+
+
 class StrategyRouteResourceTest(unittest.TestCase):
     def make_strategy(self) -> BaselineStrategy:
         return BaselineStrategy("1001", StrategyConfig.default(), SilentLogger())
@@ -882,6 +893,57 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.CLAIM_RESOURCE)
         self.assertEqual(action.main.to_action()["resourceType"], "ICE_BOX")
+
+    def test_resource_intent_and_server_result_are_logged(self) -> None:
+        logger = RecordingLogger()
+        strategy = BaselineStrategy("1001", StrategyConfig.default(), logger)
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=45, freshness=97),
+            resources=[ResourceStock(station="S03", resource_type="ICE_BOX", amount=1, claim_frames=2)],
+        )
+        strategy.decide(state)
+        self.assertTrue(any(event == "resource_intent" and fields.get("action") == "CLAIM_RESOURCE" and fields.get("resourceType") == "ICE_BOX" for event, fields in logger.records))
+
+        accepted = GameState(
+            frame=181,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=45, freshness=97, resources={"ICE_BOX": 1}),
+            action_results=[{"playerId": "1001", "action": "CLAIM_RESOURCE", "accepted": True, "targetNodeId": "S03", "resourceType": "ICE_BOX"}],
+        )
+        strategy.decide(accepted)
+        self.assertTrue(any(event == "resource_result" and fields.get("status") == "accepted" and fields.get("resourceType") == "ICE_BOX" for event, fields in logger.records))
+
+    def test_squad_dispatch_and_server_result_are_logged(self) -> None:
+        logger = RecordingLogger()
+        strategy = BaselineStrategy("1001", StrategyConfig.default(), logger)
+        moving = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.MOVING, station="S01", target="S02", task_score_base=90, squad_available=2),
+            stations={"S02": Station(id="S02", has_obstacle=True)},
+            edges=[RouteEdge(id="E1", start="S01", end="S02", distance=1), RouteEdge(id="E2", start="S02", end="S14", distance=1)],
+        )
+        strategy.decide(moving)
+        self.assertTrue(any(event == "squad_dispatch" and fields.get("action") == "SQUAD_CLEAR" and fields.get("target") == "S02" for event, fields in logger.records))
+
+        accepted = GameState(
+            frame=221,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.MOVING, station="S01", target="S02", task_score_base=90, squad_available=0),
+            stations={"S02": Station(id="S02", has_obstacle=True)},
+            edges=moving.edges,
+            action_results=[{"playerId": "1001", "action": "SQUAD_CLEAR", "accepted": True, "targetNodeId": "S02"}],
+        )
+        strategy.decide(accepted)
+        self.assertTrue(any(event == "squad_result" and fields.get("status") == "accepted" and fields.get("target") == "S02" for event, fields in logger.records))
 
     def test_reachable_ice_box_allows_quality_detour_at_target_score(self) -> None:
         strategy = self.make_strategy()

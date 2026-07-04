@@ -19,6 +19,7 @@ class DecisionLogger:
         "connect", "registration_sent", "start", "strategy_start", "strategy_variant",
         "decision", "action_result", "feedback_learn",
         "strategy_step", "resource_use", "resource_use_skip",
+        "resource_intent", "resource_result", "squad_dispatch", "squad_result",
         "rush_tactic", "rush_tactic_skip", "blocker_decision",
         "fixed_process_eval", "squad_eval", "stall_breaker",
         "server_error", "message_error", "server_closed", "over",
@@ -90,6 +91,8 @@ class DecisionLogger:
             return fields.get("step") == "window_card"
         if event == "squad_eval":
             return bool(fields.get("action"))
+        if event in {"resource_intent", "resource_result", "squad_dispatch", "squad_result"}:
+            return True
         if event in self.NOISY_EVENTS:
             return False
         return event in self.KEY_EVENTS
@@ -181,6 +184,35 @@ class DecisionLogger:
 
     def _fmt_resource_use_skip(self, fields: dict[str, Any]) -> str:
         return f"[道具] 跳过 {fields.get('resourceType')} reason={fields.get('reason')}"
+
+    def _fmt_resource_intent(self, fields: dict[str, Any]) -> str:
+        return (
+            f"[resource-send] {fields.get('action')} {fields.get('resourceType')} "
+            f"target={fields.get('target')} reason={fields.get('reason')} "
+            f"stockBefore={self._stock_text(fields.get('stockBefore'))} "
+            f"fresh={self._num(fields.get('freshness'))} task={fields.get('taskScore')}"
+        )
+
+    def _fmt_resource_result(self, fields: dict[str, Any]) -> str:
+        return (
+            f"[resource-result] {fields.get('action')} {fields.get('resourceType')} "
+            f"status={fields.get('status')} accepted={fields.get('accepted')} code={fields.get('code')} "
+            f"node={fields.get('nodeId')} stockAfter={self._stock_text(fields.get('stockAfter'))} "
+            f"fresh={self._num(fields.get('freshness'))}"
+        )
+
+    def _fmt_squad_dispatch(self, fields: dict[str, Any]) -> str:
+        return (
+            f"[squad-send] {fields.get('action')} -> {fields.get('target')} "
+            f"reason={fields.get('reason')} available={fields.get('available')} "
+            f"eta={fields.get('eta')} cooldownUntil={fields.get('cooldownUntil')}"
+        )
+
+    def _fmt_squad_result(self, fields: dict[str, Any]) -> str:
+        return (
+            f"[squad-result] {fields.get('action')} -> {fields.get('target')} "
+            f"status={fields.get('status')} accepted={fields.get('accepted')} code={fields.get('code')}"
+        )
 
     def _fmt_rush_tactic(self, fields: dict[str, Any]) -> str:
         return f"[急策] {fields.get('action')} reason={fields.get('reason')} 剩余路程≈{fields.get('remainingCost')} 剩余帧={fields.get('turnsLeft')} 鲜={self._num(fields.get('freshness'))}"

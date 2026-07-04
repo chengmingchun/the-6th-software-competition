@@ -605,6 +605,7 @@ class BaselineStrategy:
         self._log_state_snapshot(state)
         decision = self._decide(state)
         self._remember_outbound_actions(state, decision.bundle)
+        self._log_outbound_actions(state, decision.bundle, decision.reason)
         if decision.bundle.squad is not None:
             self._last_attempted_squad = (state.frame, decision.bundle.squad.action.value, decision.bundle.squad.target)
             if decision.bundle.squad.action == SquadActionType.SQUAD_SCOUT:
@@ -817,7 +818,8 @@ class BaselineStrategy:
             success = result.get("success")
             effective = result.get("effective")
             code = str(result.get("code") or result.get("errorCode") or result.get("reason") or result.get("message") or "").upper()
-            node_id = result.get("targetNodeId") or result.get("node") or result.get("nodeId") or state.me.station
+            raw_node_id = result.get("targetNodeId") or result.get("node") or result.get("nodeId")
+            node_id = raw_node_id or state.me.station
             task_id = result.get("taskId")
             resource_type = result.get("resourceType")
             if action == "MOVE" and code == "MOVE_BLOCKED_BY_GUARD":
@@ -837,7 +839,10 @@ class BaselineStrategy:
                 recent_use = self._recent_attempted_use_resource(state)
                 if recent_use is not None:
                     node_id, resource_type = recent_use
+            if action.startswith("SQUAD_") and not raw_node_id:
+                node_id = self._squad_reject_target(state, action, str(node_id or ""))
             self.logger.info("action_result", action=action, accepted=accepted, success=success, code=code, nodeId=node_id, taskId=task_id, resourceType=resource_type, raw=result)
+            self._log_server_action_result(state, action, accepted, success, effective, code, node_id, task_id, resource_type, result)
             failed = accepted is False or success is False or effective is False or bool(code)
             if action == "WINDOW_CARD" and (failed or code in WINDOW_REJECT_CODES):
                 contest_id = str(result.get("contestId") or result.get("windowId") or result.get("id") or "")
@@ -993,6 +998,87 @@ class BaselineStrategy:
                 self._scout_dispatched.add(bundle.main.target)
         elif bundle.main.action in {MainActionType.FORCED_PASS, MainActionType.BREAK_GUARD, MainActionType.CLEAR} and bundle.main.target:
             self._last_attempted_blocker_action = (state.frame, bundle.main.action.value, bundle.main.target)
+
+    def _log_outbound_actions(self, state: GameState, bundle: ActionBundle, reason: str) -> None:
+        if bundle.main is not None:
+            main = bundle.main
+            if main.action == MainActionType.CLAIM_RESOURCE:
+                self.logger.info(
+                    "resource_intent",
+                    action=main.action.value,
+                    target=main.target,
+                    resourceType=main.resource_type,
+                    reason=reason,
+                    stockBefore=dict(state.me.resources),
+                    freshness=state.me.freshness,
+                    taskScore=state.me.task_score_base,
+                )
+            elif main.action == MainActionType.USE_RESOURCE:
+                self.logger.info(
+                    "resource_intent",
+                    action=main.action.value,
+                    target=main.target,
+                    resourceType=main.resource_type,
+                    reason=reason,
+                    stockBefore=dict(state.me.resources),
+                    freshness=state.me.freshness,
+                    taskScore=state.me.task_score_base,
+                )
+        if bundle.squad is not None:
+            squad = bundle.squad
+            self.logger.info(
+                "squad_dispatch",
+                action=squad.action.value,
+                target=squad.target,
+                reason=reason,
+                available=state.me.squad_available,
+                eta=self._squad_arrival_delay(state, squad.target),
+                cooldownUntil=state.frame + 20,
+            )
+
+    def _log_server_action_result(
+        self,
+        state: GameState,
+        action: str,
+        accepted: Any,
+        success: Any,
+        effective: Any,
+        code: str,
+        node_id: Any,
+        task_id: Any,
+        resource_type: Any,
+        raw: dict[str, Any],
+    ) -> None:
+        failed = accepted is False or success is False or effective is False or bool(code)
+        status = "rejected" if failed else "accepted"
+        if action in {"CLAIM_RESOURCE", "USE_RESOURCE"}:
+            self.logger.info(
+                "resource_result",
+                action=action,
+                status=status,
+                accepted=accepted,
+                success=success,
+                effective=effective,
+                code=code,
+                nodeId=node_id,
+                resourceType=resource_type,
+                stockAfter=dict(state.me.resources),
+                freshness=state.me.freshness,
+                raw=raw,
+            )
+        elif action.startswith("SQUAD_"):
+            self.logger.info(
+                "squad_result",
+                action=action,
+                status=status,
+                accepted=accepted,
+                success=success,
+                effective=effective,
+                code=code,
+                target=node_id,
+                cooldownKey=(action, str(node_id or "")),
+                raw=raw,
+            )
 
     def _recent_attempted_task(self, state: GameState) -> str | None:
         if self._last_attempted_task is None:
