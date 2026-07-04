@@ -895,6 +895,65 @@ class BaselineStrategyTest(unittest.TestCase):
         )
         self.assertEqual(self.strategy.decide(state).window.card, WindowCard.ABSTAIN)
 
+    def test_noncritical_window_preserves_document_horse_and_good_fruit_cards(self) -> None:
+        state = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(
+                player_id="1001",
+                status=ConvoyStatus.IDLE,
+                station="S02",
+                guard_points=0,
+                good_fruit=100,
+                freshness=100,
+                resources={"PASS_TOKEN": 1, "FAST_HORSE": 1},
+            ),
+            windows=[WindowState(id="contest-noncritical-ice", window_type="RESOURCE", resource_type="ICE_BOX", target="S02", active=True, my_turn=True, round_index=1)],
+        )
+        self.assertEqual(self.strategy.decide(state).window.card, WindowCard.ABSTAIN)
+
+    def test_window_memory_counters_opponent_qiang_xing_across_windows(self) -> None:
+        strategy = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger())
+        observed = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S02", guard_points=0),
+            opponent=PlayerState(player_id="1002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S02", guard_points=0),
+            windows=[
+                WindowState(
+                    id="contest-memory-observed",
+                    window_type="TASK",
+                    target="S02",
+                    active=True,
+                    my_turn=True,
+                    round_index=2,
+                    raw={"redPlayerId": "1001", "bluePlayerId": "1002", "blueCard": "QIANG_XING"},
+                )
+            ],
+        )
+        strategy.decide(observed)
+        followup = GameState(
+            frame=230,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S02", guard_points=0, resources={"PASS_TOKEN": 1}),
+            opponent=PlayerState(player_id="1002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S02", guard_points=0, resources={"FAST_HORSE": 1}),
+            windows=[
+                WindowState(
+                    id="contest-memory-followup",
+                    window_type="PASS",
+                    target="S02",
+                    active=True,
+                    my_turn=True,
+                    round_index=1,
+                    raw={"redPlayerId": "1001", "bluePlayerId": "1002"},
+                )
+            ],
+        )
+        self.assertEqual(strategy.decide(followup).window.card, WindowCard.YAN_DIE)
+
     def test_symmetric_bots_pick_different_opening_window_cards(self) -> None:
         window = WindowState(
             id="contest-symmetric",

@@ -130,17 +130,20 @@ class WindowStrategy:
 
     def __init__(self) -> None:
         self._opponent_card_streaks: dict[str, tuple[WindowCard, int]] = {}
+        self._opponent_card_counts: dict[str, dict[WindowCard, int]] = {}
+        self._seen_opponent_card_observations: set[str] = set()
 
     def choose(self, state: GameState, window: WindowState, config: StrategyConfig) -> WindowChoice:
         high_value = self._is_high_value(state, window)
         value = self._window_value(state, window)
         opponent_card = self._opponent_revealed_card(state, window)
         if opponent_card is not None:
+            self._remember_opponent_card_profile(state, window, opponent_card)
             streak_card, streak_count = self._remember_opponent_card_streak(state, window, opponent_card)
-            streak_counter = self._counter_streak(state, streak_card, streak_count)
+            streak_counter = self._counter_streak(state, window, streak_card, streak_count, high_value, value)
             if streak_counter is not None:
                 return WindowChoice(streak_counter, "COUNTER_STREAK", f"counter opponent streak {streak_card.value}x{streak_count}")
-            counter = self._counter_card(state, opponent_card, high_value)
+            counter = self._counter_card(state, window, opponent_card, high_value, value)
             if counter is not None:
                 return WindowChoice(counter, "COUNTER_LAST_CARD", f"counter previous opponent card {opponent_card.value}")
         if self._is_opening_fight(state, window, config):
@@ -206,16 +209,17 @@ class WindowStrategy:
             return 48
         return 28
 
-    def _affordable_cards(self, state: GameState, high_value: bool) -> list[WindowCard]:
+    def _affordable_cards(self, state: GameState, window: WindowState, high_value: bool, value: int) -> list[WindowCard]:
         me = state.me
+        my_score, opp_score = self._score_state(state, window)
         cards: list[WindowCard] = []
         if me.guard_points > 1 or (high_value and me.guard_points > 0):
             cards.append(WindowCard.BING_ZHENG)
-        if high_value and me.freshness >= 82 and me.good_fruit >= 75:
+        if high_value and me.freshness >= 82 and me.good_fruit >= 75 and self._should_spend_expensive_window_card(state, window, WindowCard.XIAN_GONG, value, my_score, opp_score, high_value):
             cards.append(WindowCard.XIAN_GONG)
-        if high_value and (me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")):
+        if high_value and (me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")) and self._should_spend_expensive_window_card(state, window, WindowCard.QIANG_XING, value, my_score, opp_score, high_value):
             cards.append(WindowCard.QIANG_XING)
-        if high_value and (me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT")):
+        if high_value and (me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT")) and self._should_spend_expensive_window_card(state, window, WindowCard.YAN_DIE, value, my_score, opp_score, high_value):
             cards.append(WindowCard.YAN_DIE)
         cards.append(WindowCard.ABSTAIN)
         result: list[WindowCard] = []
@@ -225,7 +229,7 @@ class WindowStrategy:
         return result
 
     def _ev_options(self, state: GameState, window: WindowState, high_value: bool, value: int) -> list[tuple[WindowCard, int]]:
-        affordable = self._affordable_cards(state, high_value)
+        affordable = self._affordable_cards(state, window, high_value, value)
         my_score, opp_score = self._score_state(state, window)
         total_rounds = int(window.raw.get("totalRounds") or 3)
         round_index = window.round_index or 1
@@ -288,6 +292,9 @@ class WindowStrategy:
             last = self._opponent_revealed_card(state, window)
             if last is not None:
                 weights[last] += 30
+        memory = self._opponent_memory(state, window)
+        for card, count in memory.items():
+            weights[card] = weights.get(card, 0) + min(36, count * 9)
         return {card: weight for card, weight in weights.items() if weight > 0}
 
     def _expected_card_score(self, card: WindowCard, opponent_weights: dict[WindowCard, int], value: int) -> int:
@@ -316,6 +323,31 @@ class WindowStrategy:
         if card == WindowCard.YAN_DIE:
             return 18 if high_value else 42
         return 20
+
+    def _is_critical_window(self, state: GameState, window: WindowState, value: int, my_score: int | None = None, opp_score: int | None = None) -> bool:
+        ctype = str(window.window_type or "").upper()
+        if ctype in {"PASS", "GATE"} or window.target == state.gate_node:
+            return True
+        if value >= 90:
+            return True
+        if window.task_id:
+            for task in state.tasks:
+                if task.id == window.task_id and task.score >= 30:
+                    return True
+        if my_score is not None and opp_score is not None and my_score <= opp_score and value >= 60:
+            return True
+        return False
+
+    def _should_spend_expensive_window_card(self, state: GameState, window: WindowState, card: WindowCard, value: int, my_score: int, opp_score: int, high_value: bool) -> bool:
+        if card not in {WindowCard.YAN_DIE, WindowCard.QIANG_XING, WindowCard.XIAN_GONG}:
+            return True
+        if self._is_critical_window(state, window, value, my_score, opp_score):
+            return True
+        if my_score < opp_score and high_value:
+            return True
+        if card == WindowCard.XIAN_GONG and state.me.good_fruit >= 98 and state.me.freshness >= 96 and value >= 70:
+            return True
+        return False
 
     def _must_win_bonus(self, card: WindowCard, opponent_weights: dict[WindowCard, int]) -> int:
         return sum(weight * 2 for opp, weight in opponent_weights.items() if WINDOW_MATRIX.get(card, {}).get(opp) == "WIN")
@@ -439,26 +471,27 @@ class WindowStrategy:
                 continue
         return None
 
-    def _counter_card(self, state: GameState, opponent_card: WindowCard, high_value: bool) -> WindowCard | None:
+    def _counter_card(self, state: GameState, window: WindowState, opponent_card: WindowCard, high_value: bool, value: int) -> WindowCard | None:
         me = state.me
+        my_score, opp_score = self._score_state(state, window)
         if opponent_card == WindowCard.YAN_DIE:
             if me.guard_points > 0:
                 return WindowCard.BING_ZHENG
-            if high_value and me.freshness >= 82 and me.good_fruit >= 75:
+            if high_value and me.freshness >= 82 and me.good_fruit >= 75 and self._should_spend_expensive_window_card(state, window, WindowCard.XIAN_GONG, value, my_score, opp_score, high_value):
                 return WindowCard.XIAN_GONG
         if opponent_card == WindowCard.QIANG_XING:
-            if me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT"):
+            if (me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT")) and self._should_spend_expensive_window_card(state, window, WindowCard.YAN_DIE, value, my_score, opp_score, high_value):
                 return WindowCard.YAN_DIE
             if me.guard_points > 0:
                 return WindowCard.BING_ZHENG
         if opponent_card == WindowCard.XIAN_GONG:
-            if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE"):
+            if (me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")) and self._should_spend_expensive_window_card(state, window, WindowCard.QIANG_XING, value, my_score, opp_score, high_value):
                 return WindowCard.QIANG_XING
-            if me.freshness >= 75 and me.good_fruit >= 70:
+            if me.freshness >= 75 and me.good_fruit >= 70 and self._should_spend_expensive_window_card(state, window, WindowCard.XIAN_GONG, value, my_score, opp_score, high_value):
                 return WindowCard.XIAN_GONG
             return WindowCard.ABSTAIN
         if opponent_card == WindowCard.BING_ZHENG:
-            if high_value and me.freshness >= 85 and me.good_fruit >= 85:
+            if high_value and me.freshness >= 85 and me.good_fruit >= 85 and self._should_spend_expensive_window_card(state, window, WindowCard.XIAN_GONG, value, my_score, opp_score, high_value):
                 return WindowCard.XIAN_GONG
         return None
 
@@ -472,18 +505,19 @@ class WindowStrategy:
         self._opponent_card_streaks[key] = current
         return current
 
-    def _counter_streak(self, state: GameState, card: WindowCard, count: int) -> WindowCard | None:
+    def _counter_streak(self, state: GameState, window: WindowState, card: WindowCard, count: int, high_value: bool, value: int) -> WindowCard | None:
         if count < 2:
             return None
         me = state.me
+        my_score, opp_score = self._score_state(state, window)
         if card == WindowCard.XIAN_GONG:
-            if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE"):
+            if (me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")) and self._should_spend_expensive_window_card(state, window, WindowCard.QIANG_XING, value, my_score, opp_score, high_value):
                 return WindowCard.QIANG_XING
-            if me.freshness >= 75 and me.good_fruit >= 70:
+            if me.freshness >= 75 and me.good_fruit >= 70 and self._should_spend_expensive_window_card(state, window, WindowCard.XIAN_GONG, value, my_score, opp_score, high_value):
                 return WindowCard.XIAN_GONG
             return WindowCard.ABSTAIN
         if card == WindowCard.QIANG_XING:
-            if me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT"):
+            if (me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT")) and self._should_spend_expensive_window_card(state, window, WindowCard.YAN_DIE, value, my_score, opp_score, high_value):
                 return WindowCard.YAN_DIE
             if me.guard_points > 0:
                 return WindowCard.BING_ZHENG
@@ -1697,6 +1731,32 @@ class BaselineStrategy:
         self.logger.info("squad_eval", action=None, reason="no_valuable_route_scout_target", objective=objective, candidates=candidates)
         return None
 
+    def _opponent_memory_key(self, state: GameState, window: WindowState) -> str:
+        opponent_id = str(state.opponent.player_id) if state.opponent is not None else ""
+        opponent_team = str(state.opponent.team_id) if state.opponent is not None else ""
+        raw = window.raw
+        if not opponent_id:
+            my_team = str(state.me.team_id or "")
+            if my_team == "RED":
+                opponent_id = str(raw.get("bluePlayerId") or "")
+                opponent_team = "BLUE"
+            elif my_team == "BLUE":
+                opponent_id = str(raw.get("redPlayerId") or "")
+                opponent_team = "RED"
+        return opponent_id or opponent_team or "opponent"
+
+    def _remember_opponent_card_profile(self, state: GameState, window: WindowState, card: WindowCard) -> None:
+        memory_key = self._opponent_memory_key(state, window)
+        observation = "|".join([memory_key, str(window.id), str(window.round_index or 1), card.value])
+        if observation in self._seen_opponent_card_observations:
+            return
+        self._seen_opponent_card_observations.add(observation)
+        counts = self._opponent_card_counts.setdefault(memory_key, {})
+        counts[card] = counts.get(card, 0) + 1
+
+    def _opponent_memory(self, state: GameState, window: WindowState) -> dict[WindowCard, int]:
+        return self._opponent_card_counts.get(self._opponent_memory_key(state, window), {})
+
     def _route_support_squad_action(self, state: GameState, *, after_current_action: bool = False) -> SquadAction | None:
         return self._proactive_squad_clear_action(state, after_current_action=after_current_action) or self._squad_scout_action(state, after_current_action=after_current_action)
 
@@ -1724,7 +1784,7 @@ class BaselineStrategy:
             t04 = self._t04_for_target(state, target)
             if t04 is not None and self._can_claim_task_from_station(state, t04, me.station):
                 self.logger.info("proactive_squad_clear_skip", target=target, pathIndex=path_index, eta=self.route_planner.estimate_frames(state, me.station, target), routeCritical=True, taskId=t04.id, reason="t04_adjacent_claim_priority")
-                return None
+                continue
             critical, detour = self._route_obstacle_criticality(state, objective, target, plan.estimated_frames)
             eta = self.route_planner.estimate_frames(state, me.station, target)
             if not critical:

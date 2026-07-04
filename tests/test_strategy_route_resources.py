@@ -1563,6 +1563,31 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertNotEqual(action.squad.action if action.squad else None, SquadActionType.SQUAD_CLEAR)
 
+    def test_proactive_squad_clear_continues_after_adjacent_t04_skip(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=260,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=60, squad_available=2, good_fruit=80),
+            stations={"S03": Station(id="S03", has_obstacle=True), "S04": Station(id="S04", has_obstacle=True)},
+            edges=[
+                RouteEdge(id="E1", start="S01", end="S02", distance=1),
+                RouteEdge(id="E2", start="S02", end="S03", distance=1),
+                RouteEdge(id="E3", start="S03", end="S04", distance=1),
+                RouteEdge(id="E4", start="S04", end="S14", distance=1),
+                RouteEdge(id="ADJ", start="S01", end="S03", distance=100),
+            ],
+            tasks=[TaskInstance(id="clear-s03", template="T04", target="S03", score=30, process_frames=6)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.CLAIM_TASK)
+        self.assertEqual(action.main.to_action()["taskId"], "clear-s03")
+        self.assertIsNotNone(action.squad)
+        self.assertEqual(action.squad.action, SquadActionType.SQUAD_CLEAR)
+        self.assertEqual(action.squad.to_action()["targetNodeId"], "S04")
+
     def test_key_obstacle_pairs_squad_clear_with_main_forced_pass_under_pressure(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
