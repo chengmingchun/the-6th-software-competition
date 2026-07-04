@@ -33,7 +33,9 @@ PLANNING_STATES = {ConvoyStatus.IDLE, ConvoyStatus.WAITING, ConvoyStatus.UNKNOWN
 PROCESS_RETRY_CODES = {"PROCESS_REQUIRED", "PROCESS_INTERRUPTED", "INTERRUPTED"}
 PROCESS_HARD_REJECT_CODES = {"PROCESS_NOT_AVAILABLE", "NOT_AT_TARGET_NODE", "INVALID_TARGET"}
 TASK_TEMPLATE_REJECT_CODES = {"TASK_CONDITION_NOT_MET", "TASK_REQUIREMENT_NOT_MET", "RESOURCE_REQUIRED", "NO_HORSE"}
+TASK_TAKEN_REJECT_CODES = {"TASK_ALREADY_TAKEN", "ALREADY_TAKEN", "TASK_NOT_AVAILABLE", "TASK_NOT_FOUND"}
 SHORT_BUSY_COOLDOWN_FRAMES = 5
+GUARD_BLOCKED_COOLDOWN_FRAMES = 28
 ICE_BOX_REJECT_CODES = {
     "INVALID_ACTION",
     "RESOURCE_NOT_APPLICABLE",
@@ -680,6 +682,7 @@ class BaselineStrategy:
         self._last_attempted_blocker_action: tuple[int, str, str] | None = None
         self._last_attempted_squad: tuple[int, str, str] | None = None
         self._blocked_guard_nodes: dict[str, int] = {}
+        self._guard_blocked_until: dict[str, int] = {}
         self._squad_weaken_until: dict[str, int] = {}
         self._squad_clear_until: dict[str, int] = {}
         self._no_blocker_until: dict[str, int] = {}
@@ -820,6 +823,9 @@ class BaselineStrategy:
         catchup_task = self._race_catchup_task_action(state)
         if catchup_task is not None:
             return done(catchup_task, "opponent_race_catchup_task")
+        route_package = self._route_package_action(state)
+        if route_package is not None:
+            return done(route_package, "route_package_high_task_score")
         if self._need_endgame(state) or self._opponent_pressure(state) or self._must_lock_delivery(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_deadline_delivery_first")
             scout = self._route_support_squad_action(state)
@@ -892,7 +898,9 @@ class BaselineStrategy:
             if event_type == "MOVE_BLOCKED_BY_GUARD":
                 error_code = "MOVE_BLOCKED_BY_GUARD"
                 action = "MOVE"
-                node_id = event.get("targetNodeId") or payload.get("targetNodeId") or event.get("nodeId") or payload.get("nodeId") or node_id
+                explicit_target = event.get("targetNodeId") or payload.get("targetNodeId") or event.get("nextNodeId") or payload.get("nextNodeId") or event.get("target") or payload.get("target")
+                recent_move = self._recent_attempted_move(state)
+                node_id = explicit_target or recent_move or node_id
             self._learn_error_code(state, action, error_code, node_id, task_id, resource_type, event)
             if event_type in {"PROCESS_COMPLETE", "FIXED_PROCESS_COMPLETE", "PROCESS_COMPLETED"} and node_id:
                 self._mark_process_completed(str(node_id), state, event)
@@ -1008,10 +1016,21 @@ class BaselineStrategy:
                 self.logger.info("feedback_learn", learned="fixed_process_rejected", nodeId=node, code=code, result=raw)
             return
         if action == "CLAIM_TASK" and task_id:
-            self._rejected_task_ids.add(str(task_id))
-            self._cooldown_object(state, self._task_object_key(str(task_id)), f"reject:{code}")
-            self._learn_task_reject_scope(state, str(task_id), code)
-            self.logger.info("feedback_learn", learned="task_rejected", taskId=task_id, code=code, result=raw)
+            task_key = self._task_object_key(str(task_id))
+            if code == "OBJECT_BUSY":
+                self._cooldown_object_for(state, task_key, SHORT_BUSY_COOLDOWN_FRAMES, f"reject:{code}")
+                self.logger.info("feedback_learn", learned="task_object_busy_short_cooldown", taskId=task_id, code=code, result=raw)
+            elif code in TASK_TAKEN_REJECT_CODES:
+                self._rejected_task_ids.add(str(task_id))
+                self._cooldown_object(state, task_key, f"reject:{code}")
+                self.logger.info("feedback_learn", learned="task_globally_rejected", taskId=task_id, code=code, result=raw)
+            elif code in TASK_TEMPLATE_REJECT_CODES:
+                self._cooldown_object(state, task_key, f"reject:{code}")
+                self._learn_task_reject_scope(state, str(task_id), code)
+                self.logger.info("feedback_learn", learned="task_requirement_rejected", taskId=task_id, code=code, result=raw)
+            else:
+                self._cooldown_object(state, task_key, f"reject:{code}")
+                self.logger.info("feedback_learn", learned="task_rejected_cooldown_only", taskId=task_id, code=code, result=raw)
         if action == "CLAIM_RESOURCE" and node_id and resource_type:
             self._rejected_resource_keys.add((str(node_id), str(resource_type)))
             self._cooldown_object(state, self._resource_object_key(str(node_id), str(resource_type)), f"reject:{code}")
@@ -1030,7 +1049,9 @@ class BaselineStrategy:
         if action == "MOVE" and code == "MOVE_BLOCKED_BY_GUARD" and node:
             current = self._blocked_guard_nodes.get(node, 0)
             self._blocked_guard_nodes[node] = current + 1
-            self.logger.info("feedback_learn", learned="move_blocked_by_guard", nodeId=node, count=current + 1, code=code, result=raw)
+            until = state.frame + GUARD_BLOCKED_COOLDOWN_FRAMES
+            self._guard_blocked_until[node] = max(self._guard_blocked_until.get(node, 0), until)
+            self.logger.info("feedback_learn", learned="move_blocked_by_guard", nodeId=node, count=current + 1, code=code, guardBlockedUntil=until, result=raw)
         if action in {"FORCED_PASS", "BREAK_GUARD", "CLEAR"} and code == "NO_BLOCKER":
             blocker_node = node
             if self._last_attempted_blocker_action is not None:
@@ -1042,6 +1063,7 @@ class BaselineStrategy:
             until = state.frame + 40
             self._no_blocker_until[blocker_node] = max(self._no_blocker_until.get(blocker_node, 0), until)
             self._blocked_guard_nodes.pop(blocker_node, None)
+            self._guard_blocked_until.pop(blocker_node, None)
             self._squad_weaken_until.pop(blocker_node, None)
             self._squad_clear_until.pop(blocker_node, None)
             self.logger.info("feedback_learn", learned="no_blocker_at_target", nodeId=blocker_node, action=action, cooldownUntil=until, result=raw)
@@ -1398,6 +1420,136 @@ class BaselineStrategy:
             return self._claim_task(task, squad=scout)
         return self._move_towards_node(state, approach, squad=scout)
 
+    def _route_package_action(self, state: GameState) -> ActionBundle | None:
+        me = state.me
+        if me.station is None or me.task_score_base >= 120 or self._need_endgame(state) or self._must_lock_delivery(state):
+            return None
+        if self._best_urgent_station_resource(state) is not None or self._best_station_task(state) is not None:
+            return None
+        packages = self._route_packages_to_gate(state)
+        if len(packages) < 2:
+            return None
+        direct_plan = self.route_planner.plan(state, me.station, state.gate_node)
+        if direct_plan is None or len(direct_plan.path) < 2:
+            return None
+        current = min(packages, key=lambda item: (item["cost"], -item["task_score"]))
+        best = max(packages, key=lambda item: (item["task_score"], -item["cost"]))
+        score_gap = int(best["task_score"]) - int(current["task_score"])
+        extra_cost = int(best["cost"]) - int(current["cost"])
+        if score_gap < 60:
+            return None
+        max_extra = 36 if score_gap >= 90 else 24
+        if extra_cost > max_extra:
+            return None
+        next_hop = str(best["path"][1])
+        if self._is_learned_guard_blocked(state, next_hop):
+            return None
+        station = state.station(next_hop)
+        if station is not None and (station.has_obstacle or station.has_enemy_guard(me.team_id)):
+            return None
+        scout = self._route_support_squad_action(state)
+        self.logger.info(
+            "route_package_eval",
+            chosenRouteType=best["route_type"],
+            chosenPath=list(best["path"]),
+            chosenTaskScore=best["task_score"],
+            currentRouteType=current["route_type"],
+            currentPath=list(current["path"]),
+            currentTaskScore=current["task_score"],
+            scoreGap=score_gap,
+            extraCost=extra_cost,
+            nextHop=next_hop,
+            reason="high_task_score_route_package",
+        )
+        return ActionBundle(main=MainAction(MainActionType.MOVE, target=next_hop), squad=scout)
+
+    def _route_packages_to_gate(self, state: GameState) -> list[dict[str, Any]]:
+        me = state.me
+        if me.station is None:
+            return []
+        paths = self._simple_paths(state, me.station, state.gate_node, max_depth=8, max_paths=48)
+        packages: list[dict[str, Any]] = []
+        for path in paths:
+            if len(path) < 2:
+                continue
+            cost = self._path_estimated_cost(state, path)
+            if cost >= 10**8:
+                continue
+            route_type = self._path_route_type(state, path)
+            task_score = self._path_task_score(state, path)
+            packages.append({"path": path, "cost": cost, "route_type": route_type, "task_score": task_score})
+        self.logger.info("route_package_eval", candidates=[{"routeType": p["route_type"], "path": list(p["path"]), "cost": p["cost"], "taskScore": p["task_score"]} for p in packages[:8]])
+        return packages
+
+    def _simple_paths(self, state: GameState, start: str, target: str, *, max_depth: int, max_paths: int) -> list[tuple[str, ...]]:
+        paths: list[tuple[str, ...]] = []
+        stack: list[tuple[str, tuple[str, ...]]] = [(start, (start,))]
+        while stack and len(paths) < max_paths:
+            node, path = stack.pop()
+            if len(path) > max_depth:
+                continue
+            if node == target:
+                paths.append(path)
+                continue
+            neighbors = sorted(state.neighbors(node), reverse=True)
+            for nxt in neighbors:
+                if nxt in path:
+                    continue
+                station = state.station(nxt)
+                if station is not None and (station.has_obstacle or station.has_enemy_guard(state.me.team_id)):
+                    continue
+                if self._is_learned_guard_blocked(state, nxt):
+                    continue
+                stack.append((nxt, (*path, nxt)))
+        return paths
+
+    def _path_estimated_cost(self, state: GameState, path: tuple[str, ...]) -> int:
+        cost = 0
+        for start, end in zip(path, path[1:]):
+            edge = self._edge_between(state, start, end)
+            if edge is None:
+                return 10**9
+            cost += self.route_planner._edge_frames(state, edge)
+            station = state.station(end)
+            if station is not None:
+                if station.has_obstacle:
+                    cost += 12
+                if station.has_enemy_guard(state.me.team_id):
+                    cost += 10 + station.guard_defense * 5
+        return cost
+
+    def _path_route_type(self, state: GameState, path: tuple[str, ...]) -> str:
+        counts: dict[str, int] = {}
+        for start, end in zip(path, path[1:]):
+            edge = self._edge_between(state, start, end)
+            route_type = str(edge.route_type if edge is not None else "ROAD").upper()
+            if route_type == "BRANCH":
+                continue
+            counts[route_type] = counts.get(route_type, 0) + 1
+        if not counts:
+            return "ROAD"
+        return max(counts.items(), key=lambda item: item[1])[0]
+
+    def _path_task_score(self, state: GameState, path: tuple[str, ...]) -> int:
+        nodes = set(path)
+        score = 0
+        for task in state.tasks:
+            if task.id in self._rejected_task_ids or self._is_task_scope_rejected(state, task):
+                continue
+            if not task.available_for(state.player_id) or not self._task_requirements_met(state, task):
+                continue
+            if task.target in nodes:
+                score += max(0, task.score)
+            elif task.template == "T04" and any(node in nodes for node in state.neighbors(task.target)):
+                score += max(0, task.score)
+        return score
+
+    def _edge_between(self, state: GameState, start: str, end: str):
+        for edge in state.edges:
+            if edge.other(start) == end:
+                return edge
+        return None
+
     def _can_verify_gate(self, state: GameState) -> bool:
         return state.phase in RUSH_PHASES
 
@@ -1451,6 +1603,22 @@ class BaselineStrategy:
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         if me.freshness <= 82 and (me.task_score_base >= self.config.target_task_score or state.turns_left < 320):
             self.logger.info("resource_use", resourceType="ICE_BOX", reason="protect_quality_before_delivery", freshness=me.freshness, taskScore=me.task_score_base, turnsLeft=state.turns_left)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        projected = self._projected_delivery_freshness(state)
+        if (
+            me.task_score_base >= self.config.target_task_score
+            and me.freshness <= 90
+            and projected <= 82
+        ):
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="projected_delivery_freshness_protection", freshness=me.freshness, projectedFreshness=projected, taskScore=me.task_score_base, remainingCost=self._remaining_delivery_cost(state))
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
+        if (
+            me.task_score_base >= self.config.target_task_score // 2
+            and me.freshness <= 82
+            and projected <= 75
+            and (self._should_lock_delivery(state) or self._need_endgame(state) or self._route_to_delivery_has_type(state, "MOUNTAIN") or self._route_has_blocker_risk(state))
+        ):
+            self.logger.info("resource_use", resourceType="ICE_BOX", reason="projected_mid_score_delivery_freshness_protection", freshness=me.freshness, projectedFreshness=projected, taskScore=me.task_score_base, remainingCost=self._remaining_delivery_cost(state))
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="ICE_BOX"))
         remaining_delivery = self._remaining_delivery_cost(state)
         if (
@@ -1559,12 +1727,6 @@ class BaselineStrategy:
 
     def _intel_target(self, state: GameState) -> str | None:
         forbidden = self._scout_forbidden(state)
-        objective = self._current_route_objective(state)
-        target, _ = self._priority_scout_target(state, objective, forbidden)
-        if target is not None:
-            if self._intel_target_in_range(state, target):
-                return target
-            self.logger.info("resource_use_skip", resourceType="INTEL", reason="target_too_far_by_route_distance", target=target)
         me = state.me
         if me.station is not None:
             best_blocked: tuple[int, str] | None = None
@@ -1585,6 +1747,12 @@ class BaselineStrategy:
             upcoming = self._upcoming_chokepoint_scout_target(state)
             if upcoming is not None:
                 return upcoming
+        objective = self._current_route_objective(state)
+        target, _ = self._priority_scout_target(state, objective, forbidden)
+        if target is not None:
+            if self._intel_target_in_range(state, target):
+                return target
+            self.logger.info("resource_use_skip", resourceType="INTEL", reason="target_too_far_by_route_distance", target=target)
         return None
 
     def _upcoming_chokepoint_scout_target(self, state: GameState) -> str | None:
@@ -2242,6 +2410,22 @@ class BaselineStrategy:
         verify_cost = 6
         return gate_cost + verify_cost + terminal_cost
 
+    def _projected_delivery_freshness(self, state: GameState) -> float:
+        remaining = self._remaining_delivery_cost(state)
+        if remaining >= 10**8:
+            return state.me.freshness
+        route_pressure = 1.0
+        if self._route_to_delivery_has_type(state, "MOUNTAIN"):
+            route_pressure += 0.25
+        if self._route_to_delivery_has_type(state, "WATER"):
+            route_pressure += 0.15
+        if self._hot_weather_active(state) or self._weather_forecast(state, "HOT"):
+            route_pressure += 0.25
+        if self._route_has_blocker_risk(state):
+            route_pressure += 0.2
+        expected_loss = remaining * 0.04 * route_pressure
+        return max(0.0, state.me.freshness - expected_loss)
+
     def _delivery_safety_buffer(self, state: GameState) -> int:
         if state.me.task_score_base >= 120:
             return 100
@@ -2708,7 +2892,11 @@ class BaselineStrategy:
         """
         if state.me.station is None:
             return wait("unknown_station", active=False)
-        forbidden = frozenset(n for n, c in self._blocked_guard_nodes.items() if c >= 2)
+        forbidden = frozenset(
+            n
+            for n, c in self._blocked_guard_nodes.items()
+            if c >= 2 or self._guard_blocked_until.get(n, -1) > state.frame
+        )
         plan = self.route_planner.plan(state, state.me.station, target, forbidden_nodes=forbidden)
         next_hop = plan.next_station if plan is not None else None
         if next_hop is None:
@@ -2735,24 +2923,27 @@ class BaselineStrategy:
                 self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=None, avoided=next_hop, reason="wait_live_guard_trap")
                 return wait("wait_live_guard_trap", active=False)
         # Learned guard: try alternate before safety gate
-        if self._has_learned_guard(state, next_hop):
+        if self._has_learned_guard(state, next_hop) or self._guard_blocked_until.get(next_hop, -1) > state.frame:
             for neighbor in state.neighbors(state.me.station):
-                if neighbor == next_hop or self._has_learned_guard(state, neighbor):
+                if neighbor == next_hop or self._has_learned_guard(state, neighbor) or self._guard_blocked_until.get(neighbor, -1) > state.frame:
                     continue
                 s = state.station(neighbor)
                 if s is not None and s.has_obstacle:
                     continue
                 p2 = self.route_planner.plan(state, neighbor, target, forbidden_nodes=frozenset({next_hop}))
                 if p2 is not None and next_hop not in p2.path and state.me.station not in p2.path[1:]:
-                    self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=neighbor, avoided=next_hop, reason="avoid_learned_guard")
+                    self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=neighbor, avoided=next_hop, reason="avoid_learned_or_cooling_guard")
                     next_hop = neighbor
                     break
         # Safety gate: handle any blocker before MOVE
         station = state.station(next_hop)
+        if self._squad_weaken_until.get(next_hop, -1) > state.frame:
+            self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="WAIT", reason="wait_squad_weaken_arrival_before_move", until=self._squad_weaken_until[next_hop])
+            return wait("wait_squad_weaken", active=False)
         if self._no_blocker_until.get(next_hop, -1) > state.frame:
             self.logger.info("blocker_decision", target=next_hop, blocker="stale", action="MOVE", reason="recent_no_blocker_feedback")
             return ActionBundle(main=MainAction(MainActionType.MOVE, target=next_hop), squad=squad)
-        if self._has_learned_guard(state, next_hop) or (station is not None and (station.has_obstacle or station.has_enemy_guard(state.me.team_id))):
+        if self._has_learned_guard(state, next_hop) or self._guard_blocked_until.get(next_hop, -1) > state.frame or (station is not None and (station.has_obstacle or station.has_enemy_guard(state.me.team_id))):
             gate = self._pre_move_safety_gate(state, next_hop, target, squad)
             if gate is not None:
                 return gate
@@ -2798,7 +2989,7 @@ class BaselineStrategy:
             return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=next_hop), squad=support)
         # ── Enemy guard / learned block ──
         enemy_guard = station is not None and station.has_enemy_guard(me.team_id)
-        learned = self._has_learned_guard(state, next_hop)
+        learned = self._has_learned_guard(state, next_hop) or self._guard_blocked_until.get(next_hop, -1) > state.frame
         if enemy_guard or learned:
             if self._squad_weaken_until.get(next_hop, -1) > state.frame:
                 self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="WAIT", reason="wait_squad_weaken_arrival", until=self._squad_weaken_until[next_hop])
@@ -2851,11 +3042,11 @@ class BaselineStrategy:
 
     def _is_learned_guard_blocked(self, state: GameState, target: str) -> bool:
         """Whether MOVE should be banned for this node (2+ failures)."""
-        return self._blocked_guard_nodes.get(target, 0) >= 2
+        return self._blocked_guard_nodes.get(target, 0) >= 2 or self._guard_blocked_until.get(target, -1) > state.frame
 
     def _has_learned_guard(self, state: GameState, target: str) -> bool:
         """Whether a guard was ever detected at this node (1+ failure)."""
-        return self._blocked_guard_nodes.get(target, 0) >= 1
+        return self._blocked_guard_nodes.get(target, 0) >= 1 or self._guard_blocked_until.get(target, -1) > state.frame
 
     def _is_live_guard_trap_risk(self, state: GameState, target: str) -> bool:
         opponent = state.opponent
