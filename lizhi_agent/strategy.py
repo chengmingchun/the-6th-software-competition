@@ -132,25 +132,41 @@ class WindowStrategy:
         self._opponent_card_streaks: dict[str, tuple[WindowCard, int]] = {}
         self._opponent_card_counts: dict[str, dict[WindowCard, int]] = {}
         self._seen_opponent_card_observations: set[str] = set()
+        self._window_loss_streaks: dict[str, int] = {}
+        self._window_score_memory: dict[str, tuple[int, int]] = {}
 
     def choose(self, state: GameState, window: WindowState, config: StrategyConfig) -> WindowChoice:
         high_value = self._is_high_value(state, window)
         value = self._window_value(state, window)
+        loss_streak = self._remember_window_loss_state(state, window)
         opponent_card = self._opponent_revealed_card(state, window)
         if opponent_card is not None:
             self._remember_opponent_card_profile(state, window, opponent_card)
             streak_card, streak_count = self._remember_opponent_card_streak(state, window, opponent_card)
+            hard_counter = self._hard_counter_card(state, window, opponent_card, high_value, value)
+            if hard_counter is not None and loss_streak >= 2:
+                return WindowChoice(hard_counter, "HARD_COUNTER_LOSS_STREAK", f"lossStreak={loss_streak};counter opponent {opponent_card.value}")
             streak_counter = self._counter_streak(state, window, streak_card, streak_count, high_value, value)
-            if streak_counter is not None:
+            if streak_counter is not None and loss_streak < 2:
                 return WindowChoice(streak_counter, "COUNTER_STREAK", f"counter opponent streak {streak_card.value}x{streak_count}")
-            counter = self._counter_card(state, window, opponent_card, high_value, value)
+            counter = hard_counter or self._counter_card(state, window, opponent_card, high_value, value)
             if counter is not None:
-                return WindowChoice(counter, "COUNTER_LAST_CARD", f"counter previous opponent card {opponent_card.value}")
+                style = "COUNTER_AFTER_LOSS" if loss_streak >= 1 else "COUNTER_LAST_CARD"
+                return WindowChoice(counter, style, f"lossStreak={loss_streak};counter previous opponent card {opponent_card.value}")
+        if not high_value and self._low_value_window_sends(state, window) >= 1:
+            return WindowChoice(WindowCard.ABSTAIN, "LOW_VALUE_ABSTAIN_AFTER_ONE", f"value={value};sends={self._low_value_window_sends(state, window)}")
         if self._is_opening_fight(state, window, config):
             options = self._opening_options(state, window, high_value, value)
+            if loss_streak >= 1:
+                options = self._bias_options_against_memory(state, window, options)
             card, roll = self._weighted_pick(state, window, options)
             return WindowChoice(card, "OPENING_MIX", f"开局窗口混合策略，候选={self._options_text(options)}", roll)
         options = self._ev_options(state, window, high_value, value)
+        if loss_streak >= 1:
+            options = self._bias_options_against_memory(state, window, options)
+        if high_value:
+            card = self._best_ev_card(state, window, high_value, value)
+            return WindowChoice(card, "WINDOW_EV_BEST", f"value={value};score={self._score_text(state, window)};lossStreak={loss_streak}")
         card, roll = self._weighted_pick(state, window, options)
         style = "WINDOW_EV_MIX" if len(options) > 1 else "WINDOW_EV_FIXED"
         return WindowChoice(card, style, f"value={value};score={self._score_text(state, window)};options={self._options_text(options)}", roll)
@@ -270,6 +286,63 @@ class WindowStrategy:
                 continue
             options.append((card, max(8, score - best + spread + 12)))
         return options or [(scored[0][1], 100)]
+
+    def _best_ev_card(self, state: GameState, window: WindowState, high_value: bool, value: int) -> WindowCard:
+        options = self._ev_options(state, window, high_value, value)
+        candidates = [card for card, _ in options if card != WindowCard.ABSTAIN]
+        if not candidates:
+            return WindowCard.ABSTAIN
+        weights = self._opponent_model(state, window, high_value)
+        return max(candidates, key=lambda card: (self._expected_card_score(card, weights, value) - self._card_cost(card, state, high_value), card.value))
+
+    def _window_memory_key(self, state: GameState, window: WindowState) -> str:
+        return "|".join([str(self._opponent_memory_key(state, window)), str(window.id or ""), str(window.target or ""), str(window.window_type or ""), str(window.task_id or ""), str(window.resource_type or "")])
+
+    def _remember_window_loss_state(self, state: GameState, window: WindowState) -> int:
+        key = self._window_memory_key(state, window)
+        my_score, opp_score = self._score_state(state, window)
+        previous = self._window_score_memory.get(key)
+        inferred_loss = previous is not None and opp_score > previous[1] and my_score <= previous[0]
+        if self._window_raw_loss(state, window) or inferred_loss:
+            self._window_loss_streaks[key] = self._window_loss_streaks.get(key, 0) + 1
+        elif my_score > opp_score:
+            self._window_loss_streaks[key] = 0
+        self._window_score_memory[key] = (my_score, opp_score)
+        return self._window_loss_streaks.get(key, 0)
+
+    def _window_raw_loss(self, state: GameState, window: WindowState) -> bool:
+        raw = window.raw
+        my_team = str(state.me.team_id or "").upper()
+        winner = str(raw.get("winner") or raw.get("winnerTeam") or raw.get("roundWinner") or raw.get("lastWinner") or "").upper()
+        if winner and my_team and winner not in {my_team, "DRAW", "NONE", "TIE"}:
+            return True
+        for key in ("lost", "lastLost", "roundLost", "myLost"):
+            if raw.get(key) is True:
+                return True
+        outcome = str(raw.get("outcome") or raw.get("lastOutcome") or raw.get("result") or "").upper()
+        return outcome in {"LOSE", "LOST", "LOSS", "FAIL"}
+
+    def _low_value_window_sends(self, state: GameState, window: WindowState) -> int:
+        raw_sends = window.raw.get("mySendCount") or window.raw.get("sentCount") or window.raw.get("sendCount")
+        try:
+            return int(raw_sends)
+        except (TypeError, ValueError):
+            return max(0, int(window.round_index or 1) - 1)
+
+    def _bias_options_against_memory(self, state: GameState, window: WindowState, options: list[tuple[WindowCard, int]]) -> list[tuple[WindowCard, int]]:
+        memory = self._opponent_memory(state, window)
+        if not memory:
+            return options
+        likely = max(memory.items(), key=lambda item: item[1])[0]
+        counter = self._hard_counter_card(state, window, likely, self._is_high_value(state, window), self._window_value(state, window))
+        if counter is None:
+            return options
+        result: list[tuple[WindowCard, int]] = []
+        for card, weight in options:
+            result.append((card, weight + 45 if card == counter else weight))
+        if all(card != counter for card, _ in result):
+            result.append((counter, 50))
+        return result
 
     def _opponent_model(self, state: GameState, window: WindowState, high_value: bool) -> dict[WindowCard, int]:
         opponent = state.opponent
@@ -520,6 +593,27 @@ class WindowStrategy:
                 return WindowCard.XIAN_GONG
         return None
 
+    def _hard_counter_card(self, state: GameState, window: WindowState, opponent_card: WindowCard, high_value: bool, value: int) -> WindowCard | None:
+        me = state.me
+        my_score, opp_score = self._score_state(state, window)
+        if opponent_card == WindowCard.QIANG_XING:
+            if (me.has_resource("PASS_TOKEN") or me.has_resource("OFFICIAL_PERMIT")) and self._should_spend_expensive_window_card(state, window, WindowCard.YAN_DIE, value, my_score, opp_score, high_value):
+                return WindowCard.YAN_DIE
+            if me.guard_points > 0:
+                return WindowCard.BING_ZHENG
+        if opponent_card == WindowCard.XIAN_GONG:
+            if (me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED") or me.has_resource("FAST_HORSE") or me.has_resource("SHORT_HORSE")) and self._should_spend_expensive_window_card(state, window, WindowCard.QIANG_XING, value, my_score, opp_score, high_value):
+                return WindowCard.QIANG_XING
+        if opponent_card == WindowCard.YAN_DIE:
+            if me.guard_points > 0:
+                return WindowCard.BING_ZHENG
+            if high_value and me.freshness >= 82 and me.good_fruit >= 75 and self._should_spend_expensive_window_card(state, window, WindowCard.XIAN_GONG, value, my_score, opp_score, high_value):
+                return WindowCard.XIAN_GONG
+        if opponent_card == WindowCard.BING_ZHENG:
+            if high_value and me.freshness >= 85 and me.good_fruit >= 85 and self._should_spend_expensive_window_card(state, window, WindowCard.XIAN_GONG, value, my_score, opp_score, high_value):
+                return WindowCard.XIAN_GONG
+        return None
+
     def _remember_opponent_card_streak(self, state: GameState, window: WindowState, card: WindowCard) -> tuple[WindowCard, int]:
         key = "|".join([str(state.player_id), str(window.target or state.me.station or ""), str(window.window_type or ""), str(window.task_id or ""), str(window.resource_type or "")])
         previous = self._opponent_card_streaks.get(key)
@@ -723,6 +817,9 @@ class BaselineStrategy:
             if pressure_ice is not None:
                 scout = self._route_support_squad_action(state)
                 return done(self._move_towards_node(state, pressure_ice.station, squad=scout), "move_to_pressure_ice_box")
+        catchup_task = self._race_catchup_task_action(state)
+        if catchup_task is not None:
+            return done(catchup_task, "opponent_race_catchup_task")
         if self._need_endgame(state) or self._opponent_pressure(state) or self._must_lock_delivery(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_deadline_delivery_first")
             scout = self._route_support_squad_action(state)
@@ -1232,8 +1329,8 @@ class BaselineStrategy:
     def _opponent_pressure(self, state: GameState) -> bool:
         if state.opponent is None or state.me.station is None or state.opponent.station is None:
             return False
-        if state.me.task_score_base < self.config.target_task_score:
-            return False
+        if self.opponent_race_pressure(state):
+            return True
         if state.opponent.verified or state.opponent.delivered:
             return True
         my_gate = self.route_planner.estimate_frames(state, state.me.station, state.gate_node)
@@ -1242,6 +1339,64 @@ class BaselineStrategy:
         if pressure:
             self.logger.info("opponent_pressure", myGateCost=my_gate, opponentGateCost=opp_gate)
         return pressure
+
+    def opponent_race_pressure(self, state: GameState) -> bool:
+        opponent = state.opponent
+        me = state.me
+        if opponent is None or me.station is None:
+            return False
+        high_score = opponent.task_score_base >= 150 or opponent.task_score_base - me.task_score_base >= 60
+        if opponent.verified or opponent.delivered:
+            return high_score or opponent.task_score_base >= self.config.target_task_score
+        if not high_score or opponent.station is None:
+            return False
+        my_target = state.terminal_node if me.verified else state.gate_node
+        opp_target = state.terminal_node if opponent.verified else state.gate_node
+        my_cost = self.route_planner.estimate_frames(state, me.station, my_target)
+        opp_cost = self.route_planner.estimate_frames(state, opponent.station, opp_target)
+        pressure = opp_cost + 20 <= my_cost
+        if pressure:
+            self.logger.info("opponent_pressure", myGateCost=my_cost, opponentGateCost=opp_cost, opponentTaskScore=opponent.task_score_base, myTaskScore=me.task_score_base, reason="race_pressure")
+        return pressure
+
+    def terminal_guard_threat(self, state: GameState) -> bool:
+        opponent = state.opponent
+        me = state.me
+        if opponent is None or me.station is None:
+            return False
+        opponent_near_terminal = opponent.verified or opponent.delivered
+        if opponent.station is not None:
+            target = state.terminal_node if opponent.verified else state.gate_node
+            opponent_near_terminal = opponent_near_terminal or self.route_planner.estimate_frames(state, opponent.station, target) <= 8
+        if not opponent_near_terminal and not self.opponent_race_pressure(state):
+            return False
+        critical = self._terminal_chokepoints(state)
+        target = state.terminal_node if me.verified else state.gate_node
+        plan = self.route_planner.plan(state, me.station, target)
+        remaining = set(plan.path[1:]) if plan is not None else set()
+        if remaining & critical:
+            return True
+        for node in critical | remaining:
+            station = state.station(node)
+            if station is not None and station.has_enemy_guard(me.team_id):
+                return True
+        return False
+
+    def _terminal_chokepoints(self, state: GameState) -> set[str]:
+        return {"S10", "S11", state.gate_node, state.terminal_node}
+
+    def _race_catchup_task_action(self, state: GameState) -> ActionBundle | None:
+        if not self.opponent_race_pressure(state) or state.me.task_score_base >= 120 or self._need_endgame(state):
+            return None
+        task = self._best_reachable_task(state)
+        if task is None or task.score < 30:
+            return None
+        approach = self._task_approach_nodes.get(task.id, task.target)
+        scout = self._route_support_squad_action(state, after_current_action=approach == state.me.station)
+        self.logger.info("strategy_step", step="opponent_race_catchup_task", taskId=task.id, score=task.score, approach=approach, reason="opponent_high_score_fast_route")
+        if approach == state.me.station:
+            return self._claim_task(task, squad=scout)
+        return self._move_towards_node(state, approach, squad=scout)
 
     def _can_verify_gate(self, state: GameState) -> bool:
         return state.phase in RUSH_PHASES
@@ -1598,6 +1753,11 @@ class BaselineStrategy:
         if freshness_pressure >= 3 and state.me.task_score_base >= self.config.target_task_score:
             self.logger.info("task_eval_reachable", candidates=[], reason="critical_freshness_delivery_first")
             return None
+        catch_up_mode = (
+            state.opponent is not None
+            and state.opponent.task_score_base >= state.me.task_score_base + 60
+            and state.me.task_score_base < 120
+        )
         direct = self.route_planner.estimate_frames(state, state.me.station, state.gate_node)
         candidates: list[tuple[int, TaskInstance, str, int, int, int]] = []
         for task in state.tasks:
@@ -1616,6 +1776,8 @@ class BaselineStrategy:
                 to_gate = self.route_planner.estimate_frames(state, approach, state.gate_node)
                 detour = to_task + task.process_frames + to_gate - direct
                 max_detour = self.config.max_task_detour_frames + (12 if task.score >= 30 else 0)
+                if catch_up_mode and task.score >= 30:
+                    max_detour += 18 if task.score < 45 else 28
                 if task.template == "T04" and task.score >= 30:
                     max_detour += 18
                 if state.me.task_score_base >= self.config.target_task_score and task.score >= 30:
@@ -1632,6 +1794,8 @@ class BaselineStrategy:
                         value += 35
                     if state.me.task_score_base >= self.config.target_task_score:
                         value += 20
+                    if catch_up_mode and task.score >= 30:
+                        value += 90 if task.score >= 45 else 60
                     if freshness_pressure >= 2:
                         value -= max(0, detour) * 4 + task.process_frames * 3
                     candidates.append((value, task, approach, detour, to_task, to_gate))
@@ -1813,6 +1977,9 @@ class BaselineStrategy:
             return True
         if action == SquadActionType.SQUAD_CLEAR and purpose == "moving_obstacle_rescue":
             return True
+        if action == SquadActionType.SQUAD_SCOUT and purpose == "route_scout" and self.terminal_guard_threat(state):
+            self.logger.info("squad_eval_skip", action=action.value, reason="terminal_guard_threat_preserve_weaken", purpose=purpose, available=available)
+            return False
         reserve = self._squad_reserve(state, action, purpose)
         if available - cost < reserve:
             self.logger.info("squad_eval_skip", action=action.value, reason="reserve_key_pass_manpower", purpose=purpose, available=available, cost=cost, reserve=reserve)
@@ -1825,6 +1992,12 @@ class BaselineStrategy:
     def _squad_reserve(self, state: GameState, action: SquadActionType, purpose: str) -> int:
         if purpose in {"late_aggressive_reinforce", "moving_guard_rescue"}:
             return 0
+        if purpose in {"terminal_guard_preempt", "blocked_route_guard"} and action == SquadActionType.SQUAD_WEAKEN:
+            return 0
+        if self.terminal_guard_threat(state):
+            if action == SquadActionType.SQUAD_WEAKEN:
+                return 0
+            return 4
         if purpose == "blocked_route_obstacle":
             return 4 if state.me.task_score_base < self.config.target_task_score and self._has_uncrossed_critical_pass(state) else 0
         if purpose == "proactive_route_obstacle":
@@ -1848,6 +2021,8 @@ class BaselineStrategy:
         return 2
 
     def _squad_scout_budget(self, state: GameState) -> int:
+        if self.terminal_guard_threat(state):
+            return 0
         if self._need_endgame(state) or self._should_prepare_gate_scout(state):
             return 3
         return 2
@@ -1880,11 +2055,44 @@ class BaselineStrategy:
         return None
 
     def _route_support_squad_action(self, state: GameState, *, after_current_action: bool = False) -> SquadAction | None:
-        return self._proactive_squad_clear_action(state, after_current_action=after_current_action) or self._squad_scout_action(state, after_current_action=after_current_action)
+        return (
+            self._preemptive_terminal_guard_squad_action(state)
+            or self._proactive_squad_clear_action(state, after_current_action=after_current_action)
+            or self._squad_scout_action(state, after_current_action=after_current_action)
+        )
+
+    def _preemptive_terminal_guard_squad_action(self, state: GameState) -> SquadAction | None:
+        me = state.me
+        if me.station is None or not self.terminal_guard_threat(state):
+            return None
+        objective = state.terminal_node if me.verified else state.gate_node
+        plan = self.route_planner.plan(state, me.station, objective)
+        if plan is None:
+            return None
+        critical = self._terminal_chokepoints(state)
+        for path_index, target in enumerate(plan.path[2:6], start=2):
+            station = state.station(target)
+            if station is None or not station.has_enemy_guard(me.team_id):
+                continue
+            if target not in critical and not self._next_hop_is_mandatory(state, objective, target):
+                continue
+            if self._squad_weaken_until.get(target, -1) > state.frame:
+                continue
+            if not self._can_spend_squad(state, SquadActionType.SQUAD_WEAKEN, "terminal_guard_preempt"):
+                return None
+            if self._squad_action_on_cooldown(state, SquadActionType.SQUAD_WEAKEN, target):
+                continue
+            self._squad_weaken_until[target] = state.frame + self._squad_arrival_delay(state, target) + 2
+            self.logger.info("squad_eval", action="SQUAD_WEAKEN", target=target, reason="terminal_guard_preempt", pathIndex=path_index, guardDefense=station.guard_defense)
+            return SquadAction(SquadActionType.SQUAD_WEAKEN, target)
+        return None
 
     def _proactive_squad_clear_action(self, state: GameState, *, after_current_action: bool = False) -> SquadAction | None:
         me = state.me
         if me.station is None:
+            return None
+        if self.terminal_guard_threat(state):
+            self.logger.info("proactive_squad_clear_skip", reason="terminal_guard_threat_preserve_squad")
             return None
         rush_delivery_lock = state.phase in RUSH_PHASES and (self._need_endgame(state) or self._must_lock_delivery(state) or self._should_lock_delivery(state))
         if state.phase in RUSH_PHASES and not rush_delivery_lock:
@@ -2626,6 +2834,8 @@ class BaselineStrategy:
         if state.me.status not in PLANNING_STATES or state.me.current_process is not None:
             return False
         if self._must_lock_delivery(state) or self._need_endgame(state) or state.phase in RUSH_PHASES:
+            return True
+        if blocker == "enemy_guard" and self.terminal_guard_threat(state) and self._is_key_chokepoint(target):
             return True
         if blocker == "enemy_guard" and self._is_key_chokepoint(target) and not self._has_safe_alternate_around(state, objective, target):
             station = state.station(target)

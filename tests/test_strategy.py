@@ -954,6 +954,53 @@ class BaselineStrategyTest(unittest.TestCase):
         )
         self.assertEqual(strategy.decide(followup).window.card, WindowCard.YAN_DIE)
 
+    def test_window_loss_streak_uses_hard_counter_without_ev_mix(self) -> None:
+        strategy = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger())
+        config = StrategyConfig.default()
+        state = GameState(
+            frame=240,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S10", resources={"PASS_TOKEN": 1}),
+            opponent=PlayerState(player_id="1002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S10", resources={"FAST_HORSE": 1}),
+        )
+        lost_window = WindowState(
+            id="terminal-pass",
+            window_type="PASS",
+            target="S14",
+            active=True,
+            my_turn=True,
+            round_index=2,
+            raw={"redPlayerId": "1001", "bluePlayerId": "1002", "blueCard": "QIANG_XING", "winnerTeam": "BLUE"},
+        )
+        strategy.window_strategy.choose(state, lost_window, config)
+        strategy.window_strategy.choose(state, lost_window, config)
+        choice = strategy.window_strategy.choose(state, lost_window, config)
+        self.assertEqual(choice.card, WindowCard.YAN_DIE)
+        self.assertEqual(choice.style, "HARD_COUNTER_LOSS_STREAK")
+
+    def test_low_value_window_abstains_after_one_active_send(self) -> None:
+        strategy = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger())
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S02", guard_points=4, good_fruit=100, freshness=100),
+        )
+        window = WindowState(
+            id="low-resource-repeat",
+            window_type="RESOURCE",
+            resource_type="BOAT_RIGHT",
+            target="S02",
+            active=True,
+            my_turn=True,
+            round_index=2,
+            raw={"mySendCount": 1},
+        )
+        choice = strategy.window_strategy.choose(state, window, StrategyConfig.default())
+        self.assertEqual(choice.card, WindowCard.ABSTAIN)
+        self.assertEqual(choice.style, "LOW_VALUE_ABSTAIN_AFTER_ONE")
+
     def test_symmetric_bots_pick_different_opening_window_cards(self) -> None:
         window = WindowState(
             id="contest-symmetric",
