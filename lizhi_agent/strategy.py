@@ -717,6 +717,11 @@ class BaselineStrategy:
             rush_resource = self._pre_move_resource_action(state)
             if rush_resource is not None:
                 return done(rush_resource, "use_rush_route_resource")
+        if self._should_prioritize_ice_box_acquisition(state):
+            pressure_ice = self._best_reachable_ice_box(state)
+            if pressure_ice is not None:
+                scout = self._route_support_squad_action(state)
+                return done(self._move_towards_node(state, pressure_ice.station, squad=scout), "move_to_pressure_ice_box")
         if self._need_endgame(state) or self._opponent_pressure(state) or self._must_lock_delivery(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_deadline_delivery_first")
             scout = self._route_support_squad_action(state)
@@ -1620,7 +1625,8 @@ class BaselineStrategy:
         )
         if me.station is None or not wants_ice:
             return None
-        direct = self.route_planner.estimate_frames(state, me.station, state.gate_node)
+        objective = state.terminal_node if me.verified else state.gate_node
+        direct = self.route_planner.estimate_frames(state, me.station, objective)
         candidates: list[tuple[int, ResourceStock, int]] = []
         for stock in state.resources:
             if stock.resource_type != "ICE_BOX":
@@ -1628,31 +1634,61 @@ class BaselineStrategy:
             if (stock.station, stock.resource_type) in self._rejected_resource_keys or self._is_object_on_cooldown(state, self._resource_object_key(stock.station, stock.resource_type)):
                 continue
             to_res = self.route_planner.estimate_frames(state, me.station, stock.station)
-            to_gate = self.route_planner.estimate_frames(state, stock.station, state.gate_node)
-            detour = to_res + stock.claim_frames + to_gate - direct
+            to_objective = self.route_planner.estimate_frames(state, stock.station, objective)
+            detour = to_res + stock.claim_frames + to_objective - direct
             if detour <= self._max_ice_box_detour(state):
                 candidates.append((self._resource_value(state, stock, detour=detour), stock, detour))
         if not candidates:
-            self.logger.info("resource_eval_pressure_ice", directToGate=direct, candidates=[])
+            self.logger.info("resource_eval_pressure_ice", objective=objective, directToObjective=direct, candidates=[])
             return None
         chosen_value, chosen, chosen_detour = max(candidates, key=lambda item: item[0])
-        self.logger.info("resource_eval_pressure_ice", directToGate=direct, candidates=[{"station": s.station, "value": v, "detour": d} for v, s, d in candidates], chosen=chosen.station, chosenValue=chosen_value, chosenDetour=chosen_detour)
+        self.logger.info("resource_eval_pressure_ice", objective=objective, directToObjective=direct, candidates=[{"station": s.station, "value": v, "detour": d} for v, s, d in candidates], chosen=chosen.station, chosenValue=chosen_value, chosenDetour=chosen_detour)
         return chosen
+
+    def _should_prioritize_ice_box_acquisition(self, state: GameState) -> bool:
+        me = state.me
+        if me.station is None or me.has_resource("ICE_BOX"):
+            return False
+        if me.task_score_base < self.config.target_task_score and me.freshness > 92:
+            return False
+        remaining = self._remaining_delivery_cost(state)
+        if remaining < 10**8 and state.turns_left <= remaining + 20:
+            self.logger.info("resource_eval_pressure_ice", reason="hard_deadline_skip", remainingCost=remaining, turnsLeft=state.turns_left)
+            return False
+        return self._best_reachable_ice_box(state) is not None
 
     def _is_delivery_deadline_tight(self, state: GameState) -> bool:
         remaining = self._remaining_delivery_cost(state)
         return remaining < 10**8 and state.turns_left <= remaining + 70
 
     def _max_ice_box_detour(self, state: GameState) -> int:
-        if self._is_delivery_deadline_tight(state):
+        remaining = self._remaining_delivery_cost(state)
+        if remaining < 10**8 and state.turns_left <= remaining + 20:
             return 0
-        if state.me.task_score_base >= 120 and (self._hot_weather_active(state) or self._weather_forecast(state, "HOT")):
-            return 42
-        if state.me.task_score_base >= self.config.target_task_score and state.me.freshness <= 94:
-            return 32
+        soft_deadline = remaining < 10**8 and state.turns_left <= remaining + 70
+        route_pressure = self._route_to_delivery_has_type(state, "MOUNTAIN") or self._hot_weather_active(state) or self._weather_forecast(state, "HOT") or self._route_has_blocker_risk(state)
+        if state.me.task_score_base >= 120 or route_pressure:
+            return 18 if not soft_deadline else 8
+        if state.me.task_score_base >= self.config.target_task_score or state.me.freshness <= 92:
+            return 12 if not soft_deadline else 6
         if state.me.task_score_base < self.config.target_task_score:
-            return 18
-        return 24
+            return 8 if not soft_deadline else 4
+        return 12 if not soft_deadline else 6
+
+    def _route_to_delivery_has_type(self, state: GameState, route_type: str) -> bool:
+        me = state.me
+        if me.station is None:
+            return False
+        objective = state.terminal_node if me.verified else state.gate_node
+        plan = self.route_planner.plan(state, me.station, objective)
+        if plan is None:
+            return False
+        wanted = str(route_type or "").upper()
+        for start, end in zip(plan.path, plan.path[1:]):
+            for edge in state.edges:
+                if {edge.start, edge.end} == {start, end} and str(edge.route_type or "").upper() == wanted:
+                    return True
+        return False
 
     def _resource_value(self, state: GameState, stock: ResourceStock, detour: int) -> int:
         priority = {name: i for i, name in enumerate(self.config.resource_priority)}

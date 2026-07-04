@@ -766,6 +766,109 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertTrue(action.main is None or action.main.action != MainActionType.USE_RESOURCE)
 
+    def test_high_score_prioritizes_reachable_ice_box_before_delivery_guard(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=260,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", freshness=90, task_score_base=120),
+            edges=[
+                RouteEdge(id="D1", start="S01", end="S14", distance=10),
+                RouteEdge(id="D2", start="S14", end="S15", distance=1),
+                RouteEdge(id="I1", start="S01", end="S02", distance=3),
+                RouteEdge(id="I2", start="S02", end="S14", distance=10),
+            ],
+            resources=[ResourceStock(station="S02", resource_type="ICE_BOX", amount=1, claim_frames=2)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_high_score_skips_ice_box_when_delivery_deadline_is_hard(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=560,
+            max_frame=602,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", freshness=90, task_score_base=120),
+            edges=[
+                RouteEdge(id="D1", start="S01", end="S14", distance=10),
+                RouteEdge(id="D2", start="S14", end="S15", distance=1),
+                RouteEdge(id="I1", start="S01", end="S02", distance=3),
+                RouteEdge(id="I2", start="S02", end="S14", distance=10),
+            ],
+            resources=[ResourceStock(station="S02", resource_type="ICE_BOX", amount=1, claim_frames=2)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
+
+    def test_verified_ice_box_detour_uses_terminal_objective(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=260,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S10", verified=True, freshness=90, task_score_base=120),
+            edges=[
+                RouteEdge(id="DG", start="S10", end="S14", distance=1),
+                RouteEdge(id="DT", start="S10", end="S15", distance=10),
+                RouteEdge(id="I1", start="S10", end="S02", distance=1),
+                RouteEdge(id="I2", start="S02", end="S14", distance=20),
+                RouteEdge(id="I3", start="S02", end="S15", distance=10),
+            ],
+            resources=[ResourceStock(station="S02", resource_type="ICE_BOX", amount=1, claim_frames=2)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_hot_weather_allows_larger_ice_box_detour(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", freshness=94, task_score_base=90),
+            edges=[
+                RouteEdge(id="D1", start="S01", end="S14", distance=10),
+                RouteEdge(id="D2", start="S14", end="S15", distance=1),
+                RouteEdge(id="I1", start="S01", end="S02", distance=4),
+                RouteEdge(id="I2", start="S02", end="S14", distance=14),
+            ],
+            resources=[ResourceStock(station="S02", resource_type="ICE_BOX", amount=1, claim_frames=2)],
+            weather=WeatherState(active_types=("HOT",)),
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_mountain_route_allows_larger_ice_box_detour(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", freshness=94, task_score_base=90),
+            edges=[
+                RouteEdge(id="D1", start="S01", end="S14", route_type="MOUNTAIN", distance=7),
+                RouteEdge(id="D2", start="S14", end="S15", distance=1),
+                RouteEdge(id="I1", start="S01", end="S02", distance=4),
+                RouteEdge(id="I2", start="S02", end="S14", distance=20),
+            ],
+            resources=[ResourceStock(station="S02", resource_type="ICE_BOX", amount=1, claim_frames=2)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
     def test_urgent_station_resource_before_task(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
@@ -789,9 +892,9 @@ class StrategyRouteResourceTest(unittest.TestCase):
             roles={"gateNodeId": "S14"},
             me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=90, freshness=94),
             edges=[
-                RouteEdge(id="D", start="S01", end="S14", distance=3),
-                RouteEdge(id="R1", start="S01", end="S02", distance=12),
-                RouteEdge(id="R2", start="S02", end="S14", distance=12),
+                RouteEdge(id="D", start="S01", end="S14", distance=10),
+                RouteEdge(id="R1", start="S01", end="S02", distance=3),
+                RouteEdge(id="R2", start="S02", end="S14", distance=10),
             ],
             resources=[ResourceStock(station="S02", resource_type="ICE_BOX", amount=1, claim_frames=2)],
         )
