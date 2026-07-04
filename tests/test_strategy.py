@@ -289,6 +289,40 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.FORCED_PASS)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
 
+    def test_guard_block_learns_explicit_target_without_recent_move_memory(self) -> None:
+        strategy = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger())
+        blocked = GameState(
+            frame=208,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S07", task_score_base=80, squad_available=0),
+            stations={"S09": Station(id="S09")},
+            edges=[RouteEdge(id="E1", start="S07", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
+            action_results=[{"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD", "targetNodeId": "S09"}],
+        )
+        action = strategy.decide(blocked)
+        self.assertNotEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.action, MainActionType.FORCED_PASS)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
+
+    def test_guard_block_event_learns_without_action_result(self) -> None:
+        strategy = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger())
+        blocked = GameState(
+            frame=208,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S07", task_score_base=80, squad_available=0),
+            stations={"S09": Station(id="S09")},
+            edges=[RouteEdge(id="E1", start="S07", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
+            events=[{"type": "MOVE_BLOCKED_BY_GUARD", "payload": {"playerId": "1001", "targetNodeId": "S09"}}],
+        )
+        action = strategy.decide(blocked)
+        self.assertNotEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.action, MainActionType.FORCED_PASS)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
+
     def test_guard_block_prefers_alternate_route(self) -> None:
         first = GameState(
             frame=100,
@@ -324,6 +358,32 @@ class BaselineStrategyTest(unittest.TestCase):
         action = self.strategy.decide(blocked)
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S10")
+
+    def test_live_guard_trap_prefers_forbidden_alternate_route(self) -> None:
+        state = GameState(
+            frame=167,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S07", task_score_base=0, squad_available=7),
+            opponent=PlayerState(player_id="1002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S09", good_fruit=1),
+            stations={"S05": Station(id="S05"), "S07": Station(id="S07"), "S08": Station(id="S08"), "S09": Station(id="S09"), "S10": Station(id="S10"), "S11": Station(id="S11"), "S12": Station(id="S12"), "S14": Station(id="S14")},
+            edges=[
+                RouteEdge(id="E04", start="S07", end="S09", route_type="ROAD", distance=46),
+                RouteEdge(id="E05", start="S09", end="S10", route_type="ROAD", distance=40),
+                RouteEdge(id="E06", start="S10", end="S11", route_type="ROAD", distance=36),
+                RouteEdge(id="E07", start="S11", end="S12", route_type="ROAD", distance=20),
+                RouteEdge(id="E08", start="S12", end="S14", route_type="ROAD", distance=25),
+                RouteEdge(id="E13", start="S05", end="S07", route_type="BRANCH", distance=46),
+                RouteEdge(id="E20", start="S07", end="S08", route_type="MOUNTAIN", distance=42),
+                RouteEdge(id="E17", start="S08", end="S10", route_type="BRANCH", distance=46),
+                RouteEdge(id="E22", start="S08", end="S09", route_type="BRANCH", distance=64),
+            ],
+            tasks=[TaskInstance(id="T_10", template="T13", target="S12", score=15, process_frames=5)],
+        )
+        action = self.strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S08")
 
     def test_waiting_at_station_still_plans_next_move(self) -> None:
         state = GameState(

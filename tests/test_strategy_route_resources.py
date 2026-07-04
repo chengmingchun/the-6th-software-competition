@@ -235,6 +235,51 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.squad.action, SquadActionType.SQUAD_WEAKEN)
         self.assertEqual(action.squad.to_action()["targetNodeId"], "S10")
 
+    def test_squad_weaken_invalid_action_type_does_not_repeat_loop(self) -> None:
+        strategy = self.make_strategy()
+        first = GameState(
+            frame=523,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                team_id="RED",
+                status=ConvoyStatus.MOVING,
+                station="S13",
+                target="S14",
+                task_score_base=120,
+                squad_available=2,
+            ),
+            stations={"S14": Station(id="S14", guard_owner="BLUE", guard_defense=2)},
+            edges=[RouteEdge(id="E1", start="S13", end="S14", distance=1), RouteEdge(id="E2", start="S14", end="S15", distance=1)],
+        )
+        first_action = strategy.decide(first)
+        self.assertIsNotNone(first_action.squad)
+        self.assertEqual(first_action.squad.action, SquadActionType.SQUAD_WEAKEN)
+        self.assertEqual(first_action.squad.to_action()["targetNodeId"], "S14")
+
+        rejected = GameState(
+            frame=524,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                team_id="RED",
+                status=ConvoyStatus.MOVING,
+                station="S13",
+                target="S14",
+                task_score_base=120,
+                squad_available=2,
+            ),
+            stations={"S14": Station(id="S14", guard_owner="BLUE", guard_defense=2)},
+            edges=first.edges,
+            action_results=[{"playerId": "1001", "action": "SQUAD_WEAKEN", "accepted": False, "code": "INVALID_ACTION_TYPE", "nodeId": "S13"}],
+        )
+        retry = strategy.decide(rejected)
+        self.assertNotEqual(retry.squad.action if retry.squad else None, SquadActionType.SQUAD_WEAKEN)
+
     def test_rush_protect_used_before_gate_to_preserve_freshness(self) -> None:
         strategy = self.make_strategy()
         state = GameState(

@@ -520,6 +520,7 @@ class BaselineStrategy:
         self._last_attempted_use_resource: tuple[int, str, str] | None = None
         self._last_attempted_move: tuple[int, str] | None = None
         self._last_attempted_blocker_action: tuple[int, str, str] | None = None
+        self._last_attempted_squad: tuple[int, str, str] | None = None
         self._blocked_guard_nodes: dict[str, int] = {}
         self._squad_weaken_until: dict[str, int] = {}
         self._squad_clear_until: dict[str, int] = {}
@@ -541,6 +542,7 @@ class BaselineStrategy:
         decision = self._decide(state)
         self._remember_outbound_actions(state, decision.bundle)
         if decision.bundle.squad is not None:
+            self._last_attempted_squad = (state.frame, decision.bundle.squad.action.value, decision.bundle.squad.target)
             if decision.bundle.squad.action == SquadActionType.SQUAD_SCOUT:
                 self._scout_dispatched.add(decision.bundle.squad.target)
                 self._squad_scout_spent += 1
@@ -720,6 +722,10 @@ class BaselineStrategy:
             resource_type = event.get("resourceType") or payload.get("resourceType")
             error_code = str(event.get("errorCode") or payload.get("errorCode") or event.get("code") or "").upper()
             action = str(event.get("action") or payload.get("action") or event.get("actionType") or "").upper()
+            if event_type == "MOVE_BLOCKED_BY_GUARD":
+                error_code = "MOVE_BLOCKED_BY_GUARD"
+                action = "MOVE"
+                node_id = event.get("targetNodeId") or payload.get("targetNodeId") or event.get("nodeId") or payload.get("nodeId") or node_id
             self._learn_error_code(state, action, error_code, node_id, task_id, resource_type, event)
             if event_type in {"PROCESS_COMPLETE", "FIXED_PROCESS_COMPLETE", "PROCESS_COMPLETED"} and node_id:
                 self._mark_process_completed(str(node_id), state, event)
@@ -746,8 +752,11 @@ class BaselineStrategy:
             task_id = result.get("taskId")
             resource_type = result.get("resourceType")
             if action == "MOVE" and code == "MOVE_BLOCKED_BY_GUARD":
+                explicit_target = result.get("targetNodeId") or result.get("nextNodeId") or result.get("target")
                 recent_move = self._recent_attempted_move(state)
-                if recent_move is not None:
+                if explicit_target not in (None, ""):
+                    node_id = explicit_target
+                elif recent_move is not None:
                     node_id = recent_move
             if action == "CLAIM_TASK" and not task_id:
                 task_id = self._recent_attempted_task(state)
@@ -836,6 +845,17 @@ class BaselineStrategy:
             self._rejected_resource_keys.add((str(node_id), str(resource_type)))
             self._cooldown_object(state, self._resource_object_key(str(node_id), str(resource_type)), f"reject:{code}")
             self.logger.info("feedback_learn", learned="resource_rejected", nodeId=node_id, resourceType=resource_type, code=code, result=raw)
+        if action.startswith("SQUAD_") and code:
+            squad_target = self._squad_reject_target(state, action, node)
+            until = state.frame + (999 if code == "INVALID_ACTION_TYPE" else 80)
+            self._squad_action_cooldown_until[(action, squad_target)] = max(self._squad_action_cooldown_until.get((action, squad_target), 0), until)
+            if action == SquadActionType.SQUAD_SCOUT.value:
+                self._scout_dispatched.discard(squad_target)
+            elif action == SquadActionType.SQUAD_CLEAR.value:
+                self._squad_clear_until.pop(squad_target, None)
+            elif action == SquadActionType.SQUAD_WEAKEN.value:
+                self._squad_weaken_until.pop(squad_target, None)
+            self.logger.info("feedback_learn", learned="squad_action_rejected", action=action, target=squad_target, code=code, cooldownUntil=until, result=raw)
         if action == "MOVE" and code == "MOVE_BLOCKED_BY_GUARD" and node:
             current = self._blocked_guard_nodes.get(node, 0)
             self._blocked_guard_nodes[node] = current + 1
@@ -928,6 +948,14 @@ class BaselineStrategy:
         if state.frame - frame <= 3:
             return node_id
         return None
+
+    def _squad_reject_target(self, state: GameState, action: str, fallback: str) -> str:
+        if self._last_attempted_squad is None:
+            return fallback
+        frame, attempted_action, target = self._last_attempted_squad
+        if attempted_action == action and state.frame - frame <= 3:
+            return target
+        return fallback
 
     def _recent_attempted_use_resource(self, state: GameState) -> tuple[str, str] | None:
         if self._last_attempted_use_resource is None:
@@ -2167,8 +2195,8 @@ class BaselineStrategy:
                 s = state.station(neighbor)
                 if s is not None and s.has_obstacle:
                     continue
-                p2 = self.route_planner.plan(state, neighbor, target)
-                if p2 is not None and next_hop not in p2.path:
+                p2 = self.route_planner.plan(state, neighbor, target, forbidden_nodes=frozenset({next_hop}))
+                if p2 is not None and next_hop not in p2.path and state.me.station not in p2.path[1:]:
                     self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=neighbor, avoided=next_hop, reason="avoid_learned_guard")
                     next_hop = neighbor
                     break
@@ -2330,8 +2358,8 @@ class BaselineStrategy:
             station = state.station(neighbor)
             if station is not None and (station.has_obstacle or station.has_enemy_guard(state.me.team_id)):
                 continue
-            plan = self.route_planner.plan(state, neighbor, target)
-            if plan is None or risky_next_hop in plan.path:
+            plan = self.route_planner.plan(state, neighbor, target, forbidden_nodes=frozenset({risky_next_hop}))
+            if plan is None or risky_next_hop in plan.path or state.me.station in plan.path[1:]:
                 continue
             first_leg = self.route_planner.estimate_frames(state, state.me.station, neighbor)
             candidates.append((first_leg + plan.estimated_frames, neighbor))
@@ -2352,15 +2380,17 @@ class BaselineStrategy:
             if station is not None and station.has_obstacle:
                 continue
             cost_to_neighbor = self.route_planner.estimate_frames(state, state.me.station, neighbor)
-            cost_to_target = self.route_planner.estimate_frames(state, neighbor, target)
-            if cost_to_target >= 10**8:
-                continue
             # Check that the route from neighbor to target does NOT pass through
             # the blocked node again.  If it does, this 'alternate' is useless
             # and we might as well go directly through the guard.
-            plan = self.route_planner.plan(state, neighbor, target)
+            plan = self.route_planner.plan(state, neighbor, target, forbidden_nodes=frozenset({blocked_next_hop}))
             if plan is not None and blocked_next_hop in plan.path:
                 continue
+            if plan is None:
+                continue
+            if state.me.station in plan.path[1:]:
+                continue
+            cost_to_target = plan.estimated_frames
             candidates.append((cost_to_neighbor + cost_to_target, neighbor))
         if not candidates:
             return None
