@@ -12,6 +12,12 @@ ROUTE_COEFFICIENT = {
     "MOUNTAIN": 1780,
     "BRANCH": 1550,
 }
+WEATHER_MOVE_MULTIPLIER = {
+    "NONE": 1000,
+    "HOT": 1000,
+    "HEAVY_RAIN": 1350,
+    "MOUNTAIN_FOG": 1100,
+}
 
 
 @dataclass(frozen=True)
@@ -94,8 +100,20 @@ class RoutePlanner:
         route_type = str(edge.route_type or "ROAD").upper()
         coefficient = ROUTE_COEFFICIENT.get(route_type, ROUTE_COEFFICIENT["ROAD"])
         required_move = edge.distance * coefficient
-        base_frames = max(1, (required_move + 999) // 1000)
+        weather_mult = self._weather_move_multiplier(state, route_type)
+        per_frame = 1_000_000 // max(weather_mult, 1)
+        base_frames = max(1, (required_move + per_frame - 1) // per_frame)
         return base_frames + self._freshness_risk_penalty(state, edge, route_type, base_frames)
+
+    def _weather_move_multiplier(self, state: GameState, route_type: str) -> int:
+        if state.weather is None:
+            return WEATHER_MOVE_MULTIPLIER["NONE"]
+        weather_types = set(state.weather.active_types) | set(state.weather.forecast_types)
+        if route_type == "WATER" and "HEAVY_RAIN" in weather_types:
+            return WEATHER_MOVE_MULTIPLIER["HEAVY_RAIN"]
+        if route_type == "MOUNTAIN" and "MOUNTAIN_FOG" in weather_types:
+            return WEATHER_MOVE_MULTIPLIER["MOUNTAIN_FOG"]
+        return WEATHER_MOVE_MULTIPLIER["NONE"]
 
     def _freshness_risk_penalty(self, state: GameState, edge: RouteEdge, route_type: str, base_frames: int) -> int:
         """Convert route-type freshness risk into frame-equivalent cost.

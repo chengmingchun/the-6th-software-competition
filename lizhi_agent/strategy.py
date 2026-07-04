@@ -60,6 +60,8 @@ WINDOW_REJECT_CODES = {
 WINDOW_TERMINAL_STATUSES = {"SUPPRESSED", "RESOLVED", "FINISHED", "FINISH", "ENDED", "END", "CLOSED", "COMPLETED", "COMPLETE", "SETTLED"}
 WINDOW_HARD_MAX_SENDS = 3
 SCOUT_PATH_LOOKAHEAD = 3
+INTEL_MAX_ROUTE_DISTANCE = 15
+HEAVY_RAIN_PROCESS_EXTRA = 4
 ROUTE_RESOURCE_TYPES = {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE", "INTEL"}
 SQUAD_COST = {
     SquadActionType.SQUAD_SCOUT: 1,
@@ -748,7 +750,7 @@ class BaselineStrategy:
             success = result.get("success")
             effective = result.get("effective")
             code = str(result.get("code") or result.get("errorCode") or result.get("reason") or result.get("message") or "").upper()
-            node_id = result.get("targetNodeId") or result.get("nodeId") or state.me.station
+            node_id = result.get("targetNodeId") or result.get("node") or result.get("nodeId") or state.me.station
             task_id = result.get("taskId")
             resource_type = result.get("resourceType")
             if action == "MOVE" and code == "MOVE_BLOCKED_BY_GUARD":
@@ -877,7 +879,7 @@ class BaselineStrategy:
 
     def _mark_process_pending(self, node: str, state: GameState, reason: str) -> None:
         station = state.station(node)
-        process_round = station.process_round if station is not None and station.process_round > 0 else 4
+        process_round = self._effective_station_process_round(state, station)
         until = state.frame + process_round + 3
         self._pending_process_until[node] = max(self._pending_process_until.get(node, 0), until)
         self._pending_process_started_at.setdefault(node, state.frame)
@@ -1171,6 +1173,17 @@ class BaselineStrategy:
     def _weather_forecast(self, state: GameState, weather_type: str) -> bool:
         return bool(state.weather and weather_type in state.weather.forecast_types)
 
+    def _heavy_rain_active_or_forecast(self, state: GameState) -> bool:
+        return bool(state.weather and ("HEAVY_RAIN" in state.weather.active_types or "HEAVY_RAIN" in state.weather.forecast_types))
+
+    def _effective_station_process_round(self, state: GameState, station: Station | None) -> int:
+        if station is None:
+            return 4
+        process_round = station.process_round if station.process_round > 0 else 4
+        if self._heavy_rain_active_or_forecast(state) and station.process_type in {"BOARD", "WATER_TRANSFER"}:
+            return process_round + HEAVY_RAIN_PROCESS_EXTRA
+        return process_round
+
     def _pre_move_resource_action(self, state: GameState) -> ActionBundle | None:
         me = state.me
         if me.status not in PLANNING_STATES or me.station is None:
@@ -1212,13 +1225,16 @@ class BaselineStrategy:
         if not me.has_resource("INTEL") or me.status not in PLANNING_STATES or me.station is None:
             return None
         target = self._intel_target(state)
+        upcoming_chokepoint = self._upcoming_chokepoint_scout_target(state)
+        if target == state.gate_node and upcoming_chokepoint is not None:
+            target = upcoming_chokepoint
         is_blocked_guard_target = target is not None and self._is_learned_guard_blocked(state, target)
         should_spend_intel = (
             state.phase in RUSH_PHASES
             or self._should_lock_delivery(state)
             or state.frame >= 220
             or self._route_has_blocker_risk(state)
-            or target in {state.gate_node, "S10", "S11", "S13"}
+            or target in {"S10", "S11", "S13"}
             or is_blocked_guard_target
         )
         if me.squad_available > 0 and not should_spend_intel:
@@ -1257,13 +1273,34 @@ class BaselineStrategy:
                     best_blocked = (cost, blocked_node)
             if best_blocked is not None:
                 return best_blocked[1]
+            upcoming = self._upcoming_chokepoint_scout_target(state)
+            if upcoming is not None:
+                return upcoming
+        return None
+
+    def _upcoming_chokepoint_scout_target(self, state: GameState) -> str | None:
+        me = state.me
+        if me.station is None:
+            return None
+        forbidden = self._scout_forbidden(state)
+        objective = self._current_route_objective(state)
+        plan = self.route_planner.plan(state, me.station, objective)
+        if plan is None:
+            return None
+        for node in plan.path[1 : 1 + SCOUT_PATH_LOOKAHEAD]:
+            if node in forbidden or node in self._scout_dispatched or self._has_own_scout_marker(state, node):
+                continue
+            if node in {"S10", "S11", "S13"}:
+                if not self._intel_target_in_range(state, node):
+                    continue
+                return node
         return None
 
     def _intel_target_in_range(self, state: GameState, target: str) -> bool:
         if state.me.station is None:
             return False
         distance = self._raw_route_distance(state, state.me.station, target)
-        return distance is not None and distance <= 15
+        return distance is not None and distance <= INTEL_MAX_ROUTE_DISTANCE
 
     def _raw_route_distance(self, state: GameState, start: str, target: str) -> int | None:
         if start == target:
@@ -1599,10 +1636,18 @@ class BaselineStrategy:
         return True
 
     def _squad_reserve(self, state: GameState, action: SquadActionType, purpose: str) -> int:
-        if purpose in {"blocked_route_obstacle", "late_aggressive_reinforce", "moving_guard_rescue"}:
+        if purpose in {"late_aggressive_reinforce", "moving_guard_rescue"}:
             return 0
+        if purpose == "blocked_route_obstacle":
+            return 4 if state.me.task_score_base < self.config.target_task_score and self._has_uncrossed_critical_pass(state) else 0
         if action == SquadActionType.SQUAD_REINFORCE and self._can_attack_with_spare_squad(state):
             return 0
+        if (
+            action == SquadActionType.SQUAD_SCOUT
+            and self._has_uncrossed_critical_pass(state)
+            and not (self._need_endgame(state) or self._should_prepare_gate_scout(state) or state.phase in RUSH_PHASES)
+        ):
+            return 8
         if self._route_has_blocker_risk(state) or self._blocked_guard_nodes:
             return 2
         if state.frame < 180 and action == SquadActionType.SQUAD_SCOUT:
@@ -1653,10 +1698,15 @@ class BaselineStrategy:
         if self._squad_weaken_until.get(target, -1) > state.frame:
             return None
         station = state.station(target)
-        if station is None or not station.has_enemy_guard(me.team_id):
+        learned_guard = self._has_learned_guard(state, target)
+        if not learned_guard and (station is None or not station.has_enemy_guard(me.team_id)):
             return None
-        self._squad_weaken_until[target] = state.frame + 18
-        self.logger.info("squad_eval", action="SQUAD_WEAKEN", target=target, reason="moving_target_guard", guardDefense=station.guard_defense)
+        guard_defense = station.guard_defense if station is not None else 0
+        if station is not None and station.has_enemy_guard(me.team_id) and guard_defense <= 1 and me.squad_available <= 4 and state.phase not in RUSH_PHASES:
+            self.logger.info("squad_eval", action=None, target=target, reason="preserve_squad_wait_low_guard_decay", guardDefense=guard_defense, available=me.squad_available)
+            return None
+        self._squad_weaken_until[target] = state.frame + self._squad_arrival_delay(state, target) + 2
+        self.logger.info("squad_eval", action="SQUAD_WEAKEN", target=target, reason="moving_target_guard", guardDefense=station.guard_defense if station is not None else None, learnedGuard=learned_guard)
         return SquadAction(SquadActionType.SQUAD_WEAKEN, target)
 
     def _scout_forbidden(self, state: GameState) -> set[str]:
@@ -1744,6 +1794,16 @@ class BaselineStrategy:
                 return True
         return False
 
+    def _has_uncrossed_critical_pass(self, state: GameState) -> bool:
+        if state.me.station is None:
+            return False
+        target = state.terminal_node if state.me.verified else state.gate_node
+        plan = self.route_planner.plan(state, state.me.station, target)
+        if plan is None:
+            return False
+        critical = {"S10", "S11", "S13"}
+        return any(node in critical for node in plan.path[1:])
+
     def _freshness_pressure(self, state: GameState) -> int:
         me = state.me
         pressure = 0
@@ -1785,6 +1845,8 @@ class BaselineStrategy:
         station = state.station(me.station)
         if station is not None and station.has_obstacle:
             return None
+        if self._would_guard_before_uncrossed_mandatory_chokepoint(state):
+            return None
         if self._is_my_mainline_next_hop(state, me.station) and not self._is_key_chokepoint(me.station):
             return None
         if self._opponent_next_hop_to_gate(state) != me.station:
@@ -1819,6 +1881,8 @@ class BaselineStrategy:
             return None
         station = state.station(me.station)
         if station is not None and station.has_obstacle:
+            return None
+        if self._would_guard_before_uncrossed_mandatory_chokepoint(state):
             return None
         if station is not None and station.guard_owner == me.team_id and station.guard_defense > 0:
             purpose = "late_aggressive_reinforce" if self._can_attack_with_spare_squad(state) else "hold_mandatory_chokepoint"
@@ -1862,6 +1926,8 @@ class BaselineStrategy:
         station = state.station(me.station)
         if station is not None and station.has_obstacle:
             return None
+        if self._would_guard_before_uncrossed_mandatory_chokepoint(state):
+            return None
         if station is not None and station.guard_owner == me.team_id and station.guard_defense > 0:
             if (
                 self._can_spend_squad(state, SquadActionType.SQUAD_REINFORCE, "late_aggressive_reinforce")
@@ -1895,6 +1961,8 @@ class BaselineStrategy:
             opp_target = state.terminal_node if state.opponent.verified else state.gate_node
             opp_plan = self.route_planner.plan(state, state.opponent.station, opp_target)
             if opp_plan is not None and me.station in opp_plan.path:
+                if self._would_guard_before_uncrossed_mandatory_chokepoint(state):
+                    return None
                 idx = opp_plan.path.index(me.station)
                 if 1 <= idx <= 3:
                     station = state.station(me.station)
@@ -1910,6 +1978,16 @@ class BaselineStrategy:
                     self.logger.info("blocker_decision", target=me.station, blocker="opponent_route", action="SET_GUARD", reason="trap", extraGoodFruit=extra)
                     return ActionBundle(main=MainAction(MainActionType.SET_GUARD, target=me.station, extra_good_fruit=extra))
         return None
+
+    def _would_guard_before_uncrossed_mandatory_chokepoint(self, state: GameState) -> bool:
+        me = state.me
+        if me.station in {None, "S10", "S11", "S13", state.gate_node, state.terminal_node}:
+            return False
+        objective = state.terminal_node if me.verified else state.gate_node
+        plan = self.route_planner.plan(state, me.station, objective)
+        if plan is None:
+            return False
+        return "S10" in plan.path[1:]
 
     def _guard_extra_good_fruit(self, state: GameState, station_id: str) -> int:
         if state.phase in RUSH_PHASES or self._need_endgame(state) or self._must_lock_delivery(state):
@@ -1994,7 +2072,7 @@ class BaselineStrategy:
             value += 45 + min(50, max(resource_values))
             reasons.append("resource")
         if station is not None and station.process_type and station.process_round > 0 and station.process_type != "VERIFY":
-            value += 35 + min(20, station.process_round)
+            value += 35 + min(20, self._effective_station_process_round(state, station))
             reasons.append("process")
         if node == state.gate_node and self._should_prepare_gate_scout(state):
             value += 95
@@ -2177,7 +2255,8 @@ class BaselineStrategy:
                 self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=alternate, avoided=next_hop, reason="avoid_live_guard_trap")
                 next_hop = alternate
             elif target in {state.gate_node, state.terminal_node} and (
-                state.me.task_score_base < self.config.target_task_score // 2
+                (next_hop in {"S10", "S11", state.gate_node} and self._next_hop_is_mandatory(state, target, next_hop))
+                or state.me.task_score_base < self.config.target_task_score // 2
                 or self._station_stay_frames(state) >= 12
                 or self._need_endgame(state)
                 or self._must_lock_delivery(state)
@@ -2237,6 +2316,12 @@ class BaselineStrategy:
             support = self._squad_blocker_action(state, next_hop, "obstacle") or squad
             if support is not None and support is not squad:
                 self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="SQUAD_CLEAR")
+                if self._should_pair_main_with_squad_blocker(state, next_hop, objective, "obstacle"):
+                    if self._should_spend_good_fruit_to_clear(state):
+                        self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="CLEAR+SQUAD_CLEAR", reason="parallel_main_and_squad_blocker")
+                        return ActionBundle(main=MainAction(MainActionType.CLEAR, target=next_hop), squad=support)
+                    self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="FORCED_PASS+SQUAD_CLEAR", reason="parallel_main_and_squad_blocker")
+                    return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=next_hop), squad=support)
                 return ActionBundle(squad=support)
             if self._should_spend_good_fruit_to_clear(state):
                 self.logger.info("blocker_decision", target=next_hop, blocker="obstacle", action="CLEAR")
@@ -2253,9 +2338,16 @@ class BaselineStrategy:
             support = self._squad_blocker_action(state, next_hop, "enemy_guard") or squad
             if support is not None and support is not squad:
                 good, bad = self._fruit_to_break_guard(state, station, next_hop, objective)
-                if (good > 0 or bad > 0) and self._should_stack_fruit_with_squad_guard(state, next_hop):
-                    self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="BREAK_GUARD_AND_SQUAD_WEAKEN", reason="key_guard_fast_clear", goodFruit=good, badFruit=bad)
-                    return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=next_hop, good_fruit=good, bad_fruit=bad), squad=support)
+                should_pair = (
+                    self._should_pair_main_with_squad_blocker(state, next_hop, objective, "enemy_guard")
+                    or ((good > 0 or bad > 0) and self._should_stack_fruit_with_squad_guard(state, next_hop))
+                )
+                if should_pair:
+                    if good > 0 or bad > 0:
+                        self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="BREAK_GUARD+SQUAD_WEAKEN", reason="parallel_main_and_squad_blocker", goodFruit=good, badFruit=bad)
+                        return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=next_hop, good_fruit=good, bad_fruit=bad), squad=support)
+                    self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="FORCED_PASS+SQUAD_WEAKEN", reason="parallel_main_and_squad_blocker")
+                    return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=next_hop), squad=support)
                 self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="SQUAD_WEAKEN")
                 return ActionBundle(squad=support)
             # 1. Squad weaken at key chokepoint
@@ -2269,6 +2361,18 @@ class BaselineStrategy:
             self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="FORCED_PASS", reason="default")
             return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=next_hop), squad=support)
         return None  # safe to MOVE
+
+    def _should_pair_main_with_squad_blocker(self, state: GameState, target: str, objective: str, blocker: str) -> bool:
+        if state.me.status not in PLANNING_STATES or state.me.current_process is not None:
+            return False
+        if self._must_lock_delivery(state) or self._need_endgame(state) or state.phase in RUSH_PHASES:
+            return True
+        if blocker == "enemy_guard" and self._is_key_chokepoint(target) and not self._has_safe_alternate_around(state, objective, target):
+            station = state.station(target)
+            return station is not None and station.guard_defense >= 4
+        if blocker == "obstacle" and self._is_key_chokepoint(target) and state.me.task_score_base >= self.config.target_task_score:
+            return True
+        return False
 
     def _move_to(self, state: GameState, target: str, squad: SquadAction | None = None) -> ActionBundle:
         """Plain MOVE. All blocker interception is in _pre_move_safety_gate."""
@@ -2368,6 +2472,12 @@ class BaselineStrategy:
         candidates.sort()
         return candidates[0][1]
 
+    def _next_hop_is_mandatory(self, state: GameState, target: str, next_hop: str) -> bool:
+        if state.me.station is None:
+            return False
+        plan = self.route_planner.plan(state, state.me.station, target, forbidden_nodes=frozenset({next_hop}))
+        return plan is None
+
     def _alternate_next_hop_avoiding_blocked(self, state: GameState, target: str, blocked_next_hop: str) -> str | None:
         if state.me.station is None or not self._is_learned_guard_blocked(state, blocked_next_hop):
             return None
@@ -2407,7 +2517,7 @@ class BaselineStrategy:
             return False
         if state.me.task_score_base >= self.config.target_task_score // 2:
             return False
-        if state.me.squad_available > 7:
+        if state.me.squad_available > 7 and not (self._is_key_chokepoint(target) or target in {"S10", "S11", "S13"}):
             return False
         return self._is_key_chokepoint(target) or target in {"S10", "S11"}
 

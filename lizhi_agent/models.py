@@ -411,11 +411,11 @@ def _normalize_action_results(player_id: str, action_results: list[dict[str, Any
 
 
 def _blocked_move_target(result: dict[str, Any], payload: dict[str, Any], me: PlayerState) -> Any:
-    for key in ("targetNodeId", "nextNodeId", "target"):
+    for key in ("targetNodeId", "nextNodeId", "target", "node"):
         value = result.get(key)
         if value not in (None, ""):
             return value
-    for key in ("targetNodeId", "nextNodeId", "target"):
+    for key in ("targetNodeId", "nextNodeId", "target", "node"):
         value = payload.get(key)
         if value not in (None, ""):
             return value
