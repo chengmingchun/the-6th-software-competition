@@ -60,6 +60,9 @@ WINDOW_REJECT_CODES = {
 WINDOW_TERMINAL_STATUSES = {"SUPPRESSED", "RESOLVED", "FINISHED", "FINISH", "ENDED", "END", "CLOSED", "COMPLETED", "COMPLETE", "SETTLED"}
 WINDOW_HARD_MAX_SENDS = 3
 SCOUT_PATH_LOOKAHEAD = 3
+PROACTIVE_CLEAR_MIN_PATH_INDEX = 3
+PROACTIVE_CLEAR_MAX_PATH_INDEX = 5
+PROACTIVE_CLEAR_HIGH_DETOUR = 10
 INTEL_MAX_ROUTE_DISTANCE = 15
 HEAVY_RAIN_PROCESS_EXTRA = 4
 ROUTE_RESOURCE_TYPES = {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE", "INTEL"}
@@ -657,11 +660,11 @@ class BaselineStrategy:
                 return done(rush_resource, "use_rush_route_resource")
         if self._need_endgame(state) or self._opponent_pressure(state) or self._must_lock_delivery(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_deadline_delivery_first")
-            scout = self._squad_scout_action(state)
+            scout = self._proactive_squad_clear_action(state) or self._squad_scout_action(state)
             return done(self._move_towards_delivery(state, squad=scout), "delivery_guard")
         if self._is_station_escape_active(state):
             self.logger.info("stall_breaker", kind="station", station=me.station, stayFrames=self._station_stay_frames(state), escapeUntil=self._station_escape_until.get(me.station or ""), action="MOVE_MAINLINE", reason="当前站点停留过久，暂停本地任务资源，直奔主线")
-            scout = self._squad_scout_action(state)
+            scout = self._proactive_squad_clear_action(state) or self._squad_scout_action(state)
             return done(self._move_towards_delivery(state, squad=scout), "station_stall_escape")
         urgent_resource = self._best_urgent_station_resource(state)
         if urgent_resource is not None:
@@ -689,13 +692,13 @@ class BaselineStrategy:
             return done(pre_move_resource, "use_route_resource")
         pressure_ice = self._best_reachable_ice_box(state)
         if pressure_ice is not None:
-            scout = self._squad_scout_action(state)
+            scout = self._proactive_squad_clear_action(state) or self._squad_scout_action(state)
             return done(self._move_towards_node(state, pressure_ice.station, squad=scout), "move_to_pressure_ice_box")
         if self._should_lock_delivery(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_quality_delivery_first")
-            scout = self._squad_scout_action(state)
+            scout = self._proactive_squad_clear_action(state) or self._squad_scout_action(state)
             return done(self._move_towards_delivery(state, squad=scout), "delivery_guard")
-        scout = self._squad_scout_action(state)
+        scout = self._proactive_squad_clear_action(state) or self._squad_scout_action(state)
         route_task = self._best_reachable_task(state)
         if route_task is not None:
             approach = self._task_approach_nodes.get(route_task.id, route_task.target)
@@ -1626,6 +1629,8 @@ class BaselineStrategy:
         # rescue itself or a late attack with spare people.
         if action == SquadActionType.SQUAD_WEAKEN and purpose == "moving_guard_rescue":
             return True
+        if action == SquadActionType.SQUAD_CLEAR and purpose == "moving_obstacle_rescue":
+            return True
         reserve = self._squad_reserve(state, action, purpose)
         if available - cost < reserve:
             self.logger.info("squad_eval_skip", action=action.value, reason="reserve_key_pass_manpower", purpose=purpose, available=available, cost=cost, reserve=reserve)
@@ -1638,7 +1643,7 @@ class BaselineStrategy:
     def _squad_reserve(self, state: GameState, action: SquadActionType, purpose: str) -> int:
         if purpose in {"late_aggressive_reinforce", "moving_guard_rescue"}:
             return 0
-        if purpose == "blocked_route_obstacle":
+        if purpose in {"blocked_route_obstacle", "proactive_route_obstacle"}:
             return 4 if state.me.task_score_base < self.config.target_task_score and self._has_uncrossed_critical_pass(state) else 0
         if action == SquadActionType.SQUAD_REINFORCE and self._can_attack_with_spare_squad(state):
             return 0
@@ -1688,18 +1693,75 @@ class BaselineStrategy:
         self.logger.info("squad_eval", action=None, reason="no_valuable_route_scout_target", objective=objective, candidates=candidates)
         return None
 
+    def _proactive_squad_clear_action(self, state: GameState) -> SquadAction | None:
+        me = state.me
+        if state.phase in RUSH_PHASES or me.station is None:
+            return None
+        if not self._can_spend_squad(state, SquadActionType.SQUAD_CLEAR, "proactive_route_obstacle"):
+            return None
+        objective = self._current_route_objective(state)
+        plan = self.route_planner.plan(state, me.station, objective)
+        if plan is None:
+            return None
+        for path_index, target in enumerate(plan.path[PROACTIVE_CLEAR_MIN_PATH_INDEX : PROACTIVE_CLEAR_MAX_PATH_INDEX + 1], start=PROACTIVE_CLEAR_MIN_PATH_INDEX):
+            station = state.station(target)
+            if station is None or not station.has_obstacle:
+                continue
+            if self._squad_clear_until.get(target, -1) > state.frame:
+                continue
+            if self._squad_action_on_cooldown(state, SquadActionType.SQUAD_CLEAR, target):
+                continue
+            t04 = self._t04_for_target(state, target)
+            if t04 is not None and self._can_claim_task_from_station(state, t04, me.station):
+                self.logger.info("proactive_squad_clear_skip", target=target, pathIndex=path_index, eta=self.route_planner.estimate_frames(state, me.station, target), routeCritical=True, taskId=t04.id, reason="t04_adjacent_claim_priority")
+                return None
+            critical, detour = self._route_obstacle_criticality(state, objective, target, plan.estimated_frames)
+            eta = self.route_planner.estimate_frames(state, me.station, target)
+            if not critical:
+                self.logger.info("proactive_squad_clear_skip", target=target, pathIndex=path_index, eta=eta, routeCritical=False, detour=detour, reason="cheap_alternate_route")
+                continue
+            self._squad_clear_until[target] = state.frame + self._squad_arrival_delay(state, target) + 2
+            self.logger.info("proactive_squad_clear", action="SQUAD_CLEAR", target=target, pathIndex=path_index, eta=eta, routeCritical=critical, detour=detour)
+            return SquadAction(SquadActionType.SQUAD_CLEAR, target)
+        return None
+
+    def _route_obstacle_criticality(self, state: GameState, objective: str, obstacle: str, base_cost: int) -> tuple[bool, int | None]:
+        if state.me.station is None:
+            return False, None
+        alternate = self.route_planner.plan(state, state.me.station, objective, forbidden_nodes=frozenset({obstacle}))
+        if alternate is None:
+            return True, None
+        detour = alternate.estimated_frames - base_cost
+        return detour >= PROACTIVE_CLEAR_HIGH_DETOUR, detour
+
     def _moving_squad_guard_action(self, state: GameState) -> SquadAction | None:
         me = state.me
         target = me.target
-        if not target or not self._can_spend_squad(state, SquadActionType.SQUAD_WEAKEN, "moving_guard_rescue"):
+        if not target:
+            return None
+        station = state.station(target)
+        if station is not None and station.has_obstacle:
+            if not self._can_spend_squad(state, SquadActionType.SQUAD_CLEAR, "moving_obstacle_rescue"):
+                return None
+            if self._squad_action_on_cooldown(state, SquadActionType.SQUAD_CLEAR, target):
+                return None
+            if self._squad_clear_until.get(target, -1) > state.frame:
+                return None
+            self._squad_clear_until[target] = state.frame + self._squad_arrival_delay(state, target) + 2
+            self.logger.info("squad_eval", action="SQUAD_CLEAR", target=target, reason="moving_target_obstacle")
+            return SquadAction(SquadActionType.SQUAD_CLEAR, target)
+        if not self._can_spend_squad(state, SquadActionType.SQUAD_WEAKEN, "moving_guard_rescue"):
             return None
         if self._squad_action_on_cooldown(state, SquadActionType.SQUAD_WEAKEN, target):
             return None
         if self._squad_weaken_until.get(target, -1) > state.frame:
             return None
-        station = state.station(target)
         learned_guard = self._has_learned_guard(state, target)
-        if not learned_guard and (station is None or not station.has_enemy_guard(me.team_id)):
+        if station is None or not station.has_enemy_guard(me.team_id):
+            if learned_guard:
+                self.logger.info("squad_eval_skip", action=SquadActionType.SQUAD_WEAKEN.value, target=target, reason="learned_guard_without_public_enemy_guard")
+            return None
+        if learned_guard and station.has_obstacle:
             return None
         guard_defense = station.guard_defense if station is not None else 0
         if station is not None and station.has_enemy_guard(me.team_id) and guard_defense <= 1 and me.squad_available <= 4 and state.phase not in RUSH_PHASES:

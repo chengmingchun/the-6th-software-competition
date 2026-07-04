@@ -281,7 +281,7 @@ class StrategyRouteResourceTest(unittest.TestCase):
         retry = strategy.decide(rejected)
         self.assertNotEqual(retry.squad.action if retry.squad else None, SquadActionType.SQUAD_WEAKEN)
 
-    def test_moving_state_uses_learned_guard_feedback_for_squad_weaken(self) -> None:
+    def test_moving_state_does_not_weaken_from_learned_guard_without_public_guard(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
             frame=360,
@@ -303,8 +303,31 @@ class StrategyRouteResourceTest(unittest.TestCase):
         )
         action = strategy.decide(state)
         self.assertIsNone(action.main)
+        self.assertIsNone(action.squad)
+
+    def test_moving_target_obstacle_uses_squad_clear_not_weaken(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=360,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(
+                player_id="1001",
+                team_id="RED",
+                status=ConvoyStatus.MOVING,
+                station="S09",
+                target="S10",
+                task_score_base=70,
+                squad_available=2,
+            ),
+            stations={"S10": Station(id="S10", has_obstacle=True, guard_owner="BLUE", guard_defense=4)},
+            edges=[RouteEdge(id="E1", start="S09", end="S10", distance=1), RouteEdge(id="E2", start="S10", end="S14", distance=1)],
+        )
+        action = strategy.decide(state)
+        self.assertIsNone(action.main)
         self.assertIsNotNone(action.squad)
-        self.assertEqual(action.squad.action, SquadActionType.SQUAD_WEAKEN)
+        self.assertEqual(action.squad.action, SquadActionType.SQUAD_CLEAR)
         self.assertEqual(action.squad.to_action()["targetNodeId"], "S10")
 
     def test_moving_low_defense_guard_preserves_last_rescue_squad(self) -> None:
@@ -1416,6 +1439,50 @@ class StrategyRouteResourceTest(unittest.TestCase):
         wait_action = strategy.decide(next_state)
         self.assertIsNone(wait_action.main)
         self.assertIsNone(wait_action.squad)
+
+    def test_proactive_squad_clear_targets_future_critical_obstacle(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=260,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=130, squad_available=2, good_fruit=80),
+            stations={"S04": Station(id="S04", has_obstacle=True)},
+            edges=[
+                RouteEdge(id="E1", start="S01", end="S02", distance=1),
+                RouteEdge(id="E2", start="S02", end="S03", distance=1),
+                RouteEdge(id="E3", start="S03", end="S04", distance=1),
+                RouteEdge(id="E4", start="S04", end="S14", distance=1),
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+        self.assertIsNotNone(action.squad)
+        self.assertEqual(action.squad.action, SquadActionType.SQUAD_CLEAR)
+        self.assertEqual(action.squad.to_action()["targetNodeId"], "S04")
+
+    def test_proactive_squad_clear_skips_future_obstacle_when_alternate_is_cheap(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=260,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=130, squad_available=4, good_fruit=80),
+            stations={"S04": Station(id="S04", has_obstacle=True)},
+            edges=[
+                RouteEdge(id="E1", start="S01", end="S02", distance=1),
+                RouteEdge(id="E2", start="S02", end="S03", distance=1),
+                RouteEdge(id="E3", start="S03", end="S04", distance=1),
+                RouteEdge(id="E4", start="S04", end="S14", distance=1),
+                RouteEdge(id="A1", start="S03", end="S05", distance=1),
+                RouteEdge(id="A2", start="S05", end="S14", distance=1),
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertNotEqual(action.squad.action if action.squad else None, SquadActionType.SQUAD_CLEAR)
 
     def test_key_obstacle_pairs_squad_clear_with_main_forced_pass_under_pressure(self) -> None:
         strategy = self.make_strategy()
