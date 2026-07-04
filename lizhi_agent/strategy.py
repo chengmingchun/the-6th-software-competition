@@ -36,6 +36,7 @@ TASK_TEMPLATE_REJECT_CODES = {"TASK_CONDITION_NOT_MET", "TASK_REQUIREMENT_NOT_ME
 TASK_TAKEN_REJECT_CODES = {"TASK_ALREADY_TAKEN", "ALREADY_TAKEN", "TASK_NOT_AVAILABLE", "TASK_NOT_FOUND"}
 SHORT_BUSY_COOLDOWN_FRAMES = 5
 GUARD_BLOCKED_COOLDOWN_FRAMES = 28
+GUARD_MEMORY_TTL_FRAMES = 90
 ICE_BOX_REJECT_CODES = {
     "INVALID_ACTION",
     "RESOURCE_NOT_APPLICABLE",
@@ -682,6 +683,7 @@ class BaselineStrategy:
         self._last_attempted_blocker_action: tuple[int, str, str] | None = None
         self._last_attempted_squad: tuple[int, str, str] | None = None
         self._blocked_guard_nodes: dict[str, int] = {}
+        self._blocked_guard_last_frame: dict[str, int] = {}
         self._guard_blocked_until: dict[str, int] = {}
         self._squad_weaken_until: dict[str, int] = {}
         self._squad_clear_until: dict[str, int] = {}
@@ -1049,9 +1051,10 @@ class BaselineStrategy:
         if action == "MOVE" and code == "MOVE_BLOCKED_BY_GUARD" and node:
             current = self._blocked_guard_nodes.get(node, 0)
             self._blocked_guard_nodes[node] = current + 1
+            self._blocked_guard_last_frame[node] = state.frame
             until = state.frame + GUARD_BLOCKED_COOLDOWN_FRAMES
             self._guard_blocked_until[node] = max(self._guard_blocked_until.get(node, 0), until)
-            self.logger.info("feedback_learn", learned="move_blocked_by_guard", nodeId=node, count=current + 1, code=code, guardBlockedUntil=until, result=raw)
+            self.logger.info("feedback_learn", learned="move_blocked_by_guard", nodeId=node, count=current + 1, code=code, guardBlockedUntil=until, guardMemoryLastFrame=state.frame, guardMemoryTtl=GUARD_MEMORY_TTL_FRAMES, result=raw)
         if action in {"FORCED_PASS", "BREAK_GUARD", "CLEAR"} and code == "NO_BLOCKER":
             blocker_node = node
             if self._last_attempted_blocker_action is not None:
@@ -1063,6 +1066,7 @@ class BaselineStrategy:
             until = state.frame + 40
             self._no_blocker_until[blocker_node] = max(self._no_blocker_until.get(blocker_node, 0), until)
             self._blocked_guard_nodes.pop(blocker_node, None)
+            self._blocked_guard_last_frame.pop(blocker_node, None)
             self._guard_blocked_until.pop(blocker_node, None)
             self._squad_weaken_until.pop(blocker_node, None)
             self._squad_clear_until.pop(blocker_node, None)
@@ -1442,11 +1446,6 @@ class BaselineStrategy:
         if extra_cost > max_extra:
             return None
         next_hop = str(best["path"][1])
-        if self._is_learned_guard_blocked(state, next_hop):
-            return None
-        station = state.station(next_hop)
-        if station is not None and (station.has_obstacle or station.has_enemy_guard(me.team_id)):
-            return None
         scout = self._route_support_squad_action(state)
         self.logger.info(
             "route_package_eval",
@@ -1461,7 +1460,7 @@ class BaselineStrategy:
             nextHop=next_hop,
             reason="high_task_score_route_package",
         )
-        return ActionBundle(main=MainAction(MainActionType.MOVE, target=next_hop), squad=scout)
+        return self._move_towards_node(state, next_hop, squad=scout)
 
     def _route_packages_to_gate(self, state: GameState) -> list[dict[str, Any]]:
         me = state.me
@@ -1495,11 +1494,6 @@ class BaselineStrategy:
             for nxt in neighbors:
                 if nxt in path:
                     continue
-                station = state.station(nxt)
-                if station is not None and (station.has_obstacle or station.has_enemy_guard(state.me.team_id)):
-                    continue
-                if self._is_learned_guard_blocked(state, nxt):
-                    continue
                 stack.append((nxt, (*path, nxt)))
         return paths
 
@@ -1516,7 +1510,9 @@ class BaselineStrategy:
                     cost += 12
                 if station.has_enemy_guard(state.me.team_id):
                     cost += 10 + station.guard_defense * 5
-        return cost
+            if self._is_learned_guard_blocked(state, end):
+                cost += 25
+        return cost + self._path_task_process_cost(state, path)
 
     def _path_route_type(self, state: GameState, path: tuple[str, ...]) -> str:
         counts: dict[str, int] = {}
@@ -1543,6 +1539,22 @@ class BaselineStrategy:
             elif task.template == "T04" and any(node in nodes for node in state.neighbors(task.target)):
                 score += max(0, task.score)
         return score
+
+    def _path_task_process_cost(self, state: GameState, path: tuple[str, ...]) -> int:
+        nodes = set(path)
+        cost = 0
+        counted: set[str] = set()
+        for task in state.tasks:
+            if task.id in counted or task.id in self._rejected_task_ids or self._is_task_scope_rejected(state, task):
+                continue
+            if not task.available_for(state.player_id) or not self._task_requirements_met(state, task):
+                continue
+            on_path = task.target in nodes
+            adjacent_t04 = task.template == "T04" and any(node in nodes for node in state.neighbors(task.target))
+            if on_path or adjacent_t04:
+                cost += max(0, task.process_frames)
+                counted.add(task.id)
+        return cost
 
     def _edge_between(self, state: GameState, start: str, end: str):
         for edge in state.edges:
@@ -2894,8 +2906,8 @@ class BaselineStrategy:
             return wait("unknown_station", active=False)
         forbidden = frozenset(
             n
-            for n, c in self._blocked_guard_nodes.items()
-            if c >= 2 or self._guard_blocked_until.get(n, -1) > state.frame
+            for n in set(self._blocked_guard_nodes) | set(self._guard_blocked_until)
+            if self._is_learned_guard_blocked(state, n)
         )
         plan = self.route_planner.plan(state, state.me.station, target, forbidden_nodes=forbidden)
         next_hop = plan.next_station if plan is not None else None
@@ -3042,11 +3054,29 @@ class BaselineStrategy:
 
     def _is_learned_guard_blocked(self, state: GameState, target: str) -> bool:
         """Whether MOVE should be banned for this node (2+ failures)."""
+        if not self._guard_memory_active(state, target):
+            return False
         return self._blocked_guard_nodes.get(target, 0) >= 2 or self._guard_blocked_until.get(target, -1) > state.frame
 
     def _has_learned_guard(self, state: GameState, target: str) -> bool:
         """Whether a guard was ever detected at this node (1+ failure)."""
+        if not self._guard_memory_active(state, target):
+            return False
         return self._blocked_guard_nodes.get(target, 0) >= 1 or self._guard_blocked_until.get(target, -1) > state.frame
+
+    def _guard_memory_active(self, state: GameState, target: str) -> bool:
+        if self._guard_blocked_until.get(target, -1) > state.frame:
+            return True
+        last_frame = self._blocked_guard_last_frame.get(target)
+        if last_frame is None:
+            return False
+        if state.frame - last_frame <= GUARD_MEMORY_TTL_FRAMES:
+            return True
+        self._blocked_guard_nodes.pop(target, None)
+        self._blocked_guard_last_frame.pop(target, None)
+        self._guard_blocked_until.pop(target, None)
+        self.logger.info("feedback_learn", learned="guard_memory_expired", nodeId=target, lastFrame=last_frame, frame=state.frame, ttl=GUARD_MEMORY_TTL_FRAMES)
+        return False
 
     def _is_live_guard_trap_risk(self, state: GameState, target: str) -> bool:
         opponent = state.opponent
