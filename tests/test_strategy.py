@@ -1115,6 +1115,70 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(self.strategy.decide(state).window.card, WindowCard.ABSTAIN)
 
 
+class ReleaseBugFixTest(unittest.TestCase):
+    """Minimal regression tests for release-level bug fixes (BOM, encoding, guard decay)."""
+
+    def setUp(self) -> None:
+        self.strategy = self.make_strategy()
+
+    def make_strategy(self):
+        from lizhi_agent.config import StrategyConfig
+        return BaselineStrategy("1001", StrategyConfig.default(), SilentLogger())
+
+    def test_strategy_file_has_no_bom(self) -> None:
+        import os
+        path = os.path.join(os.path.dirname(__file__), "..", "lizhi_agent", "strategy.py")
+        with open(path, "rb") as f:
+            raw = f.read()
+        self.assertNotEqual(raw[:3], b"\xef\xbb\xbf", "strategy.py must not have UTF-8 BOM")
+
+    def test_rush_phases_contains_chinese_phase(self) -> None:
+        from lizhi_agent.strategy import RUSH_PHASES
+        self.assertIn("宫宴冲刺", RUSH_PHASES)
+        self.assertNotIn("瀹鍐插埡", RUSH_PHASES)
+
+    def _make_state_with_guard(self, node: str, gate_node: str, defense: int, initial_defense: int,
+                                age_round: int) -> GameState:
+        from lizhi_agent.models import PlayerState, RouteEdge
+        station_raw = {
+            "guard": {
+                "active": True,
+                "defense": defense,
+                "initialDefense": initial_defense,
+                "ageRound": age_round,
+            }
+        }
+        return GameState(
+            frame=100,
+            player_id="1001",
+            roles={"gateNodeId": gate_node},
+            me=PlayerState(player_id="1001", team_id="RED", station=node),
+            stations={node: Station(id=node, guard_owner="BLUE", guard_defense=defense, raw=station_raw)},
+            edges=[RouteEdge(id="E1", start=node, end=gate_node, distance=1)],
+        )
+
+    def test_key_chokepoint_guard_decay_first_45(self) -> None:
+        state = self._make_state_with_guard("S10", "S14", defense=4, initial_defense=4, age_round=42)
+        # S10 with initialDefense>=4 => first_decay=45, age=42 => 3f to first decay
+        # remaining = 3 + (4-1)*30 = 93
+        remaining = self.strategy._guard_decay_remaining_frames(state, "S10")
+        self.assertEqual(remaining, 93)
+
+    def test_normal_guard_decay_first_30(self) -> None:
+        state = self._make_state_with_guard("S07", "S14", defense=3, initial_defense=3, age_round=30)
+        # Normal node => first_decay=30, age=30 => at first decay point
+        # passed=0, mod=0, to_next=30, remaining=30+(3-1)*30=90
+        remaining = self.strategy._guard_decay_remaining_frames(state, "S07")
+        self.assertEqual(remaining, 90)
+
+    def test_gate_guard_not_first_decay_zero(self) -> None:
+        state = self._make_state_with_guard("S14", "S14", defense=4, initial_defense=4, age_round=1)
+        # gate_node is key chokepoint with initialDefense=4 => first_decay=45
+        # age=1 < 45, remaining = (45-1)+(4-1)*30 = 44+90 = 134
+        remaining = self.strategy._guard_decay_remaining_frames(state, "S14")
+        self.assertEqual(remaining, 134)
+
+
 class ProtocolCodecTest(unittest.TestCase):
     def test_length_prefixed_codec_roundtrip(self) -> None:
         stream = MemoryStream()

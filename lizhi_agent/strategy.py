@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
@@ -28,7 +28,7 @@ BUSY_STATES = {
     ConvoyStatus.CONTESTING,
 }
 MOVING_STATES = {ConvoyStatus.MOVING}
-RUSH_PHASES = {"RUSH", "BANQUET", "ENDGAME", "FINAL", "瀹鍐插埡"}
+RUSH_PHASES = {"RUSH", "BANQUET", "ENDGAME", "FINAL", "宫宴冲刺"}
 PLANNING_STATES = {ConvoyStatus.IDLE, ConvoyStatus.WAITING, ConvoyStatus.UNKNOWN, ConvoyStatus.COST_BANKRUPT}
 PROCESS_RETRY_CODES = {"PROCESS_REQUIRED", "PROCESS_INTERRUPTED", "INTERRUPTED"}
 PROCESS_HARD_REJECT_CODES = {"PROCESS_NOT_AVAILABLE", "NOT_AT_TARGET_NODE", "INVALID_TARGET"}
@@ -2358,10 +2358,8 @@ class BaselineStrategy:
             else:
                 return None
             initial_defense = self._guard_int(guard.get("initialDefense"), defense)
-            if node == state.gate_node:
-                first_decay = 0
-            elif self._is_key_chokepoint_for_state(state, node) and initial_defense >= 4:
-                first_decay = 5
+            if self._is_key_chokepoint_for_state(state, node) and initial_defense >= 4:
+                first_decay = 45
             else:
                 first_decay = 30
             if age < first_decay:

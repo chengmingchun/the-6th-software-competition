@@ -3128,7 +3128,9 @@ class StrategyRouteResourceTest(unittest.TestCase):
             me=PlayerState(player_id="1001", team_id="RED", station="S01"),
             stations={"S10": Station(id="S10", node_type="KEY_PASS", guard_owner="BLUE", guard_defense=4, raw={"guard": {"ownerTeamId": "BLUE", "defense": 4, "initialDefense": 4, "ageRound": 42, "active": True}})},
         )
-        self.assertEqual(strategy._guard_decay_remaining_frames(state, "S10"), 113)
+        # Key chokepoint with initialDefense=4 => first_decay=45 (was incorrectly 5 before bug fix).
+        # age=42 < 45 => remaining = (45-42) + (4-1)*30 = 3 + 90 = 93
+        self.assertEqual(strategy._guard_decay_remaining_frames(state, "S10"), 93)
 
     def test_guard_decay_remaining_gate_soon(self) -> None:
         strategy = self.make_strategy()
