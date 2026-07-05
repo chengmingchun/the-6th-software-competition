@@ -589,8 +589,10 @@ class BaselineStrategyTest(unittest.TestCase):
             tasks=[TaskInstance(id="task-loop", template="T01", target="S03", score=30, process_frames=3)],
         )
         first_action = self.strategy.decide(first)
-        self.assertEqual(first_action.main.action, MainActionType.MOVE)
-        self.assertEqual(first_action.main.to_action()["targetNodeId"], "S14")
+        # With task score < 60, the strategy now prioritizes getting the
+        # station's 30-point task before moving on.
+        self.assertEqual(first_action.main.action, MainActionType.CLAIM_TASK)
+        self.assertEqual(first_action.main.to_action()["taskId"], "task-loop")
 
         stalled = GameState(
             frame=119,
@@ -602,8 +604,8 @@ class BaselineStrategyTest(unittest.TestCase):
             tasks=[TaskInstance(id="task-loop", template="T01", target="S03", score=30, process_frames=3)],
         )
         action = self.strategy.decide(stalled)
-        self.assertEqual(action.main.action, MainActionType.MOVE)
-        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
+        # Same logic: task score 30 < 60, station has 30-point task.
+        self.assertEqual(action.main.action, MainActionType.CLAIM_TASK)
 
     def test_task_score_120_locks_delivery_midgame(self) -> None:
         state = GameState(

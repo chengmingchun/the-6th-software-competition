@@ -3570,6 +3570,16 @@ class BaselineStrategy:
         me = state.me
         if me.task_score_base >= 60 or me.status not in PLANNING_STATES or me.current_process is not None or me.station is None:
             return None
+        # Don't block urgent resource claiming (ICE_BOX, valuable horse/permit)
+        for stock in state.station_resources(me.station):
+            if stock.resource_type in {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE", "PASS_TOKEN", "OFFICIAL_PERMIT"}:
+                if (stock.station, stock.resource_type) not in self._rejected_resource_keys and not self._is_object_on_cooldown(state, self._resource_object_key(stock.station, stock.resource_type)):
+                    return None
+        # Don't block priority guard at key chokepoints
+        opponent = state.opponent
+        if opponent is not None and me.station in {"S10", "S13", state.gate_node}:
+            if self._opponent_route_depends_on_station(state, me.station) or self._opponent_next_hop_to_gate(state) == me.station:
+                return None
         tasks = [
             task
             for task in state.tasks

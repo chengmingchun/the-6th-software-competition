@@ -2887,8 +2887,10 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertGreater(high["cost"] - direct["cost"], 36)
 
         action = strategy.decide(state)
+        # With task score 30 < 60, fast_delivery is blocked, so the strategy
+        # evaluates route packages and picks the S08 detour for 75 task points.
         self.assertEqual(action.main.action, MainActionType.MOVE)
-        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S08")
 
     def test_route_package_score_value_detour_tightens_under_freshness_pressure(self) -> None:
         strategy = self.make_strategy()
