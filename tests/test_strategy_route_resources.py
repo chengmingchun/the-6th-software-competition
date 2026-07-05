@@ -2942,8 +2942,63 @@ class StrategyRouteResourceTest(unittest.TestCase):
             action_results=[{"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD", "targetNodeId": "S02"}],
         )
         action = strategy.decide(learned)
+        self.assertIn(action.main.action, {MainActionType.FORCED_PASS, MainActionType.BREAK_GUARD})
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_route_package_allows_mountain_escape_after_repeated_mainline_block(self) -> None:
+        strategy = self.make_strategy()
+        learned = GameState(
+            frame=260,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=95, squad_available=0),
+            edges=[
+                RouteEdge(id="HIGH1", start="S01", end="S02", route_type="ROAD", distance=1),
+                RouteEdge(id="HIGH2", start="S02", end="S04", route_type="ROAD", distance=1),
+                RouteEdge(id="HIGH3", start="S04", end="S14", route_type="ROAD", distance=1),
+                RouteEdge(id="ALT1", start="S01", end="S03", route_type="MOUNTAIN", distance=2),
+                RouteEdge(id="ALT2", start="S03", end="S14", route_type="MOUNTAIN", distance=1),
+            ],
+            tasks=[
+                TaskInstance(id="road-45", template="T08", target="S02", score=45, process_frames=4),
+                TaskInstance(id="road-30", template="T08", target="S04", score=30, process_frames=4),
+            ],
+            action_results=[
+                {"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD", "targetNodeId": "S02"},
+                {"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD", "targetNodeId": "S02"},
+            ],
+        )
+        action = strategy.decide(learned)
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S03")
+
+    def test_mountain_package_records_missed_mainline_task_penalty(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=120,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=30, squad_available=0),
+            edges=[
+                RouteEdge(id="M1", start="S01", end="S08", route_type="MOUNTAIN", distance=1),
+                RouteEdge(id="M2", start="S08", end="S14", route_type="MOUNTAIN", distance=1),
+                RouteEdge(id="R1", start="S01", end="S02", route_type="ROAD", distance=1),
+                RouteEdge(id="R2", start="S02", end="S03", route_type="ROAD", distance=1),
+                RouteEdge(id="R3", start="S03", end="S14", route_type="ROAD", distance=1),
+            ],
+            tasks=[
+                TaskInstance(id="road-45", template="T08", target="S02", score=45, process_frames=4),
+                TaskInstance(id="road-30", template="T08", target="S03", score=30, process_frames=4),
+            ],
+        )
+        packages = strategy._route_packages_to_gate(state)
+        mountain = next(package for package in packages if package["path"] == ("S01", "S08", "S14"))
+        self.assertTrue(mountain["escape_route"])
+        self.assertGreaterEqual(mountain["skipped_task_score"], 45)
+        self.assertGreater(mountain["missed_task_penalty"], 0)
+        self.assertLess(mountain["adjusted_score_value"], mountain["score_value"])
 
     def test_claim_task_object_busy_only_short_cools_without_global_reject(self) -> None:
         strategy = self.make_strategy()

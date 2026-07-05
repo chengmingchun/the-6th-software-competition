@@ -1524,10 +1524,24 @@ class BaselineStrategy:
         direct_plan = self.route_planner.plan(state, me.station, state.gate_node)
         if direct_plan is None or len(direct_plan.path) < 2:
             return None
-        current = min(packages, key=lambda item: (item["cost"], -item["score_value"], -item["task_score"]))
-        best = max(packages, key=lambda item: (item["score_value"], item["task_score"], -item["cost"]))
+        current = min(packages, key=lambda item: (item["cost"], -item["adjusted_score_value"], -item["task_score"]))
+        best = max(packages, key=lambda item: (item["adjusted_score_value"], item["task_score"], -item["cost"]))
+        mainline = self._best_mainline_route_package(packages)
+        if mainline is not None and self._should_prefer_mainline_package(state, best, mainline):
+            self.logger.info(
+                "route_choice_eval",
+                chosenRouteType=mainline["route_type"],
+                skippedTaskScore=mainline["skipped_task_score"],
+                blockerPenalty=mainline["blocker_penalty"],
+                escapeRoute=mainline["escape_route"],
+                reason="task_route_preferred",
+                rejectedRouteType=best["route_type"],
+                rejectedEscapeRoute=best["escape_route"],
+                rejectedSkippedTaskScore=best["skipped_task_score"],
+            )
+            best = mainline
         score_gap = int(best["task_score"]) - int(current["task_score"])
-        score_value_gap = int(best["score_value"]) - int(current["score_value"])
+        score_value_gap = int(best["adjusted_score_value"]) - int(current["adjusted_score_value"])
         extra_cost = int(best["cost"]) - int(current["cost"])
         if score_gap < 60 and score_value_gap < 70:
             return None
@@ -1557,16 +1571,32 @@ class BaselineStrategy:
             chosenPath=list(best["path"]),
             chosenTaskScore=best["task_score"],
             chosenScoreValue=best["score_value"],
+            chosenAdjustedScoreValue=best["adjusted_score_value"],
+            chosenSkippedTaskScore=best["skipped_task_score"],
+            chosenBlockerPenalty=best["blocker_penalty"],
+            chosenEscapeRoute=best["escape_route"],
             currentRouteType=current["route_type"],
             currentPath=list(current["path"]),
             currentTaskScore=current["task_score"],
             currentScoreValue=current["score_value"],
+            currentAdjustedScoreValue=current["adjusted_score_value"],
+            currentSkippedTaskScore=current["skipped_task_score"],
+            currentBlockerPenalty=current["blocker_penalty"],
+            currentEscapeRoute=current["escape_route"],
             scoreGap=score_gap,
             scoreValueGap=score_value_gap,
             extraCost=extra_cost,
             nextHop=next_hop,
             objective=objective,
-            reason="high_task_score_route_package" if score_gap >= 60 else "high_delivery_score_value_route_package",
+            reason="delivery_escape" if best["escape_route"] else ("forced_pass_mainline" if best["blocker_penalty"] > 0 else "task_route_preferred"),
+        )
+        self.logger.info(
+            "route_choice_eval",
+            chosenRouteType=best["route_type"],
+            skippedTaskScore=best["skipped_task_score"],
+            blockerPenalty=best["blocker_penalty"],
+            escapeRoute=best["escape_route"],
+            reason="delivery_escape" if best["escape_route"] else ("forced_pass_mainline" if best["blocker_penalty"] > 0 else "task_route_preferred"),
         )
         return self._move_to_next_hop_with_objective(state, next_hop, objective, squad=scout)
 
@@ -1576,6 +1606,8 @@ class BaselineStrategy:
             return []
         paths = self._simple_paths(state, me.station, state.gate_node, max_depth=8, max_paths=48)
         packages: list[dict[str, Any]] = []
+        scored_paths: list[dict[str, Any]] = []
+        mainline_task_score = 0
         for path in paths:
             if len(path) < 2:
                 continue
@@ -1585,13 +1617,111 @@ class BaselineStrategy:
             route_type = self._path_route_type(state, path)
             task_score = self._path_task_score(state, path)
             score_value = self._route_package_score_value(state, task_score, cost)
-            packages.append({"path": path, "cost": cost, "route_type": route_type, "task_score": task_score, "score_value": score_value})
-        self.logger.info("route_package_eval", candidates=[{"routeType": p["route_type"], "path": list(p["path"]), "cost": p["cost"], "taskScore": p["task_score"], "scoreValue": p["score_value"]} for p in packages[:8]])
+            escape_route = self._path_is_delivery_escape_route(state, path)
+            blocker_penalty = self._path_blocker_penalty(state, path)
+            item = {"path": path, "cost": cost, "route_type": route_type, "task_score": task_score, "score_value": score_value, "escape_route": escape_route, "blocker_penalty": blocker_penalty}
+            scored_paths.append(item)
+            if not escape_route:
+                mainline_task_score = max(mainline_task_score, task_score)
+        for item in scored_paths:
+            skipped_task_score = max(0, mainline_task_score - int(item["task_score"])) if item["escape_route"] else 0
+            missed_task_penalty = self._missed_task_penalty(state, int(item["task_score"]), mainline_task_score) if skipped_task_score > 0 else 0
+            adjusted_score_value = int(item["score_value"]) - missed_task_penalty
+            item["skipped_task_score"] = skipped_task_score
+            item["missed_task_penalty"] = missed_task_penalty
+            item["adjusted_score_value"] = adjusted_score_value
+            packages.append(item)
+        self.logger.info(
+            "route_package_eval",
+            candidates=[
+                {
+                    "routeType": p["route_type"],
+                    "path": list(p["path"]),
+                    "cost": p["cost"],
+                    "taskScore": p["task_score"],
+                    "scoreValue": p["score_value"],
+                    "adjustedScoreValue": p["adjusted_score_value"],
+                    "skippedTaskScore": p["skipped_task_score"],
+                    "missedTaskPenalty": p["missed_task_penalty"],
+                    "blockerPenalty": p["blocker_penalty"],
+                    "escapeRoute": p["escape_route"],
+                }
+                for p in packages[:8]
+            ],
+        )
         return packages
 
     def _route_package_score_value(self, state: GameState, path_task_score: int, package_cost: int) -> int:
         projected_task_base = min(self.config.greed_task_score, state.me.task_score_base + max(0, path_task_score))
         return self._delivery_base_score(projected_task_base) + self._task_award_score(projected_task_base) + self._time_score_value(state, projected_task_base, package_cost)
+
+    def _best_mainline_route_package(self, packages: list[dict[str, Any]]) -> dict[str, Any] | None:
+        mainline = [package for package in packages if not package.get("escape_route")]
+        if not mainline:
+            return None
+        return max(mainline, key=lambda item: (item["task_score"], item["adjusted_score_value"], -item["cost"]))
+
+    def _should_prefer_mainline_package(self, state: GameState, chosen: dict[str, Any], mainline: dict[str, Any]) -> bool:
+        if not chosen.get("escape_route"):
+            return False
+        mainline_task_score = int(mainline.get("task_score", 0))
+        blocked_count = self._path_guard_blocked_count(state, mainline["path"])
+        deadline_tight = state.turns_left <= int(mainline["cost"]) + 80
+        single_manageable_guard = int(mainline.get("blocker_penalty", 0)) > 0 and self._path_action_blocker_count(state, mainline["path"]) <= 1
+        if self._must_lock_delivery(state) or self._need_endgame(state) or state.me.task_score_base >= 120:
+            return single_manageable_guard
+        if mainline_task_score < 45:
+            return False
+        if state.me.task_score_base < 90:
+            return single_manageable_guard or int(chosen.get("skipped_task_score", 0)) >= 45
+        if state.me.task_score_base < 120:
+            return not deadline_tight and blocked_count < 2 and (single_manageable_guard or int(chosen.get("skipped_task_score", 0)) >= 45)
+        return False
+
+    def _path_is_delivery_escape_route(self, state: GameState, path: tuple[str, ...]) -> bool:
+        return self._path_has_route_type(state, path, "MOUNTAIN")
+
+    def _path_has_route_type(self, state: GameState, path: tuple[str, ...], route_type: str) -> bool:
+        wanted = str(route_type or "").upper()
+        for start, end in zip(path, path[1:]):
+            edge = self._edge_between(state, start, end)
+            if edge is not None and str(edge.route_type or "").upper() == wanted:
+                return True
+        return False
+
+    def _path_blocker_penalty(self, state: GameState, path: tuple[str, ...]) -> int:
+        penalty = 0
+        for node in path[1:]:
+            station = state.station(node)
+            if station is not None:
+                if station.has_obstacle:
+                    penalty += self._route_package_obstacle_penalty(state, node)
+                if station.has_enemy_guard(state.me.team_id):
+                    penalty += self._route_package_guard_penalty(state, node, station.guard_defense, learned=False)
+            if self._is_learned_guard_blocked(state, node):
+                guard_defense = station.guard_defense if station is not None else 0
+                penalty += self._route_package_guard_penalty(state, node, guard_defense, learned=True)
+        return penalty
+
+    def _path_action_blocker_count(self, state: GameState, path: tuple[str, ...]) -> int:
+        count = 0
+        for node in path[1:]:
+            station = state.station(node)
+            if station is not None and (station.has_obstacle or station.has_enemy_guard(state.me.team_id)):
+                count += 1
+            elif self._is_learned_guard_blocked(state, node):
+                count += 1
+        return count
+
+    def _path_guard_blocked_count(self, state: GameState, path: tuple[str, ...]) -> int:
+        return max((self._blocked_guard_nodes.get(node, 0) for node in path[1:]), default=0)
+
+    def _missed_task_penalty(self, state: GameState, path_task_score: int, mainline_task_score: int) -> int:
+        path_score = min(self.config.greed_task_score, state.me.task_score_base + max(0, path_task_score))
+        mainline_score = min(self.config.greed_task_score, state.me.task_score_base + max(0, mainline_task_score))
+        skipped = max(0, mainline_task_score - path_task_score)
+        milestone_loss = max(0, self._task_award_score(mainline_score) - self._task_award_score(path_score) - skipped)
+        return skipped + milestone_loss
 
     def _delivery_base_score(self, task_score_base: int) -> int:
         return min(240, 120 + (max(0, task_score_base) * 4 // 3))
@@ -3229,6 +3359,46 @@ class BaselineStrategy:
         plan = self.route_planner.plan(state, state.me.station, objective)
         return plan is not None and target in plan.path[1:]
 
+    def _mainline_delivery_next_hop_over_escape(self, state: GameState, objective: str, chosen_next_hop: str) -> str | None:
+        if objective != state.gate_node or state.me.station is None:
+            return None
+        if self._edge_route_type(state, state.me.station, chosen_next_hop) != "MOUNTAIN":
+            return None
+        packages = self._route_packages_to_gate(state)
+        mainline = self._best_mainline_route_package(packages)
+        chosen = next((package for package in packages if len(package["path"]) > 1 and package["path"][1] == chosen_next_hop), None)
+        if mainline is None or chosen is None or len(mainline["path"]) < 2:
+            return None
+        if not self._should_prefer_mainline_package(state, chosen, mainline):
+            return None
+        return str(mainline["path"][1])
+
+    def _should_hold_mainline_task_route(self, state: GameState, objective: str, blocked_next_hop: str) -> bool:
+        if objective != state.gate_node or state.me.station is None:
+            return False
+        packages = self._route_packages_to_gate(state)
+        mainline = self._best_mainline_route_package(packages)
+        if mainline is None or len(mainline["path"]) < 2 or mainline["path"][1] != blocked_next_hop:
+            return False
+        escape = next((package for package in packages if package.get("escape_route")), None)
+        if escape is None:
+            return False
+        return self._should_prefer_mainline_package(state, escape, mainline)
+
+    def _mainline_delivery_blocker_penalty(self, state: GameState, objective: str) -> int:
+        if objective != state.gate_node:
+            return 0
+        mainline = self._best_mainline_route_package(self._route_packages_to_gate(state))
+        return int(mainline.get("blocker_penalty", 0)) if mainline is not None else 0
+
+    def _edge_route_type(self, state: GameState, start: str | None, end: str | None) -> str:
+        if start is None or end is None:
+            return "ROAD"
+        edge = self._edge_between(state, start, end)
+        if edge is None:
+            return "ROAD"
+        return str(edge.route_type or "ROAD").upper()
+
     def _move_towards_delivery(self, state: GameState, squad: SquadAction | None = None) -> ActionBundle:
         target = state.terminal_node if state.me.verified else state.gate_node
         return self._move_towards_node(state, target, squad=squad)
@@ -3255,6 +3425,10 @@ class BaselineStrategy:
         if next_hop is None:
             self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=None, reason="no_route")
             return wait("no_route", active=False)
+        mainline_next_hop = self._mainline_delivery_next_hop_over_escape(state, target, next_hop)
+        if mainline_next_hop is not None:
+            self.logger.info("route_choice_eval", chosenRouteType="ROAD", skippedTaskScore=0, blockerPenalty=self._mainline_delivery_blocker_penalty(state, target), escapeRoute=False, reason="forced_pass_mainline", rejectedNextHop=next_hop)
+            next_hop = mainline_next_hop
         if self._is_live_guard_trap_risk(state, next_hop):
             alternate = self._alternate_next_hop_avoiding_live_trap(state, target, next_hop)
             if alternate is not None:
@@ -3274,11 +3448,15 @@ class BaselineStrategy:
                 return wait("wait_live_guard_trap", active=True)
         # Learned guard: try alternate before safety gate
         if self._has_learned_guard(state, next_hop) or self._guard_blocked_until.get(next_hop, -1) > state.frame:
+            hold_mainline = self._should_hold_mainline_task_route(state, target, next_hop)
             for neighbor in state.neighbors(state.me.station):
                 if neighbor == next_hop or self._has_learned_guard(state, neighbor) or self._guard_blocked_until.get(neighbor, -1) > state.frame:
                     continue
                 s = state.station(neighbor)
                 if s is not None and s.has_obstacle:
+                    continue
+                if hold_mainline and self._edge_route_type(state, state.me.station, neighbor) == "MOUNTAIN":
+                    self.logger.info("route_choice_eval", chosenRouteType="ROAD", skippedTaskScore=0, blockerPenalty=self._mainline_delivery_blocker_penalty(state, target), escapeRoute=False, reason="forced_pass_mainline", rejectedNextHop=neighbor)
                     continue
                 p2 = self.route_planner.plan(state, neighbor, target, forbidden_nodes=frozenset({next_hop}))
                 if p2 is not None and next_hop not in p2.path and state.me.station not in p2.path[1:]:
@@ -3321,11 +3499,15 @@ class BaselineStrategy:
                 self.logger.info("route_decision", fromNode=state.me.station, target=objective, nextHop=None, avoided=next_hop, reason="route_package_wait_live_guard_trap")
                 return wait("wait_live_guard_trap", active=True)
         if self._has_learned_guard(state, next_hop) or self._guard_blocked_until.get(next_hop, -1) > state.frame:
+            hold_mainline = self._should_hold_mainline_task_route(state, objective, next_hop)
             for neighbor in state.neighbors(state.me.station):
                 if neighbor == next_hop or self._has_learned_guard(state, neighbor) or self._guard_blocked_until.get(neighbor, -1) > state.frame:
                     continue
                 station = state.station(neighbor)
                 if station is not None and station.has_obstacle:
+                    continue
+                if hold_mainline and self._edge_route_type(state, state.me.station, neighbor) == "MOUNTAIN":
+                    self.logger.info("route_choice_eval", chosenRouteType="ROAD", skippedTaskScore=0, blockerPenalty=self._mainline_delivery_blocker_penalty(state, objective), escapeRoute=False, reason="forced_pass_mainline", rejectedNextHop=neighbor)
                     continue
                 plan = self.route_planner.plan(state, neighbor, objective, forbidden_nodes=frozenset({next_hop}))
                 if plan is not None and next_hop not in plan.path and state.me.station not in plan.path[1:]:
