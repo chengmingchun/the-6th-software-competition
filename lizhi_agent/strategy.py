@@ -1527,23 +1527,33 @@ class BaselineStrategy:
         current = min(packages, key=lambda item: (item["cost"], -item["adjusted_score_value"], -item["task_score"]))
         best = max(packages, key=lambda item: (item["adjusted_score_value"], item["task_score"], -item["cost"]))
         mainline = self._best_mainline_route_package(packages)
+        decision_reason = self._route_choice_reason(state, best, mainline)
         if mainline is not None and self._should_prefer_mainline_package(state, best, mainline):
             self.logger.info(
                 "route_choice_eval",
                 chosenRouteType=mainline["route_type"],
                 skippedTaskScore=mainline["skipped_task_score"],
                 blockerPenalty=mainline["blocker_penalty"],
+                guardResolutionCost=mainline["guard_resolution_cost"],
+                guardResolutionMode=mainline["guard_resolution_mode"],
+                guardDecayRemaining=mainline["guard_decay_remaining"],
+                forcedPassTax=mainline["forced_pass_tax"],
                 escapeRoute=mainline["escape_route"],
-                reason="task_route_preferred",
+                mountainRoute=mainline["mountain_route"],
+                escapeReason=mainline["escape_reason"],
+                reason=decision_reason,
+                decisionReason=decision_reason,
                 rejectedRouteType=best["route_type"],
                 rejectedEscapeRoute=best["escape_route"],
                 rejectedSkippedTaskScore=best["skipped_task_score"],
             )
             best = mainline
+            decision_reason = self._route_choice_reason(state, best, mainline)
         score_gap = int(best["task_score"]) - int(current["task_score"])
         score_value_gap = int(best["adjusted_score_value"]) - int(current["adjusted_score_value"])
         extra_cost = int(best["cost"]) - int(current["cost"])
-        if score_gap < 60 and score_value_gap < 70:
+        route_value_escape = bool(best.get("mountain_route")) and score_value_gap >= 18 and extra_cost <= 30
+        if score_gap < 60 and score_value_gap < 70 and not route_value_escape:
             return None
         base_extra = 36 if score_gap >= 90 or score_value_gap >= 95 else 24
         if best["task_score"] >= 90 and current["task_score"] < 60 and not self._path_has_action_blocker(state, best["path"]):
@@ -1573,30 +1583,60 @@ class BaselineStrategy:
             chosenScoreValue=best["score_value"],
             chosenAdjustedScoreValue=best["adjusted_score_value"],
             chosenSkippedTaskScore=best["skipped_task_score"],
+            chosenMissedTaskPenalty=best["missed_task_penalty"],
             chosenBlockerPenalty=best["blocker_penalty"],
+            chosenGuardResolutionCost=best["guard_resolution_cost"],
+            chosenGuardResolutionMode=best["guard_resolution_mode"],
+            chosenGuardDecayRemaining=best["guard_decay_remaining"],
+            chosenForcedPassTax=best["forced_pass_tax"],
             chosenEscapeRoute=best["escape_route"],
+            chosenMountainRoute=best["mountain_route"],
+            chosenEscapeReason=best["escape_reason"],
             currentRouteType=current["route_type"],
             currentPath=list(current["path"]),
             currentTaskScore=current["task_score"],
             currentScoreValue=current["score_value"],
             currentAdjustedScoreValue=current["adjusted_score_value"],
             currentSkippedTaskScore=current["skipped_task_score"],
+            currentMissedTaskPenalty=current["missed_task_penalty"],
             currentBlockerPenalty=current["blocker_penalty"],
+            currentGuardResolutionCost=current["guard_resolution_cost"],
+            currentGuardResolutionMode=current["guard_resolution_mode"],
+            currentGuardDecayRemaining=current["guard_decay_remaining"],
+            currentForcedPassTax=current["forced_pass_tax"],
             currentEscapeRoute=current["escape_route"],
+            currentMountainRoute=current["mountain_route"],
+            mainlineCost=mainline["cost"] if mainline is not None else None,
+            mainlineAdjustedScoreValue=mainline["adjusted_score_value"] if mainline is not None else None,
+            escapeCost=best["cost"] if best["escape_route"] else None,
+            escapeAdjustedScoreValue=best["adjusted_score_value"] if best["escape_route"] else None,
             scoreGap=score_gap,
             scoreValueGap=score_value_gap,
             extraCost=extra_cost,
             nextHop=next_hop,
             objective=objective,
-            reason="delivery_escape" if best["escape_route"] else ("forced_pass_mainline" if best["blocker_penalty"] > 0 else "task_route_preferred"),
+            reason=decision_reason,
+            decisionReason=decision_reason,
         )
         self.logger.info(
             "route_choice_eval",
             chosenRouteType=best["route_type"],
+            mainlineCost=mainline["cost"] if mainline is not None else None,
+            escapeCost=best["cost"] if best["escape_route"] else None,
+            mainlineAdjustedScoreValue=mainline["adjusted_score_value"] if mainline is not None else None,
+            escapeAdjustedScoreValue=best["adjusted_score_value"] if best["escape_route"] else None,
             skippedTaskScore=best["skipped_task_score"],
+            missedTaskPenalty=best["missed_task_penalty"],
             blockerPenalty=best["blocker_penalty"],
+            guardResolutionCost=best["guard_resolution_cost"],
+            guardResolutionMode=best["guard_resolution_mode"],
+            guardDecayRemaining=best["guard_decay_remaining"],
+            forcedPassTax=best["forced_pass_tax"],
+            mountainRoute=best["mountain_route"],
             escapeRoute=best["escape_route"],
-            reason="delivery_escape" if best["escape_route"] else ("forced_pass_mainline" if best["blocker_penalty"] > 0 else "task_route_preferred"),
+            escapeReason=best["escape_reason"],
+            reason=decision_reason,
+            decisionReason=decision_reason,
         )
         return self._move_to_next_hop_with_objective(state, next_hop, objective, squad=scout)
 
@@ -1617,18 +1657,30 @@ class BaselineStrategy:
             route_type = self._path_route_type(state, path)
             task_score = self._path_task_score(state, path)
             score_value = self._route_package_score_value(state, task_score, cost)
-            escape_route = self._path_is_delivery_escape_route(state, path)
-            blocker_penalty = self._path_blocker_penalty(state, path)
-            item = {"path": path, "cost": cost, "route_type": route_type, "task_score": task_score, "score_value": score_value, "escape_route": escape_route, "blocker_penalty": blocker_penalty}
+            mountain_route = self._path_has_route_type(state, path, "MOUNTAIN")
+            item = {"path": path, "cost": cost, "route_type": route_type, "task_score": task_score, "score_value": score_value, "mountain_route": mountain_route}
             scored_paths.append(item)
-            if not escape_route:
+            if not mountain_route:
                 mainline_task_score = max(mainline_task_score, task_score)
+        if mainline_task_score == 0 and scored_paths:
+            mainline_task_score = max(int(item["task_score"]) for item in scored_paths)
         for item in scored_paths:
-            skipped_task_score = max(0, mainline_task_score - int(item["task_score"])) if item["escape_route"] else 0
+            skipped_task_score = max(0, mainline_task_score - int(item["task_score"])) if item["mountain_route"] else 0
+            escape_route = self._path_is_delivery_escape_route(state, item["path"], skipped_task_score)
+            escape_reason = self._path_escape_reason(item["mountain_route"], escape_route, skipped_task_score)
             missed_task_penalty = self._missed_task_penalty(state, int(item["task_score"]), mainline_task_score) if skipped_task_score > 0 else 0
-            adjusted_score_value = int(item["score_value"]) - missed_task_penalty
+            blocker_info = self._path_blocker_info(state, item["path"], state.gate_node)
+            guard_resolution_cost = int(blocker_info["guardResolutionCost"])
+            adjusted_score_value = int(item["score_value"]) - missed_task_penalty - guard_resolution_cost
             item["skipped_task_score"] = skipped_task_score
             item["missed_task_penalty"] = missed_task_penalty
+            item["escape_route"] = escape_route
+            item["escape_reason"] = escape_reason
+            item["blocker_penalty"] = blocker_info["blockerPenalty"]
+            item["guard_resolution_cost"] = guard_resolution_cost
+            item["guard_resolution_mode"] = blocker_info["guardResolutionMode"]
+            item["guard_decay_remaining"] = blocker_info["guardDecayRemaining"]
+            item["forced_pass_tax"] = blocker_info["forcedPassTax"]
             item["adjusted_score_value"] = adjusted_score_value
             packages.append(item)
         self.logger.info(
@@ -1644,7 +1696,13 @@ class BaselineStrategy:
                     "skippedTaskScore": p["skipped_task_score"],
                     "missedTaskPenalty": p["missed_task_penalty"],
                     "blockerPenalty": p["blocker_penalty"],
+                    "guardResolutionCost": p["guard_resolution_cost"],
+                    "guardResolutionMode": p["guard_resolution_mode"],
+                    "guardDecayRemaining": p["guard_decay_remaining"],
+                    "forcedPassTax": p["forced_pass_tax"],
+                    "mountainRoute": p["mountain_route"],
                     "escapeRoute": p["escape_route"],
+                    "escapeReason": p["escape_reason"],
                 }
                 for p in packages[:8]
             ],
@@ -1664,22 +1722,57 @@ class BaselineStrategy:
     def _should_prefer_mainline_package(self, state: GameState, chosen: dict[str, Any], mainline: dict[str, Any]) -> bool:
         if not chosen.get("escape_route"):
             return False
-        mainline_task_score = int(mainline.get("task_score", 0))
-        blocked_count = self._path_guard_blocked_count(state, mainline["path"])
-        deadline_tight = state.turns_left <= int(mainline["cost"]) + 80
-        single_manageable_guard = int(mainline.get("blocker_penalty", 0)) > 0 and self._path_action_blocker_count(state, mainline["path"]) <= 1
-        if self._must_lock_delivery(state) or self._need_endgame(state) or state.me.task_score_base >= 120:
-            return single_manageable_guard
-        if mainline_task_score < 45:
+        mainline_value = int(mainline.get("adjusted_score_value", 0))
+        escape_value = int(chosen.get("adjusted_score_value", 0))
+        value_gap = mainline_value - escape_value
+        if value_gap >= 8:
+            return True
+        if value_gap <= -18:
             return False
-        if state.me.task_score_base < 90:
-            return single_manageable_guard or int(chosen.get("skipped_task_score", 0)) >= 45
+        if self._must_lock_delivery(state) or self._need_endgame(state) or state.me.task_score_base >= 120:
+            return int(mainline.get("guard_resolution_cost", 0)) <= 8 and int(mainline.get("cost", 0)) <= int(chosen.get("cost", 0)) + 10
+        if state.me.task_score_base < 90 and int(mainline.get("task_score", 0)) >= 45:
+            return int(mainline.get("guard_resolution_cost", 0)) <= 24 or value_gap >= -6
         if state.me.task_score_base < 120:
-            return not deadline_tight and blocked_count < 2 and (single_manageable_guard or int(chosen.get("skipped_task_score", 0)) >= 45)
-        return False
+            blocked_count = self._path_guard_blocked_count(state, mainline["path"])
+            deadline_tight = state.turns_left <= int(mainline["cost"]) + 80
+            return not deadline_tight and blocked_count < 2 and value_gap >= -6
+        return value_gap >= 0
 
-    def _path_is_delivery_escape_route(self, state: GameState, path: tuple[str, ...]) -> bool:
-        return self._path_has_route_type(state, path, "MOUNTAIN")
+    def _route_choice_reason(self, state: GameState, chosen: dict[str, Any], mainline: dict[str, Any] | None) -> str:
+        if mainline is None:
+            return "static_fallback"
+        if chosen.get("mountain_route") and not chosen.get("escape_route"):
+            return "no_skipped_task_mountain_allowed"
+        mainline_value = int(mainline.get("adjusted_score_value", 0))
+        chosen_value = int(chosen.get("adjusted_score_value", 0))
+        if chosen.get("escape_route"):
+            if self._must_lock_delivery(state) or self._need_endgame(state) or state.me.task_score_base >= 120:
+                return "delivery_lock_escape_allowed"
+            if chosen_value > mainline_value:
+                return "escape_value_higher"
+            return "escape_guard_cost_too_high"
+        if int(chosen.get("guard_decay_remaining") or 9999) <= 3:
+            return "mainline_guard_decay_soon"
+        if state.me.task_score_base < 90 and int(chosen.get("task_score", 0)) >= 45:
+            return "task_score_low_mainline_required"
+        if chosen_value >= mainline_value:
+            return "mainline_value_higher"
+        return "static_fallback"
+
+    def _path_is_delivery_escape_route(self, state: GameState, path: tuple[str, ...], skipped_task_score: int = 0) -> bool:
+        if not self._path_has_route_type(state, path, "MOUNTAIN"):
+            return False
+        return skipped_task_score > 0
+
+    def _path_escape_reason(self, mountain_route: bool, escape_route: bool, skipped_task_score: int) -> str:
+        if not mountain_route:
+            return "mainline"
+        if not escape_route:
+            return "no_skipped_task"
+        if skipped_task_score > 0:
+            return "bypass_mainline_tasks"
+        return "delivery_escape"
 
     def _path_has_route_type(self, state: GameState, path: tuple[str, ...], route_type: str) -> bool:
         wanted = str(route_type or "").upper()
@@ -1690,18 +1783,51 @@ class BaselineStrategy:
         return False
 
     def _path_blocker_penalty(self, state: GameState, path: tuple[str, ...]) -> int:
-        penalty = 0
+        return int(self._path_blocker_info(state, path, state.gate_node)["blockerPenalty"])
+
+    def _path_blocker_info(self, state: GameState, path: tuple[str, ...], objective: str) -> dict[str, Any]:
+        blocker_penalty = 0
+        guard_resolution_cost = 0
+        guard_resolution_mode = None
+        guard_decay_remaining = None
+        forced_pass_tax = None
         for node in path[1:]:
             station = state.station(node)
             if station is not None:
                 if station.has_obstacle:
-                    penalty += self._route_package_obstacle_penalty(state, node)
+                    blocker_penalty += self._route_package_obstacle_penalty(state, node)
                 if station.has_enemy_guard(state.me.team_id):
-                    penalty += self._route_package_guard_penalty(state, node, station.guard_defense, learned=False)
+                    resolution = self._guard_resolution_cost(state, node, objective)
+                    cost = int(resolution["cost"])
+                    blocker_penalty += cost
+                    guard_resolution_cost += cost
+                    guard_resolution_mode = guard_resolution_mode or resolution["mode"]
+                    guard_decay_remaining = self._min_optional_int(guard_decay_remaining, resolution["decayRemaining"])
+                    forced_pass_tax = self._min_optional_int(forced_pass_tax, resolution["forcedPassTax"])
             if self._is_learned_guard_blocked(state, node):
-                guard_defense = station.guard_defense if station is not None else 0
-                penalty += self._route_package_guard_penalty(state, node, guard_defense, learned=True)
-        return penalty
+                if station is not None and station.has_enemy_guard(state.me.team_id):
+                    continue
+                resolution = self._guard_resolution_cost(state, node, objective)
+                cost = int(resolution["cost"])
+                blocker_penalty += cost
+                guard_resolution_cost += cost
+                guard_resolution_mode = guard_resolution_mode or resolution["mode"]
+                guard_decay_remaining = self._min_optional_int(guard_decay_remaining, resolution["decayRemaining"])
+                forced_pass_tax = self._min_optional_int(forced_pass_tax, resolution["forcedPassTax"])
+        return {
+            "blockerPenalty": blocker_penalty,
+            "guardResolutionCost": guard_resolution_cost,
+            "guardResolutionMode": guard_resolution_mode,
+            "guardDecayRemaining": guard_decay_remaining,
+            "forcedPassTax": forced_pass_tax,
+        }
+
+    def _min_optional_int(self, current: int | None, value: int | None) -> int | None:
+        if value is None:
+            return current
+        if current is None:
+            return value
+        return min(current, value)
 
     def _path_action_blocker_count(self, state: GameState, path: tuple[str, ...]) -> int:
         count = 0
@@ -1775,11 +1901,6 @@ class BaselineStrategy:
             if station is not None:
                 if station.has_obstacle:
                     cost += self._route_package_obstacle_penalty(state, end)
-                if station.has_enemy_guard(state.me.team_id):
-                    cost += self._route_package_guard_penalty(state, end, station.guard_defense, learned=False)
-            if self._is_learned_guard_blocked(state, end):
-                guard_defense = station.guard_defense if station is not None else 0
-                cost += self._route_package_guard_penalty(state, end, guard_defense, learned=True)
         return cost + self._path_task_process_cost(state, path)
 
     def _route_package_obstacle_penalty(self, state: GameState, target: str) -> int:
@@ -1797,6 +1918,124 @@ class BaselineStrategy:
             if state.me.squad_available < SQUAD_COST[SquadActionType.SQUAD_WEAKEN]:
                 penalty += 20
         return penalty
+
+    def _guard_decay_remaining_frames(self, state: GameState, node: str) -> int | None:
+        try:
+            station = state.station(node)
+            if station is None:
+                return 0
+            guard = station.raw.get("guard") if isinstance(station.raw.get("guard"), dict) else None
+            if guard is None:
+                return None if station.has_enemy_guard(state.me.team_id) else 0
+            if guard.get("active") is False:
+                return 0
+            defense = self._guard_int(guard.get("defense"), station.guard_defense)
+            if defense <= 0:
+                return 0
+            age_value = guard.get("ageRound")
+            if age_value is not None:
+                age = self._guard_int(age_value, 0)
+            elif guard.get("completeRound") is not None:
+                age = max(0, state.frame - self._guard_int(guard.get("completeRound"), state.frame))
+            else:
+                return None
+            initial_defense = self._guard_int(guard.get("initialDefense"), defense)
+            if node == state.gate_node:
+                first_decay = 0
+            elif self._is_key_chokepoint_for_state(state, node) and initial_defense >= 4:
+                first_decay = 5
+            else:
+                first_decay = 30
+            if age < first_decay:
+                return max(0, (first_decay - age) + (defense - 1) * 30)
+            passed = age - first_decay
+            mod = passed % 30
+            to_next = 30 if mod == 0 else 30 - mod
+            return max(0, to_next + (defense - 1) * 30)
+        except Exception:
+            return None
+
+    def _forced_pass_tax_for_guard(self, state: GameState, node: str) -> int | None:
+        station = state.station(node)
+        if station is None:
+            return None
+        defense = max(0, self._station_guard_defense(state, node))
+        if defense <= 0:
+            return 0
+        if station.has_obstacle:
+            return min(28, 8 + defense * 5)
+        if node == state.gate_node:
+            return min(32, 12 + defense * 5)
+        if self._is_key_chokepoint_for_state(state, node):
+            return min(50, 15 + defense * 5)
+        return min(40, 10 + defense * 5)
+
+    def _guard_resolution_cost(self, state: GameState, node: str, objective: str) -> dict[str, Any]:
+        station = state.station(node)
+        defense = self._station_guard_defense(state, node)
+        learned = self._is_learned_guard_blocked(state, node)
+        if station is None and learned:
+            static_cost = self._route_package_guard_penalty(state, node, 0, learned=True)
+            return {"cost": static_cost, "mode": "static_fallback", "decayRemaining": None, "forcedPassTax": None, "breakCost": None, "squadWeakenDelay": None}
+        if station is not None and learned and not station.has_enemy_guard(state.me.team_id):
+            static_cost = self._route_package_guard_penalty(state, node, defense, learned=True)
+            return {"cost": static_cost, "mode": "static_fallback", "decayRemaining": None, "forcedPassTax": None, "breakCost": None, "squadWeakenDelay": None}
+        if station is None or (not station.has_enemy_guard(state.me.team_id) and not learned):
+            return {"cost": 0, "mode": "static_fallback", "decayRemaining": None, "forcedPassTax": None, "breakCost": None, "squadWeakenDelay": None}
+        static_cost = self._route_package_guard_penalty(state, node, defense, learned=learned)
+        guard = station.raw.get("guard") if station is not None and isinstance(station.raw.get("guard"), dict) else {}
+        if "ageRound" not in guard and "completeRound" not in guard:
+            return {"cost": static_cost, "mode": "static_fallback", "decayRemaining": None, "forcedPassTax": None, "breakCost": None, "squadWeakenDelay": None}
+        candidates: list[tuple[int, str]] = []
+        decay_remaining = self._guard_decay_remaining_frames(state, node)
+        if decay_remaining is not None:
+            candidates.append((decay_remaining, "decay_wait"))
+        forced_tax = self._forced_pass_tax_for_guard(state, node)
+        if forced_tax is not None:
+            candidates.append((forced_tax, "forced_pass"))
+        break_cost = self._break_guard_estimated_cost(state, node, objective, defense)
+        if break_cost is not None:
+            candidates.append((break_cost, "break_guard"))
+        squad_delay = self._squad_weaken_estimated_delay(state, node, defense)
+        if squad_delay is not None:
+            candidates.append((squad_delay, "squad_weaken"))
+        if not candidates:
+            return {"cost": static_cost, "mode": "static_fallback", "decayRemaining": decay_remaining, "forcedPassTax": forced_tax, "breakCost": break_cost, "squadWeakenDelay": squad_delay}
+        cost, mode = min(candidates, key=lambda item: item[0])
+        return {"cost": cost, "mode": mode, "decayRemaining": decay_remaining, "forcedPassTax": forced_tax, "breakCost": break_cost, "squadWeakenDelay": squad_delay}
+
+    def _break_guard_estimated_cost(self, state: GameState, node: str, objective: str, defense: int) -> int | None:
+        station = state.station(node)
+        if station is None or defense <= 0:
+            return None
+        good, bad = self._fruit_to_break_guard(state, station, node, objective)
+        if good * 2 + bad * 3 >= defense:
+            return 5
+        if good > 0 or bad > 0:
+            return 18
+        return None
+
+    def _squad_weaken_estimated_delay(self, state: GameState, node: str, defense: int) -> int | None:
+        if defense > 2:
+            return None
+        if state.me.squad_available < SQUAD_COST[SquadActionType.SQUAD_WEAKEN]:
+            return None
+        if self._squad_action_on_cooldown(state, SquadActionType.SQUAD_WEAKEN, node):
+            return None
+        return self._squad_arrival_delay(state, node)
+
+    def _station_guard_defense(self, state: GameState, node: str) -> int:
+        station = state.station(node)
+        if station is None:
+            return 0
+        guard = station.raw.get("guard") if isinstance(station.raw.get("guard"), dict) else {}
+        return max(0, self._guard_int(guard.get("defense"), station.guard_defense))
+
+    def _guard_int(self, value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(default)
 
     def _path_route_type(self, state: GameState, path: tuple[str, ...]) -> str:
         counts: dict[str, int] = {}

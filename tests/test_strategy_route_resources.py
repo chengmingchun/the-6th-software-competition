@@ -2892,7 +2892,8 @@ class StrategyRouteResourceTest(unittest.TestCase):
         packages = strategy._route_packages_to_gate(blocked)
         direct = next(package for package in packages if package["path"] == ("S01", "S10", "S14"))
         alternate = next(package for package in packages if package["path"] == ("S01", "S08", "S14"))
-        self.assertGreaterEqual(direct["cost"] - alternate["cost"], 40)
+        self.assertGreaterEqual(direct["guard_resolution_cost"], 40)
+        self.assertLess(direct["adjusted_score_value"], alternate["adjusted_score_value"])
 
     def test_route_package_uses_safety_gate_for_guarded_next_hop(self) -> None:
         strategy = self.make_strategy()
@@ -2953,6 +2954,7 @@ class StrategyRouteResourceTest(unittest.TestCase):
             player_id="1001",
             roles={"gateNodeId": "S14"},
             me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=95, squad_available=0),
+            stations={"S02": Station(id="S02", guard_owner="BLUE", guard_defense=8, raw={"guard": {"ownerTeamId": "BLUE", "defense": 8, "initialDefense": 8, "ageRound": 0, "active": True}})},
             edges=[
                 RouteEdge(id="HIGH1", start="S01", end="S02", route_type="ROAD", distance=1),
                 RouteEdge(id="HIGH2", start="S02", end="S04", route_type="ROAD", distance=1),
@@ -2961,7 +2963,6 @@ class StrategyRouteResourceTest(unittest.TestCase):
                 RouteEdge(id="ALT2", start="S03", end="S14", route_type="MOUNTAIN", distance=1),
             ],
             tasks=[
-                TaskInstance(id="road-45", template="T08", target="S02", score=45, process_frames=4),
                 TaskInstance(id="road-30", template="T08", target="S04", score=30, process_frames=4),
             ],
             action_results=[
@@ -2972,6 +2973,146 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(learned)
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S03")
+
+    def test_mountain_without_skipped_task_not_penalized(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=120,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=30, squad_available=0),
+            edges=[
+                RouteEdge(id="M1", start="S01", end="S08", route_type="MOUNTAIN", distance=1),
+                RouteEdge(id="M2", start="S08", end="S14", route_type="MOUNTAIN", distance=1),
+                RouteEdge(id="R1", start="S01", end="S02", route_type="ROAD", distance=1),
+                RouteEdge(id="R2", start="S02", end="S14", route_type="ROAD", distance=1),
+            ],
+            tasks=[TaskInstance(id="both-30", template="T08", target="S08", score=30, process_frames=4)],
+        )
+        mountain = next(package for package in strategy._route_packages_to_gate(state) if package["path"] == ("S01", "S08", "S14"))
+        self.assertTrue(mountain["mountain_route"])
+        self.assertFalse(mountain["escape_route"])
+        self.assertEqual(mountain["escape_reason"], "no_skipped_task")
+        self.assertEqual(mountain["missed_task_penalty"], 0)
+
+    def test_guard_decay_remaining_key_pass(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=120,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", station="S01"),
+            stations={"S10": Station(id="S10", node_type="KEY_PASS", guard_owner="BLUE", guard_defense=4, raw={"guard": {"ownerTeamId": "BLUE", "defense": 4, "initialDefense": 4, "ageRound": 42, "active": True}})},
+        )
+        self.assertEqual(strategy._guard_decay_remaining_frames(state, "S10"), 113)
+
+    def test_guard_decay_remaining_gate_soon(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=120,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", station="S13"),
+            stations={"S14": Station(id="S14", guard_owner="BLUE", guard_defense=1, raw={"guard": {"ownerTeamId": "BLUE", "defense": 1, "initialDefense": 1, "ageRound": 29, "active": True}})},
+        )
+        self.assertEqual(strategy._guard_decay_remaining_frames(state, "S14"), 1)
+
+    def test_forced_pass_tax_gate(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=120,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", station="S13"),
+            stations={"S14": Station(id="S14", guard_owner="BLUE", guard_defense=4, raw={"guard": {"ownerTeamId": "BLUE", "defense": 4, "initialDefense": 4, "ageRound": 0, "active": True}})},
+        )
+        self.assertEqual(strategy._forced_pass_tax_for_guard(state, "S14"), 32)
+
+    def test_mainline_preferred_when_guard_decays_soon(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=30, squad_available=0),
+            stations={"S02": Station(id="S02", guard_owner="BLUE", guard_defense=1, raw={"guard": {"ownerTeamId": "BLUE", "defense": 1, "initialDefense": 1, "ageRound": 29, "active": True}})},
+            edges=[
+                RouteEdge(id="R1", start="S01", end="S02", route_type="ROAD", distance=1),
+                RouteEdge(id="R2", start="S02", end="S14", route_type="ROAD", distance=1),
+                RouteEdge(id="M1", start="S01", end="S03", route_type="MOUNTAIN", distance=1),
+                RouteEdge(id="M2", start="S03", end="S14", route_type="MOUNTAIN", distance=1),
+            ],
+            tasks=[TaskInstance(id="road-45", template="T08", target="S02", score=45, process_frames=4)],
+        )
+        action = strategy.decide(state)
+        self.assertIn(action.main.action, {MainActionType.FORCED_PASS, MainActionType.BREAK_GUARD})
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_escape_allowed_when_mainline_guard_cost_too_high(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=95, squad_available=0, good_fruit=20, bad_fruit=0),
+            stations={"S02": Station(id="S02", node_type="KEY_PASS", guard_owner="BLUE", guard_defense=8, raw={"guard": {"ownerTeamId": "BLUE", "defense": 8, "initialDefense": 8, "ageRound": 0, "active": True}})},
+            edges=[
+                RouteEdge(id="R1", start="S01", end="S02", route_type="ROAD", distance=1),
+                RouteEdge(id="R2", start="S02", end="S14", route_type="ROAD", distance=1),
+                RouteEdge(id="M1", start="S01", end="S03", route_type="MOUNTAIN", distance=1),
+                RouteEdge(id="M2", start="S03", end="S14", route_type="MOUNTAIN", distance=1),
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S03")
+
+    def test_mainline_preferred_when_escape_skips_large_task_score(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S01", task_score_base=30, squad_available=0),
+            stations={"S02": Station(id="S02", guard_owner="BLUE", guard_defense=1, raw={"guard": {"ownerTeamId": "BLUE", "defense": 1, "initialDefense": 1, "ageRound": 29, "active": True}})},
+            edges=[
+                RouteEdge(id="R1", start="S01", end="S02", route_type="ROAD", distance=1),
+                RouteEdge(id="R2", start="S02", end="S04", route_type="ROAD", distance=1),
+                RouteEdge(id="R3", start="S04", end="S14", route_type="ROAD", distance=1),
+                RouteEdge(id="M1", start="S01", end="S03", route_type="MOUNTAIN", distance=1),
+                RouteEdge(id="M2", start="S03", end="S14", route_type="MOUNTAIN", distance=1),
+            ],
+            tasks=[
+                TaskInstance(id="road-60", template="T08", target="S02", score=60, process_frames=4),
+                TaskInstance(id="road-45", template="T08", target="S04", score=45, process_frames=4),
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertIn(action.main.action, {MainActionType.FORCED_PASS, MainActionType.BREAK_GUARD})
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+
+    def test_missing_guard_raw_falls_back_to_existing_behavior(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=120,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", station="S01", squad_available=0),
+            stations={"S10": Station(id="S10", node_type="KEY_PASS", guard_owner="BLUE", guard_defense=4)},
+        )
+        resolution = strategy._guard_resolution_cost(state, "S10", "S14")
+        self.assertEqual(resolution["mode"], "static_fallback")
+        self.assertGreaterEqual(resolution["cost"], 60)
+        self.assertIsNone(resolution["forcedPassTax"])
+        self.assertIsNone(resolution["decayRemaining"])
 
     def test_mountain_package_records_missed_mainline_task_penalty(self) -> None:
         strategy = self.make_strategy()
