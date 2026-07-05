@@ -1001,6 +1001,30 @@ class BaselineStrategyTest(unittest.TestCase):
         self.assertEqual(choice.card, WindowCard.ABSTAIN)
         self.assertEqual(choice.style, "LOW_VALUE_ABSTAIN_AFTER_ONE")
 
+    def test_window_matches_opponent_abstain_when_already_ahead(self) -> None:
+        strategy = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger())
+        state = GameState(
+            frame=180,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S02", guard_points=4, good_fruit=100, freshness=100),
+            opponent=PlayerState(player_id="1002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S02"),
+        )
+        window = WindowState(
+            id="opponent-abstained",
+            window_type="DOCK",
+            target="S02",
+            active=True,
+            my_turn=True,
+            round_index=2,
+            red_point=1,
+            blue_point=0,
+            raw={"redPlayerId": "1001", "bluePlayerId": "1002", "blueCard": "ABSTAIN"},
+        )
+        choice = strategy.window_strategy.choose(state, window, StrategyConfig.default())
+        self.assertEqual(choice.card, WindowCard.ABSTAIN)
+        self.assertEqual(choice.style, "MATCH_OPPONENT_ABSTAIN")
+
     def test_symmetric_bots_pick_different_opening_window_cards(self) -> None:
         window = WindowState(
             id="contest-symmetric",

@@ -2386,6 +2386,27 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertFalse(action.main.action == MainActionType.MOVE and action.main.to_action().get("targetNodeId") == "S10")
         self.assertEqual(action.main.to_action().get("targetNodeId"), "S09")
 
+    def test_move_blocked_result_node_field_binds_guard_target_and_avoids_repeat_move(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=315,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, squad_available=0),
+            stations={"S10": Station(id="S10"), "S09": Station(id="S09")},
+            edges=[
+                RouteEdge(id="BAD", start="S08", end="S10", distance=1),
+                RouteEdge(id="BAD2", start="S10", end="S14", distance=1),
+                RouteEdge(id="ALT", start="S08", end="S09", distance=2),
+                RouteEdge(id="ALT2", start="S09", end="S14", distance=1),
+            ],
+            action_results=[{"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD", "node": "S10"}],
+        )
+        action = strategy.decide(state)
+        self.assertFalse(action.main.action == MainActionType.MOVE and action.main.to_action().get("targetNodeId") == "S10")
+        self.assertEqual(action.main.to_action().get("targetNodeId"), "S09")
+
     def test_learned_guard_ttl_expires_and_allows_probe_move(self) -> None:
         strategy = self.make_strategy()
         first = GameState(
@@ -2660,6 +2681,53 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
+
+    def test_route_package_allows_safe_road_package_to_reach_ninety_task_score(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=120,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S07", task_score_base=30, freshness=92, squad_available=0),
+            edges=[
+                RouteEdge(id="M1", start="S07", end="S09", route_type="MOUNTAIN", distance=1),
+                RouteEdge(id="M2", start="S09", end="S14", route_type="MOUNTAIN", distance=1),
+                RouteEdge(id="R1", start="S07", end="S08", route_type="ROAD", distance=38),
+                RouteEdge(id="R2", start="S08", end="S10", route_type="ROAD", distance=1),
+                RouteEdge(id="R3", start="S10", end="S14", route_type="ROAD", distance=1),
+            ],
+            tasks=[
+                TaskInstance(id="road-30-a", template="T08", target="S08", route_bucket="ROAD", score=30, process_frames=4),
+                TaskInstance(id="road-30-b", template="T11", target="S10", route_bucket="ROAD", score=30, process_frames=4),
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S08")
+
+    def test_task_requirement_fields_skip_unclaimable_task(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=190,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S07", task_score_base=30, resources={}),
+            edges=[RouteEdge(id="E1", start="S07", end="S14", distance=1)],
+            tasks=[
+                TaskInstance(
+                    id="needs-permit",
+                    template="T09",
+                    target="S07",
+                    score=30,
+                    process_frames=4,
+                    raw={"requiredResourceTypes": ["OFFICIAL_PERMIT"]},
+                )
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertNotEqual(action.main.action, MainActionType.CLAIM_TASK)
 
     def test_route_package_large_score_value_detour_requires_deadline_buffer(self) -> None:
         strategy = self.make_strategy()

@@ -146,6 +146,8 @@ class WindowStrategy:
         loss_streak = self._remember_window_loss_state(state, window)
         opponent_card = self._opponent_revealed_card(state, window)
         if opponent_card is not None:
+            if opponent_card == WindowCard.ABSTAIN and self._should_match_opponent_abstain(state, window, high_value, value):
+                return WindowChoice(WindowCard.ABSTAIN, "MATCH_OPPONENT_ABSTAIN", f"value={value};score={self._score_text(state, window)};opponent=ABSTAIN")
             self._remember_opponent_card_profile(state, window, opponent_card)
             streak_card, streak_count = self._remember_opponent_card_streak(state, window, opponent_card)
             hard_counter = self._hard_counter_card(state, window, opponent_card, high_value, value)
@@ -333,6 +335,18 @@ class WindowStrategy:
             return int(raw_sends)
         except (TypeError, ValueError):
             return max(0, int(window.round_index or 1) - 1)
+
+    def _should_match_opponent_abstain(self, state: GameState, window: WindowState, high_value: bool, value: int) -> bool:
+        my_score, opp_score = self._score_state(state, window)
+        total_rounds = int(window.raw.get("totalRounds") or 3)
+        round_index = int(window.round_index or 1)
+        if my_score > opp_score:
+            return True
+        if my_score == opp_score and round_index >= total_rounds:
+            return True
+        if not high_value and value < 60:
+            return True
+        return False
 
     def _bias_options_against_memory(self, state: GameState, window: WindowState, options: list[tuple[WindowCard, int]]) -> list[tuple[WindowCard, int]]:
         memory = self._opponent_memory(state, window)
@@ -902,7 +916,7 @@ class BaselineStrategy:
                 continue
             event_type = str(event.get("event") or event.get("eventType") or event.get("type") or event.get("effectType") or "").upper()
             payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
-            node_id = event.get("targetNodeId") or event.get("nodeId") or payload.get("targetNodeId") or payload.get("nodeId") or state.me.station
+            node_id = self._feedback_node_id(event, payload) or state.me.station
             task_id = event.get("taskId") or payload.get("taskId")
             resource_type = event.get("resourceType") or payload.get("resourceType")
             error_code = str(event.get("errorCode") or payload.get("errorCode") or event.get("code") or "").upper()
@@ -910,7 +924,7 @@ class BaselineStrategy:
             if event_type == "MOVE_BLOCKED_BY_GUARD":
                 error_code = "MOVE_BLOCKED_BY_GUARD"
                 action = "MOVE"
-                explicit_target = event.get("targetNodeId") or payload.get("targetNodeId") or event.get("nextNodeId") or payload.get("nextNodeId") or event.get("target") or payload.get("target")
+                explicit_target = self._feedback_node_id(event, payload)
                 recent_move = self._recent_attempted_move(state)
                 node_id = explicit_target or recent_move or node_id
             self._learn_error_code(state, action, error_code, node_id, task_id, resource_type, event)
@@ -935,12 +949,13 @@ class BaselineStrategy:
             success = result.get("success")
             effective = result.get("effective")
             code = str(result.get("code") or result.get("errorCode") or result.get("reason") or result.get("message") or "").upper()
-            raw_node_id = result.get("targetNodeId") or result.get("node") or result.get("nodeId")
+            payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+            raw_node_id = self._feedback_node_id(result, payload)
             node_id = raw_node_id or state.me.station
             task_id = result.get("taskId")
             resource_type = result.get("resourceType")
             if action == "MOVE" and code == "MOVE_BLOCKED_BY_GUARD":
-                explicit_target = result.get("targetNodeId") or result.get("nextNodeId") or result.get("target")
+                explicit_target = self._feedback_node_id(result, payload)
                 recent_move = self._recent_attempted_move(state)
                 if explicit_target not in (None, ""):
                     node_id = explicit_target
@@ -970,6 +985,15 @@ class BaselineStrategy:
                 self._learn_error_code(state, action, code, node_id, task_id, resource_type, result)
             elif action == "PROCESS" and node_id:
                 self._mark_process_pending(str(node_id), state, "accepted")
+
+    def _feedback_node_id(self, record: dict[str, Any], payload: dict[str, Any] | None = None) -> Any:
+        payload = payload if isinstance(payload, dict) else {}
+        for source in (record, payload):
+            for key in ("targetNodeId", "nextNodeId", "nodeId", "node", "target"):
+                value = source.get(key)
+                if value not in (None, ""):
+                    return value
+        return None
 
     def _record_belongs_to_me(self, state: GameState, record: dict[str, Any]) -> bool:
         payload = record.get("payload") if isinstance(record.get("payload"), dict) else {}
@@ -1462,6 +1486,10 @@ class BaselineStrategy:
         if score_gap < 60 and score_value_gap < 70:
             return None
         base_extra = 36 if score_gap >= 90 or score_value_gap >= 95 else 24
+        if best["task_score"] >= 90 and current["task_score"] < 60 and not self._path_has_action_blocker(state, best["path"]):
+            base_extra = max(base_extra, 42)
+        if best["route_type"] == "ROAD" and best["task_score"] >= 90 and not self._path_has_action_blocker(state, best["path"]):
+            base_extra = max(base_extra, 48)
         max_extra = base_extra
         if score_value_gap >= 70:
             max_extra = max(max_extra, min(90, score_value_gap // 2))
@@ -3568,6 +3596,106 @@ class BaselineStrategy:
     def _task_requirements_met(self, state: GameState, task: TaskInstance) -> bool:
         if not task.available_for(state.player_id):
             return False
+        required_freshness = self._task_required_freshness(state, task)
+        if required_freshness > 0 and state.me.freshness < required_freshness:
+            self.logger.info("task_eval_skip", taskId=task.id, template=task.template, reason="required_freshness_not_met", requiredFreshness=required_freshness, freshness=state.me.freshness)
+            return False
+        required_resources = self._task_required_resources(state, task)
+        if required_resources:
+            if task.template == "T06" or required_resources <= {"FAST_HORSE", "SHORT_HORSE"}:
+                if not any(state.me.has_resource(resource) for resource in required_resources):
+                    self.logger.info("task_eval_skip", taskId=task.id, template=task.template, reason="required_horse_not_met", requiredResources=sorted(required_resources))
+                    return False
+            else:
+                missing = [resource for resource in sorted(required_resources) if not state.me.has_resource(resource)]
+                if missing:
+                    self.logger.info("task_eval_skip", taskId=task.id, template=task.template, reason="required_resource_not_met", missingResources=missing)
+                    return False
+        min_task_score = self._task_raw_int(state, task, ("requiredTaskScore", "minTaskScore", "requiredScore", "minScore"))
+        if min_task_score > 0 and state.me.task_score_base < min_task_score:
+            self.logger.info("task_eval_skip", taskId=task.id, template=task.template, reason="required_task_score_not_met", requiredTaskScore=min_task_score, taskScore=state.me.task_score_base)
+            return False
+        require_verified = self._task_raw_bool(state, task, ("requiredVerified", "requireVerified", "needsVerified", "verifiedRequired"))
+        if require_verified and not state.me.verified:
+            self.logger.info("task_eval_skip", taskId=task.id, template=task.template, reason="required_verified_not_met")
+            return False
         if task.template == "T06" and not (state.me.has_resource("FAST_HORSE") or state.me.has_resource("SHORT_HORSE")):
             return False
         return True
+
+    def _task_required_freshness(self, state: GameState, task: TaskInstance) -> float:
+        value = self._task_raw_value(state, task, ("requiredFreshness", "minFreshness", "freshnessRequired"))
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _task_required_resources(self, state: GameState, task: TaskInstance) -> set[str]:
+        values: list[Any] = []
+        for key in ("requiredResourceTypes", "requiredResources", "resourceRequirements", "needResourceTypes", "needResources"):
+            value = self._task_raw_value(state, task, (key,))
+            if value in (None, ""):
+                continue
+            if isinstance(value, list):
+                values.extend(value)
+            elif isinstance(value, dict):
+                values.extend(k for k, v in value.items() if v)
+            else:
+                values.append(value)
+        resource = self._task_raw_value(state, task, ("requiredResourceType", "needResourceType", "resourceRequired"))
+        if resource not in (None, ""):
+            values.append(resource)
+        return {str(value).upper() for value in values if value not in (None, "")}
+
+    def _task_raw_int(self, state: GameState, task: TaskInstance, keys: tuple[str, ...]) -> int:
+        value = self._task_raw_value(state, task, keys)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _task_raw_bool(self, state: GameState, task: TaskInstance, keys: tuple[str, ...]) -> bool:
+        value = self._task_raw_value(state, task, keys)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "required"}
+        return False
+
+    def _task_raw_value(self, state: GameState, task: TaskInstance, keys: tuple[str, ...]) -> Any:
+        for source in (task.raw, self._task_template_raw(state, task)):
+            if not isinstance(source, dict):
+                continue
+            for key in keys:
+                if key in source:
+                    return source.get(key)
+            requirements = source.get("requirements") or source.get("requirement") or source.get("conditions") or source.get("condition")
+            if isinstance(requirements, dict):
+                for key in keys:
+                    if key in requirements:
+                        return requirements.get(key)
+        return None
+
+    def _task_template_raw(self, state: GameState, task: TaskInstance) -> dict[str, Any]:
+        start = state.raw.get("start") if isinstance(state.raw, dict) else {}
+        candidates: list[Any] = []
+        if isinstance(start, dict):
+            candidates.append(start.get("taskTemplates"))
+            map_data = start.get("map") if isinstance(start.get("map"), dict) else {}
+            gameplay = map_data.get("gameplay") if isinstance(map_data.get("gameplay"), dict) else {}
+            candidates.extend([map_data.get("taskTemplates"), gameplay.get("taskTemplates")])
+        for raw_templates in candidates:
+            if isinstance(raw_templates, dict):
+                raw = raw_templates.get(task.template)
+                if isinstance(raw, dict):
+                    return raw
+            if isinstance(raw_templates, list):
+                for item in raw_templates:
+                    if not isinstance(item, dict):
+                        continue
+                    template_id = item.get("taskTemplateId") or item.get("templateId") or item.get("id")
+                    if str(template_id) == str(task.template):
+                        return item
+        return {}
