@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
@@ -28,7 +28,7 @@ BUSY_STATES = {
     ConvoyStatus.CONTESTING,
 }
 MOVING_STATES = {ConvoyStatus.MOVING}
-RUSH_PHASES = {"RUSH", "BANQUET", "ENDGAME", "FINAL", "宫宴冲刺"}
+RUSH_PHASES = {"RUSH", "BANQUET", "ENDGAME", "FINAL", "瀹鍐插埡"}
 PLANNING_STATES = {ConvoyStatus.IDLE, ConvoyStatus.WAITING, ConvoyStatus.UNKNOWN, ConvoyStatus.COST_BANKRUPT}
 PROCESS_RETRY_CODES = {"PROCESS_REQUIRED", "PROCESS_INTERRUPTED", "INTERRUPTED"}
 PROCESS_HARD_REJECT_CODES = {"PROCESS_NOT_AVAILABLE", "NOT_AT_TARGET_NODE", "INVALID_TARGET"}
@@ -39,6 +39,9 @@ GUARD_BLOCKED_COOLDOWN_FRAMES = 28
 GUARD_MEMORY_TTL_FRAMES = 60
 KEY_GUARD_MEMORY_TTL_FRAMES = 90
 RECENT_GUARD_BLOCK_FRAMES = 36
+CHOKEPOINT_GUARD_FUSE_WINDOW_FRAMES = 20
+CHOKEPOINT_GUARD_FUSE_WAIT_DECAY_FRAMES = 3
+SQUAD_WEAKEN_INEFFECTIVE_FRAMES = 80
 RUSH_SQUAD_WEAKEN_INVALID_COOLDOWN_FRAMES = 600
 ICE_BOX_REJECT_CODES = {
     "INVALID_ACTION",
@@ -706,6 +709,7 @@ class BaselineStrategy:
         self._blocked_guard_last_frame: dict[str, int] = {}
         self._guard_blocked_until: dict[str, int] = {}
         self._squad_weaken_until: dict[str, int] = {}
+        self._squad_weaken_ineffective_until: dict[str, int] = {}
         self._squad_clear_until: dict[str, int] = {}
         self._no_blocker_until: dict[str, int] = {}
         self._recent_move_blocked_target: str | None = None
@@ -865,6 +869,10 @@ class BaselineStrategy:
                 if pressure_ice.station == me.station:
                     return done(self._claim_resource(pressure_ice, squad=scout), "claim_pressure_ice_box")
                 return done(self._move_towards_node(state, pressure_ice.station, squad=scout), "move_to_pressure_ice_box")
+        rhythm = self._race_pressure_context(state)
+        race_speed = self._race_speed_resource_action(state, rhythm)
+        if race_speed is not None:
+            return done(race_speed, "race_speed_resource")
         catchup_task = self._race_catchup_task_action(state)
         if catchup_task is not None:
             return done(catchup_task, "opponent_race_catchup_task")
@@ -883,6 +891,9 @@ class BaselineStrategy:
         if urgent_resource is not None:
             scout = self._route_support_squad_action(state, after_current_action=True)
             return done(self._claim_resource(urgent_resource, squad=scout), f"claim_urgent_resource:{urgent_resource.resource_type}")
+        pressure_guard = self._pressure_guard_action(state, rhythm)
+        if pressure_guard is not None:
+            return done(pressure_guard, "pressure_guard")
         station_task = self._best_station_task(state)
         if station_task is not None:
             scout = self._route_support_squad_action(state, after_current_action=True)
@@ -1111,6 +1122,7 @@ class BaselineStrategy:
                 self._squad_clear_until.pop(squad_target, None)
             elif action == SquadActionType.SQUAD_WEAKEN.value:
                 self._squad_weaken_until.pop(squad_target, None)
+                self._squad_weaken_ineffective_until[squad_target] = max(self._squad_weaken_ineffective_until.get(squad_target, 0), until)
                 if invalid_squad_type and state.phase in RUSH_PHASES:
                     self._rush_squad_weaken_invalid = True
             self.logger.info("feedback_learn", learned="squad_action_rejected", action=action, target=squad_target, code=code, cooldownUntil=until, rushSquadWeakenInvalid=self._rush_squad_weaken_invalid, result=raw)
@@ -1125,6 +1137,11 @@ class BaselineStrategy:
             self._recent_move_blocked_target = node
             self._recent_move_blocked_frame = state.frame
             self._recent_move_blocked_count[node] = self._recent_move_blocked_count.get(node, 0) + 1
+            weaken_until = self._squad_weaken_until.get(node)
+            if weaken_until is not None and weaken_until <= state.frame and weaken_until >= state.frame - SQUAD_WEAKEN_INEFFECTIVE_FRAMES:
+                ineffective_until = state.frame + SQUAD_WEAKEN_INEFFECTIVE_FRAMES
+                self._squad_weaken_ineffective_until[node] = max(self._squad_weaken_ineffective_until.get(node, 0), ineffective_until)
+                self.logger.info("feedback_learn", learned="squad_weaken_ineffective_after_block", nodeId=node, cooldownUntil=ineffective_until)
             delivery_blocker = self._is_delivery_path_target(state, node)
             if delivery_blocker:
                 self._delivery_blocker_nodes.add(node)
@@ -1156,6 +1173,7 @@ class BaselineStrategy:
             self._blocked_guard_last_frame.pop(blocker_node, None)
             self._guard_blocked_until.pop(blocker_node, None)
             self._squad_weaken_until.pop(blocker_node, None)
+            self._squad_weaken_ineffective_until.pop(blocker_node, None)
             self._squad_clear_until.pop(blocker_node, None)
             self._delivery_blocker_nodes.discard(blocker_node)
             self.logger.info("feedback_learn", learned="no_blocker_at_target", nodeId=blocker_node, action=action, cooldownUntil=until, result=raw)
@@ -1473,6 +1491,129 @@ class BaselineStrategy:
             self.logger.info("opponent_pressure", myGateCost=my_cost, opponentGateCost=opp_cost, opponentTaskScore=opponent.task_score_base, myTaskScore=me.task_score_base, reason="race_pressure")
         return pressure
 
+    def _race_keypoints(self, state: GameState) -> tuple[str, ...]:
+        points = ("S10", "S11", "S12", state.gate_node, state.terminal_node)
+        seen: set[str] = set()
+        result: list[str] = []
+        for point in points:
+            if point and point not in seen:
+                seen.add(point)
+                result.append(point)
+        return tuple(result)
+
+    def _has_passed_keypoint(self, state: GameState, player: PlayerState | None) -> bool:
+        if player is None:
+            return False
+        if player.verified or player.delivered or player.status == ConvoyStatus.DELIVERED:
+            return True
+        station = player.target if player.status in {ConvoyStatus.MOVING, ConvoyStatus.WAITING} and player.target else player.station
+        if station is None:
+            return False
+        if station in self._race_keypoints(state):
+            return True
+        number = self._station_number(station)
+        return number is not None and number >= 10
+
+    def _distance_to_keypoint(self, state: GameState, player: PlayerState | None) -> int:
+        if player is None:
+            return 10**9
+        if player.verified or player.delivered or player.status == ConvoyStatus.DELIVERED:
+            return 0
+        origin = player.target if player.status in {ConvoyStatus.MOVING, ConvoyStatus.WAITING} and player.target else player.station
+        if origin is None:
+            return 10**9
+        if self._has_passed_keypoint(state, player):
+            return 0
+        candidates = [point for point in self._race_keypoints(state) if point == state.gate_node or point == state.terminal_node or point in state.stations or any(point in (edge.start, edge.end) for edge in state.edges)]
+        distances = [self.route_planner.estimate_frames(state, origin, point) for point in candidates]
+        distances = [distance for distance in distances if distance < 10**8]
+        return min(distances) if distances else 10**9
+
+    def _race_pressure_state(self, state: GameState) -> str:
+        rhythm = self._race_pressure_context(state)
+        if rhythm.get("catchup_mode"):
+            return "catchup"
+        if rhythm.get("pressure_mode"):
+            return "pressure"
+        if rhythm.get("race_mode"):
+            return "race"
+        return "normal"
+
+    def _race_pressure_context(self, state: GameState) -> dict[str, Any]:
+        me = state.me
+        opponent = state.opponent
+        my_keypoint_distance = self._distance_to_keypoint(state, me)
+        opponent_keypoint_distance = self._distance_to_keypoint(state, opponent)
+        my_passed = self._has_passed_keypoint(state, me)
+        opponent_passed = self._has_passed_keypoint(state, opponent)
+        task_gap = (opponent.task_score_base - me.task_score_base) if opponent is not None else 0
+        opponent_not_obviously_behind = opponent is not None and opponent.task_score_base + 45 >= me.task_score_base and opponent_keypoint_distance <= my_keypoint_distance + 45
+        eta_close = opponent is not None and abs(my_keypoint_distance - opponent_keypoint_distance) < 30
+        race_mode = (
+            opponent is not None
+            and state.frame < 380
+            and not me.verified
+            and not me.delivered
+            and not opponent.delivered
+            and opponent_not_obviously_behind
+            and me.task_score_base < 120
+            and my_keypoint_distance < 10**8
+            and (not opponent_passed or eta_close)
+        )
+        blocked_chokepoint = (
+            self._recent_move_blocked_target is not None
+            and self._guard_fuse_active(state, self._recent_move_blocked_target)
+        )
+        catchup_mode = (
+            opponent is not None
+            and not me.delivered
+            and (
+                task_gap >= 20
+                or (opponent_keypoint_distance + 25 <= my_keypoint_distance and opponent.task_score_base >= max(60, me.task_score_base))
+                or (opponent_passed and not my_passed and opponent.task_score_base >= 30)
+                or blocked_chokepoint
+            )
+        )
+        pressure_mode = (
+            opponent is not None
+            and my_passed
+            and not opponent_passed
+            and me.guard_points > 0
+            and me.station is not None
+            and me.status in PLANNING_STATES
+            and not self._need_endgame(state)
+            and not self._must_lock_delivery(state)
+        )
+        target_score = 120 if state.frame >= 300 or me.task_score_base >= 90 else 90
+        rhythm = {
+            "race_mode": race_mode,
+            "catchup_mode": catchup_mode,
+            "pressure_mode": pressure_mode,
+            "taskScoreGap": task_gap,
+            "keypointGap": my_keypoint_distance - opponent_keypoint_distance,
+            "keypointDistance": my_keypoint_distance,
+            "opponentKeypointDistance": opponent_keypoint_distance,
+            "targetTaskScore": target_score,
+        }
+        if race_mode:
+            self.logger.info("race_mode_active", race_reason="midgame_keypoint_race", targetTaskScore=target_score, keypointDistance=my_keypoint_distance, opponentKeypointDistance=opponent_keypoint_distance, selfKeypointEta=my_keypoint_distance, opponentKeypointEta=opponent_keypoint_distance, taskScore=me.task_score_base, opponentTaskScore=opponent.task_score_base if opponent else None)
+        if catchup_mode:
+            action = "rush_delivery" if me.task_score_base >= 90 else "claim_nearby_high_value_task"
+            if opponent_passed and not my_passed:
+                action = "escape_route" if my_keypoint_distance >= opponent_keypoint_distance + 12 else action
+            if blocked_chokepoint:
+                action = "break_guard"
+            self.logger.info("catchup_mode_active", taskScoreGap=task_gap, keypointGap=my_keypoint_distance - opponent_keypoint_distance, etaGap=my_keypoint_distance - opponent_keypoint_distance, selectedPlan=action, action=action, keypointDistance=my_keypoint_distance, opponentKeypointDistance=opponent_keypoint_distance)
+        return rhythm
+
+    def _station_number(self, station_id: str | None) -> int | None:
+        if not station_id or not station_id.startswith("S"):
+            return None
+        try:
+            return int(station_id[1:])
+        except ValueError:
+            return None
+
     def terminal_guard_threat(self, state: GameState) -> bool:
         opponent = state.opponent
         me = state.me
@@ -1500,14 +1641,21 @@ class BaselineStrategy:
         return {"S10", "S11", state.gate_node, state.terminal_node}
 
     def _race_catchup_task_action(self, state: GameState) -> ActionBundle | None:
-        if not self.opponent_race_pressure(state) or state.me.task_score_base >= 120 or self._need_endgame(state):
+        rhythm = self._race_pressure_context(state)
+        if not rhythm.get("catchup_mode") or state.me.task_score_base >= 120 or self._need_endgame(state):
             return None
         task = self._best_reachable_task(state)
         if task is None or task.score < 30:
             return None
         approach = self._task_approach_nodes.get(task.id, task.target)
+        plan = self.route_planner.plan(state, state.me.station, approach) if state.me.station is not None else None
+        if state.me.task_score_base >= 90 and plan is not None:
+            blocker_info = self._path_blocker_info(state, plan.path, state.gate_node)
+            if int(blocker_info["guardResolutionCost"]) >= 32:
+                self.logger.info("strategy_step", step="opponent_race_catchup_task", taskId=task.id, score=task.score, approach=approach, reason="catchup_skip_blocked_task_for_escape_route", guardResolutionCost=blocker_info["guardResolutionCost"])
+                return None
         scout = self._route_support_squad_action(state, after_current_action=approach == state.me.station)
-        self.logger.info("strategy_step", step="opponent_race_catchup_task", taskId=task.id, score=task.score, approach=approach, reason="opponent_high_score_fast_route")
+        self.logger.info("strategy_step", step="opponent_race_catchup_task", taskId=task.id, score=task.score, approach=approach, reason="catchup_mode_high_value_route_task", taskScoreGap=rhythm.get("taskScoreGap"), keypointGap=rhythm.get("keypointGap"))
         if approach == state.me.station:
             return self._claim_task(task, squad=scout)
         return self._move_towards_node(state, approach, squad=scout)
@@ -1671,7 +1819,6 @@ class BaselineStrategy:
             missed_task_penalty = self._missed_task_penalty(state, int(item["task_score"]), mainline_task_score) if skipped_task_score > 0 else 0
             blocker_info = self._path_blocker_info(state, item["path"], state.gate_node)
             guard_resolution_cost = int(blocker_info["guardResolutionCost"])
-            adjusted_score_value = int(item["score_value"]) - missed_task_penalty - guard_resolution_cost
             item["skipped_task_score"] = skipped_task_score
             item["missed_task_penalty"] = missed_task_penalty
             item["escape_route"] = escape_route
@@ -1681,6 +1828,9 @@ class BaselineStrategy:
             item["guard_resolution_mode"] = blocker_info["guardResolutionMode"]
             item["guard_decay_remaining"] = blocker_info["guardDecayRemaining"]
             item["forced_pass_tax"] = blocker_info["forcedPassTax"]
+            rhythm_adjustment = self._route_package_rhythm_adjustment(state, item, mainline_task_score)
+            adjusted_score_value = int(item["score_value"]) - missed_task_penalty - guard_resolution_cost + rhythm_adjustment
+            item["rhythm_adjustment"] = rhythm_adjustment
             item["adjusted_score_value"] = adjusted_score_value
             packages.append(item)
         self.logger.info(
@@ -1700,6 +1850,7 @@ class BaselineStrategy:
                     "guardResolutionMode": p["guard_resolution_mode"],
                     "guardDecayRemaining": p["guard_decay_remaining"],
                     "forcedPassTax": p["forced_pass_tax"],
+                    "rhythmAdjustment": p["rhythm_adjustment"],
                     "mountainRoute": p["mountain_route"],
                     "escapeRoute": p["escape_route"],
                     "escapeReason": p["escape_reason"],
@@ -1713,6 +1864,24 @@ class BaselineStrategy:
         projected_task_base = min(self.config.greed_task_score, state.me.task_score_base + max(0, path_task_score))
         return self._delivery_base_score(projected_task_base) + self._task_award_score(projected_task_base) + self._time_score_value(state, projected_task_base, package_cost)
 
+    def _route_package_rhythm_adjustment(self, state: GameState, item: dict[str, Any], mainline_task_score: int) -> int:
+        rhythm = self._race_pressure_context(state)
+        adjustment = 0
+        task_score = int(item.get("task_score", 0))
+        if rhythm.get("race_mode"):
+            if not item.get("mountain_route") and task_score >= 30:
+                adjustment += 25
+            elif item.get("mountain_route") and int(item.get("cost", 0)) > rhythm.get("keypointDistance", 10**9) + 20:
+                adjustment -= 15
+        if rhythm.get("catchup_mode"):
+            if state.me.task_score_base >= 90 and item.get("escape_route") and int(item.get("skipped_task_score", 0)) <= 30:
+                adjustment += 120
+            elif task_score >= 30 and task_score >= min(45, max(30, mainline_task_score)):
+                adjustment += 20
+            elif task_score < 30:
+                adjustment -= 25
+        return adjustment
+
     def _best_mainline_route_package(self, packages: list[dict[str, Any]]) -> dict[str, Any] | None:
         mainline = [package for package in packages if not package.get("escape_route")]
         if not mainline:
@@ -1725,6 +1894,9 @@ class BaselineStrategy:
         mainline_value = int(mainline.get("adjusted_score_value", 0))
         escape_value = int(chosen.get("adjusted_score_value", 0))
         value_gap = mainline_value - escape_value
+        rhythm = self._race_pressure_context(state)
+        if rhythm.get("catchup_mode") and int(chosen.get("skipped_task_score", 0)) <= 30 and int(mainline.get("guard_resolution_cost", 0)) >= 32 and value_gap < 18:
+            return False
         if value_gap >= 8:
             return True
         if value_gap <= -18:
@@ -2220,6 +2392,37 @@ class BaselineStrategy:
             return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="SHORT_HORSE"))
         return None
 
+    def _race_speed_resource_action(self, state: GameState, rhythm: dict[str, Any] | None = None) -> ActionBundle | None:
+        me = state.me
+        if rhythm is None:
+            rhythm = self._race_pressure_context(state)
+        if not rhythm.get("race_mode") or me.status not in PLANNING_STATES or me.station is None:
+            return None
+        if me.has_buff("FAST_HORSE", "SHORT_HORSE", "RUSH_SPEED"):
+            return None
+        target = self._race_speed_target(state)
+        distance = self.route_planner.estimate_frames(state, me.station, target) if target is not None else int(rhythm.get("keypointDistance", 10**9))
+        if distance >= 4 and me.has_resource("FAST_HORSE") and not self._is_resource_use_on_cooldown(state, "FAST_HORSE"):
+            self.logger.info("resource_use", resourceType="FAST_HORSE", reason="race_to_keypoint_speedup", target=target, remainingCost=distance, targetTaskScore=rhythm.get("targetTaskScore"), selfKeypointEta=rhythm.get("keypointDistance"), opponentKeypointEta=rhythm.get("opponentKeypointDistance"), speedResourceUsed=True)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="FAST_HORSE"))
+        if distance >= 3 and me.has_resource("SHORT_HORSE") and not self._is_resource_use_on_cooldown(state, "SHORT_HORSE"):
+            self.logger.info("resource_use", resourceType="SHORT_HORSE", reason="race_to_keypoint_speedup", target=target, remainingCost=distance, targetTaskScore=rhythm.get("targetTaskScore"), selfKeypointEta=rhythm.get("keypointDistance"), opponentKeypointEta=rhythm.get("opponentKeypointDistance"), speedResourceUsed=True)
+            return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, resource_type="SHORT_HORSE"))
+        return None
+
+    def _race_speed_target(self, state: GameState) -> str | None:
+        task = self._best_reachable_task(state)
+        if task is not None and task.score >= 30:
+            approach = self._task_approach_nodes.get(task.id, task.target)
+            if self._task_on_current_mainline(state, task, approach):
+                return approach
+        if state.me.verified:
+            return state.terminal_node
+        for point in self._race_keypoints(state):
+            if self.route_planner.estimate_frames(state, state.me.station, point) < 10**8:
+                return point
+        return state.gate_node
+
     def _moving_speed_resource_action(self, state: GameState) -> ActionBundle | None:
         me = state.me
         if me.status not in MOVING_STATES and not self._is_transit_waiting(state):
@@ -2417,6 +2620,7 @@ class BaselineStrategy:
         if self._freshness_pressure(state) >= 2 and state.me.task_score_base >= self.config.target_task_score:
             self.logger.info("task_eval_station", station=state.me.station, candidates=[], reason="freshness_pressure_delivery_first")
             return None
+        rhythm = self._race_pressure_context(state)
         tasks = [
             task
             for task in state.tasks
@@ -2435,9 +2639,21 @@ class BaselineStrategy:
         def score(task: TaskInstance) -> tuple[int, int]:
             threshold_bonus = 100 if state.me.task_score_base < self.config.target_task_score and task.score >= 30 else 0
             clear_bonus = 20 if task.template == "T04" else 0
-            return threshold_bonus + clear_bonus + task.score, -task.process_frames
+            rhythm_bonus = 0
+            on_mainline = self._task_on_current_mainline(state, task, state.me.station or task.target)
+            if rhythm.get("race_mode"):
+                if on_mainline and task.score >= 30:
+                    rhythm_bonus += 30
+                elif task.score < 30:
+                    rhythm_bonus -= 20
+            if rhythm.get("catchup_mode"):
+                rhythm_bonus += 35 if on_mainline and task.score >= 30 else -60
+            return threshold_bonus + clear_bonus + rhythm_bonus + task.score, -task.process_frames
         best = max(tasks, key=score)
         self.logger.info("task_eval_station", station=state.me.station, candidates=[{"taskId": t.id, "template": t.template, "score": t.score, "processFrames": t.process_frames, "rank": score(t)} for t in tasks], chosen=best.id)
+        if rhythm.get("catchup_mode") and best.score < 30:
+            self.logger.info("task_eval_station", station=state.me.station, chosen=best.id, reason="catchup_skip_low_value_station_task", taskScoreGap=rhythm.get("taskScoreGap"))
+            return None
         if self._freshness_pressure(state) >= 2 and best.score < 45:
             return None
         if state.me.task_score_base < self.config.target_task_score:
@@ -2495,11 +2711,9 @@ class BaselineStrategy:
         if freshness_pressure >= 3 and state.me.task_score_base >= self.config.target_task_score:
             self.logger.info("task_eval_reachable", candidates=[], reason="critical_freshness_delivery_first")
             return None
-        catch_up_mode = (
-            state.opponent is not None
-            and state.opponent.task_score_base >= state.me.task_score_base + 60
-            and state.me.task_score_base < 120
-        )
+        rhythm = self._race_pressure_context(state)
+        race_mode = bool(rhythm.get("race_mode"))
+        catch_up_mode = bool(rhythm.get("catchup_mode")) and state.me.task_score_base < 120
         direct = self.route_planner.estimate_frames(state, state.me.station, state.gate_node)
         candidates: list[tuple[int, TaskInstance, str, int, int, int]] = []
         for task in state.tasks:
@@ -2518,7 +2732,15 @@ class BaselineStrategy:
                 if to_task >= 10**8 or to_gate >= 10**8 or plan_to_task is None:
                     continue
                 detour = to_task + task.process_frames + to_gate - direct
+                on_mainline = self._task_on_current_mainline(state, task, approach)
                 milestone_bonus = self._task_milestone_bonus(state.me.task_score_base, task.score)
+                if race_mode and state.me.task_score_base >= 30 and task.score < 30 and not on_mainline and detour > 20 and milestone_bonus <= 0:
+                    continue
+                if catch_up_mode:
+                    if task.score < 30:
+                        continue
+                    if not on_mainline and detour > (18 if task.score >= 45 else 12):
+                        continue
                 first_hop = plan_to_task.next_station
                 if (
                     task.score < 30
@@ -2533,8 +2755,14 @@ class BaselineStrategy:
                     if self._path_has_action_blocker(state, plan_to_task.path):
                         continue
                 max_detour = self.config.max_task_detour_frames + (12 if task.score >= 30 else 0)
+                if race_mode and state.me.task_score_base >= 30:
+                    if on_mainline and task.score >= 30:
+                        max_detour += 10
+                    elif task.score < 30 and not on_mainline:
+                        max_detour = min(max_detour, 8)
                 if catch_up_mode and task.score >= 30:
-                    max_detour += 18 if task.score < 45 else 28
+                    max_detour += 12 if on_mainline else 0
+                    max_detour += 10 if task.score >= 45 else 0
                 if task.template == "T04" and task.score >= 30:
                     max_detour += 18
                 if milestone_bonus > 0:
@@ -2555,8 +2783,15 @@ class BaselineStrategy:
                         value += milestone_bonus * 4
                     if state.me.task_score_base >= self.config.target_task_score:
                         value += 20
+                    if race_mode:
+                        if on_mainline and task.score >= 30:
+                            value += 30
+                        elif task.score < 30:
+                            value -= 20
                     if catch_up_mode and task.score >= 30:
-                        value += 90 if task.score >= 45 else 60
+                        value += 75 if task.score >= 45 else 45
+                        if on_mainline:
+                            value += 25
                     if freshness_pressure >= 2:
                         value -= max(0, detour) * 4 + task.process_frames * 3
                     candidates.append((value, task, approach, detour, to_task, to_gate))
@@ -2605,6 +2840,29 @@ class BaselineStrategy:
                 seen.add(node)
                 result.append(node)
         return result
+
+    def _task_on_current_mainline(self, state: GameState, task: TaskInstance, approach: str | None = None) -> bool:
+        if state.me.station is None:
+            return False
+        plan = self.route_planner.plan(state, state.me.station, state.gate_node)
+        if plan is not None and not self._path_has_route_type(state, plan.path, "MOUNTAIN") and not self._path_has_route_type(state, plan.path, "BRANCH") and self._task_touches_path(state, task, approach, plan.path):
+            return True
+        for path in self._simple_paths(state, state.me.station, state.gate_node, max_depth=8, max_paths=32):
+            if self._path_has_route_type(state, path, "MOUNTAIN") or self._path_has_route_type(state, path, "BRANCH"):
+                continue
+            if self._task_touches_path(state, task, approach, path):
+                return True
+        return False
+
+    def _task_touches_path(self, state: GameState, task: TaskInstance, approach: str | None, path: tuple[str, ...]) -> bool:
+        path_nodes = set(path)
+        if task.target in path_nodes:
+            return True
+        if approach is not None and approach in path_nodes:
+            return True
+        if task.template == "T04":
+            return any(node in path_nodes for node in state.neighbors(task.target))
+        return False
 
     def _best_reachable_resource(self, state: GameState, *, exclude_current_station: bool = False) -> ResourceStock | None:
         if state.me.station is None:
@@ -2865,6 +3123,8 @@ class BaselineStrategy:
                 return None
             if self._squad_action_on_cooldown(state, SquadActionType.SQUAD_WEAKEN, target):
                 continue
+            if self._squad_weaken_ineffective(state, target):
+                continue
             self._squad_weaken_until[target] = state.frame + self._squad_arrival_delay(state, target) + 2
             self.logger.info("squad_eval", action="SQUAD_WEAKEN", target=target, reason="terminal_guard_preempt", pathIndex=path_index, guardDefense=station.guard_defense)
             return SquadAction(SquadActionType.SQUAD_WEAKEN, target)
@@ -2947,6 +3207,8 @@ class BaselineStrategy:
         if self._squad_action_on_cooldown(state, SquadActionType.SQUAD_WEAKEN, target):
             return None
         if self._squad_weaken_until.get(target, -1) > state.frame:
+            return None
+        if self._squad_weaken_ineffective(state, target):
             return None
         learned_guard = self._has_learned_guard(state, target)
         if station is None or not station.has_enemy_guard(me.team_id):
@@ -3134,6 +3396,60 @@ class BaselineStrategy:
         extra = self._guard_extra_good_fruit(state, me.station)
         self.logger.info("blocker_decision", target=me.station, blocker="opponent_route", action="SET_GUARD", reason="opponent_next_hop", extraGoodFruit=extra)
         return ActionBundle(main=MainAction(MainActionType.SET_GUARD, target=me.station, extra_good_fruit=extra))
+
+    def _pressure_guard_action(self, state: GameState, rhythm: dict[str, Any] | None = None) -> ActionBundle | None:
+        me = state.me
+        opponent = state.opponent
+        if rhythm is None:
+            rhythm = self._race_pressure_context(state)
+        if not rhythm.get("pressure_mode") or opponent is None or me.station is None:
+            return None
+        if state.phase in RUSH_PHASES or me.status not in PLANNING_STATES or me.current_process is not None:
+            return None
+        if me.station in {state.start_node, state.gate_node, state.terminal_node}:
+            return None
+        if not self._is_key_chokepoint(me.station):
+            return None
+        if me.good_fruit < 86 or me.freshness < 80:
+            return None
+        station = state.station(me.station)
+        if station is not None and station.has_obstacle:
+            return None
+        if station is not None and station.guard_owner not in (None, "", me.team_id) and station.guard_defense > 0:
+            return None
+        if self._station_has_high_value_task(state, me.station):
+            self.logger.info("pressure_guard_eval", target=me.station, opponentDistance=None, selfNeedReturn=False, reason="skip_current_high_value_task")
+            return None
+        if self._would_guard_before_uncrossed_mandatory_chokepoint(state):
+            self.logger.info("pressure_guard_eval", target=me.station, opponentDistance=None, selfNeedReturn=True, reason="skip_self_future_path")
+            return None
+        opponent_distance = self.route_planner.estimate_frames(state, opponent.station, me.station) if opponent.station else 10**9
+        if not self._opponent_route_depends_on_station(state, me.station) and self._opponent_next_hop_to_gate(state) != me.station and opponent_distance > 12:
+            self.logger.info("pressure_guard_eval", target=me.station, opponentDistance=opponent_distance, selfNeedReturn=False, reason="skip_not_opponent_chokepoint")
+            return None
+        if station is not None and station.guard_owner == me.team_id and station.guard_defense > 0:
+            if (
+                self._can_spend_squad(state, SquadActionType.SQUAD_REINFORCE, "pressure_guard_reinforce")
+                and not self._squad_action_on_cooldown(state, SquadActionType.SQUAD_REINFORCE, me.station)
+            ):
+                self.logger.info("pressure_guard_eval", target=me.station, opponentDistance=opponent_distance, selfNeedReturn=False, reason="passed_keypoint_guard_opponent", action="SQUAD_REINFORCE")
+                return ActionBundle(squad=SquadAction(SquadActionType.SQUAD_REINFORCE, me.station))
+            return None
+        extra = self._guard_extra_good_fruit(state, me.station)
+        self.logger.info("pressure_guard_eval", target=me.station, opponentDistance=opponent_distance, selfNeedReturn=False, reason="passed_keypoint_guard_opponent", action="SET_GUARD", extraGoodFruit=extra)
+        return ActionBundle(main=MainAction(MainActionType.SET_GUARD, target=me.station, extra_good_fruit=extra))
+
+    def _station_has_high_value_task(self, state: GameState, station_id: str | None) -> bool:
+        return any(
+            self._can_claim_task_from_station(state, task, station_id)
+            and self._task_can_be_considered(state, task)
+            and self._task_can_start_by(state, task, 0)
+            and task.id not in self._rejected_task_ids
+            and not self._is_task_scope_rejected(state, task)
+            and not self._is_object_on_cooldown(state, self._task_object_key(task.id))
+            and task.score >= 30
+            for task in state.tasks
+        )
 
     def _defensive_chokepoint_guard_action(self, state: GameState) -> ActionBundle | None:
         """Hold mandatory chokepoints after we have already crossed them."""
@@ -3589,6 +3905,46 @@ class BaselineStrategy:
             return True
         return target in self._delivery_blocker_nodes
 
+    def _guard_fuse_active(self, state: GameState, target: str | None) -> bool:
+        if not target or self._no_blocker_until.get(target, -1) > state.frame:
+            return False
+        if target not in {"S10", "S11", state.gate_node, "S14"} and not self._is_key_chokepoint(target):
+            return False
+        last_frame = self._blocked_guard_last_frame.get(target, -10**9)
+        recent_count = self._recent_move_blocked_count.get(target, 0)
+        learned_count = self._blocked_guard_nodes.get(target, 0)
+        if self._recent_move_blocked_target == target and state.frame - self._recent_move_blocked_frame <= CHOKEPOINT_GUARD_FUSE_WINDOW_FRAMES and recent_count >= 2:
+            return True
+        return state.frame - last_frame <= CHOKEPOINT_GUARD_FUSE_WINDOW_FRAMES and learned_count >= 2
+
+    def _guard_fuse_breaker_action(self, state: GameState, target: str, objective: str, squad: SquadAction | None = None) -> ActionBundle | None:
+        if not self._guard_fuse_active(state, target):
+            return None
+        if self._squad_weaken_until.get(target, -1) > state.frame:
+            self.logger.info("guard_fuse_breaker", target=target, objective=objective, action="WAIT", reason="wait_squad_weaken_arrival", blockedCount=self._blocked_guard_nodes.get(target, 0))
+            return wait("guard_fuse_wait_squad_weaken", active=True)
+
+        station = state.station(target)
+        if station is not None and station.has_enemy_guard(state.me.team_id) and 0 < station.guard_defense <= CHOKEPOINT_GUARD_FUSE_WAIT_DECAY_FRAMES:
+            self.logger.info("guard_fuse_breaker", target=target, objective=objective, action="WAIT", reason="wait_short_guard_decay", guardDefense=station.guard_defense, blockedCount=self._blocked_guard_nodes.get(target, 0))
+            return wait("guard_fuse_wait_short_decay", active=True)
+        if station is None and 0 < self._guard_blocked_until.get(target, -1) - state.frame <= CHOKEPOINT_GUARD_FUSE_WAIT_DECAY_FRAMES:
+            self.logger.info("guard_fuse_breaker", target=target, objective=objective, action="WAIT", reason="wait_guard_feedback_cooldown", guardBlockedUntil=self._guard_blocked_until.get(target), blockedCount=self._blocked_guard_nodes.get(target, 0))
+            return wait("guard_fuse_wait_cooldown", active=True)
+
+        good, bad = self._fruit_to_break_guard(state, station, target, objective)
+        if good > 0 or bad > 0:
+            self.logger.info("guard_fuse_breaker", target=target, objective=objective, action="BREAK_GUARD", reason="midgame_chokepoint_fuse", goodFruit=good, badFruit=bad, blockedCount=self._blocked_guard_nodes.get(target, 0))
+            return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=target, good_fruit=good, bad_fruit=bad), squad=squad)
+
+        alternate = self._alternate_next_hop_avoiding_blocked(state, objective, target)
+        if alternate is not None:
+            self.logger.info("guard_fuse_breaker", target=target, objective=objective, action="MOVE", nextHop=alternate, reason="safe_alternate_after_repeated_guard_block", blockedCount=self._blocked_guard_nodes.get(target, 0))
+            return ActionBundle(main=MainAction(MainActionType.MOVE, target=alternate), squad=squad)
+
+        self.logger.info("guard_fuse_breaker", target=target, objective=objective, action="FORCED_PASS", reason="midgame_chokepoint_fuse_no_safe_alternate", blockedCount=self._blocked_guard_nodes.get(target, 0))
+        return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=target), squad=squad)
+
     def _is_delivery_path_target(self, state: GameState, target: str) -> bool:
         if target in {state.gate_node, state.terminal_node}:
             return True
@@ -3777,6 +4133,9 @@ class BaselineStrategy:
         """
         station = state.station(next_hop)
         me = state.me
+        fuse = self._guard_fuse_breaker_action(state, next_hop, objective, squad)
+        if fuse is not None:
+            return fuse
         # Obstacle
         if station is not None and station.has_obstacle:
             if self._squad_clear_until.get(next_hop, -1) > state.frame:
@@ -3827,13 +4186,13 @@ class BaselineStrategy:
                 self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="SQUAD_WEAKEN")
                 return ActionBundle(squad=support)
             # 1. Squad weaken at key chokepoint
-            # 2. bad fruit 鈫?BREAK_GUARD
+            # 2. bad fruit 閳?BREAK_GUARD
             good, bad = self._fruit_to_break_guard(state, station, next_hop, objective)
             if good > 0 or bad > 0:
                 self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="BREAK_GUARD", reason="fruit_combo", goodFruit=good, badFruit=bad)
                 return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=next_hop, good_fruit=good, bad_fruit=bad), squad=support)
             # 3. Squad weaken (general)
-            # 4. good fruit 鈫?BREAK_GUARD
+            # 4. good fruit 閳?BREAK_GUARD
             self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="FORCED_PASS", reason="default")
             return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=next_hop), squad=support)
         return None  # safe to MOVE
@@ -3991,7 +4350,7 @@ class BaselineStrategy:
         for neighbor in state.neighbors(state.me.station):
             if neighbor == blocked_next_hop or self._is_learned_guard_blocked(state, neighbor):
                 continue
-            # Skip obstacle nodes 鈥?they also block movement.
+            # Skip obstacle nodes 閳?they also block movement.
             station = state.station(neighbor)
             if station is not None and station.has_obstacle:
                 continue
@@ -4095,6 +4454,8 @@ class BaselineStrategy:
                 return None
             if self._squad_action_on_cooldown(state, SquadActionType.SQUAD_WEAKEN, target):
                 return None
+            if self._squad_weaken_ineffective(state, target):
+                return None
             self._squad_weaken_until[target] = state.frame + self._squad_arrival_delay(state, target) + 2
             self.logger.info("squad_eval", action="SQUAD_WEAKEN", target=target, reason="blocked_route_guard", guardDefense=station.guard_defense)
             return SquadAction(SquadActionType.SQUAD_WEAKEN, target)
@@ -4107,6 +4468,16 @@ class BaselineStrategy:
         if state.frame < until:
             return True
         self._squad_action_cooldown_until.pop((action.value, target), None)
+        return False
+
+    def _squad_weaken_ineffective(self, state: GameState, target: str) -> bool:
+        until = self._squad_weaken_ineffective_until.get(target)
+        if until is None:
+            return False
+        if state.frame < until:
+            self.logger.info("squad_eval_skip", action=SquadActionType.SQUAD_WEAKEN.value, target=target, reason="squad_weaken_recently_ineffective", cooldownUntil=until)
+            return True
+        self._squad_weaken_ineffective_until.pop(target, None)
         return False
 
     def _squad_arrival_delay(self, state: GameState, target: str) -> int:
@@ -4267,3 +4638,4 @@ class BaselineStrategy:
                     if str(template_id) == str(task.template):
                         return item
         return {}
+
