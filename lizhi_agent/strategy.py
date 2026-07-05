@@ -846,6 +846,9 @@ class BaselineStrategy:
                     return done(self._verify_action(state), "verify_gate")
                 return done(wait("at_gate_before_rush", active=True), "at_gate_before_rush")
             rhythm = self._race_pressure_context(state)
+            priority_guard = self._priority_chokepoint_guard_action(state)
+            if priority_guard is not None:
+                return done(priority_guard, "priority_chokepoint_guard_gate")
             pressure_guard = self._pressure_guard_action(state, rhythm)
             if pressure_guard is not None:
                 return done(pressure_guard, "pressure_guard_gate")
@@ -856,6 +859,9 @@ class BaselineStrategy:
         fixed_process = self._fixed_process_action(state)
         if fixed_process is not None:
             return done(fixed_process, "fixed_process")
+        route_intel = self._delivery_route_intel_action(state)
+        if route_intel is not None:
+            return done(route_intel, "use_intel_delivery_route")
         delivery_blocker = self._delivery_blocker_breaker_action(state)
         if delivery_blocker is not None:
             return done(delivery_blocker, "delivery_blocker_breaker")
@@ -869,14 +875,59 @@ class BaselineStrategy:
         if self._should_prioritize_ice_box_acquisition(state):
             pressure_ice = self._best_reachable_ice_box(state)
             if pressure_ice is not None:
-                scout = self._route_support_squad_action(state)
-                if pressure_ice.station == me.station:
-                    return done(self._claim_resource(pressure_ice, squad=scout), "claim_pressure_ice_box")
-                return done(self._move_towards_node(state, pressure_ice.station, squad=scout), "move_to_pressure_ice_box")
+                if self._station_progress_rank(me.station) >= 1 and self._fast_delivery_mode(state) and pressure_ice.station != me.station:
+                    self.logger.info(
+                        "resource_eval_pressure_ice",
+                        station=pressure_ice.station,
+                        currentStation=me.station,
+                        reason="skip_detour_in_fast_delivery_mode",
+                    )
+                else:
+                    scout = self._route_support_squad_action(state)
+                    if pressure_ice.station == me.station:
+                        return done(self._claim_resource(pressure_ice, squad=scout), "claim_pressure_ice_box")
+                    return done(self._move_towards_node(state, pressure_ice.station, squad=scout), "move_to_pressure_ice_box")
         rhythm = self._race_pressure_context(state)
         race_speed = self._race_speed_resource_action(state, rhythm)
         if race_speed is not None:
             return done(race_speed, "race_speed_resource")
+        priority_guard = self._priority_chokepoint_guard_action(state)
+        if priority_guard is not None:
+            return done(priority_guard, "priority_chokepoint_guard")
+        pressure_guard = self._pressure_guard_action(state, rhythm)
+        if pressure_guard is not None:
+            return done(pressure_guard, "pressure_guard")
+        transit_guard = self._opportunistic_transit_guard_action(state)
+        if transit_guard is not None and state.opponent is not None and state.opponent.status in {ConvoyStatus.MOVING, ConvoyStatus.WAITING} and state.opponent.target == me.station:
+            return done(transit_guard, "opponent_moving_into_current_station_guard")
+        if self._fast_delivery_mode(state):
+            current_rank = self._station_progress_rank(me.station)
+            self.logger.info(
+                "strategy_step",
+                step="fast_delivery_lock",
+                station=me.station,
+                currentRank=current_rank,
+                taskScore=me.task_score_base,
+                freshness=me.freshness,
+                reason="midgame_single_lane_delivery_first",
+            )
+            scout = self._route_support_squad_action(state)
+            return done(self._move_towards_delivery(state, squad=scout), "fast_delivery_lock")
+        if self._opening_keypoint_race_mode(state):
+            station_resource = self._best_station_resource(state)
+            if station_resource is not None and station_resource.resource_type in {"ICE_BOX", "FAST_HORSE", "SHORT_HORSE", "PASS_TOKEN", "OFFICIAL_PERMIT"}:
+                scout = self._route_support_squad_action(state, after_current_action=True)
+                return done(self._claim_resource(station_resource, squad=scout), f"claim_race_station_resource:{station_resource.resource_type}")
+            self.logger.info(
+                "strategy_step",
+                step="opening_keypoint_race",
+                station=me.station,
+                taskScore=me.task_score_base,
+                freshness=me.freshness,
+                reason="skip_early_tasks_race_to_wuguan",
+            )
+            scout = self._route_support_squad_action(state)
+            return done(self._move_towards_delivery(state, squad=scout), "opening_keypoint_race")
         catchup_task = self._race_catchup_task_action(state)
         if catchup_task is not None:
             return done(catchup_task, "opponent_race_catchup_task")
@@ -2663,6 +2714,18 @@ class BaselineStrategy:
         self.logger.info("resource_use", resourceType="INTEL", reason="route_intel_scout", target=target)
         return ActionBundle(main=MainAction(MainActionType.USE_RESOURCE, target=target, resource_type="INTEL"))
 
+    def _delivery_route_intel_action(self, state: GameState) -> ActionBundle | None:
+        action = self._intel_action(state)
+        if action is None or action.main is None or action.main.resource_type != "INTEL":
+            return None
+        target = action.main.target
+        if target is None:
+            return None
+        if target in {"S10", "S11", "S13"} or self._is_learned_guard_blocked(state, target):
+            self.logger.info("resource_use", resourceType="INTEL", reason="priority_delivery_route_intel", target=target)
+            return action
+        return None
+
     def _intel_target(self, state: GameState) -> str | None:
         forbidden = self._scout_forbidden(state)
         me = state.me
@@ -3433,7 +3496,7 @@ class BaselineStrategy:
         return state.terminal_node if me.verified else state.gate_node
 
     def _current_route_objective(self, state: GameState) -> str:
-        if self._need_endgame(state) or self._opponent_pressure(state) or self._should_lock_delivery(state):
+        if self._need_endgame(state) or self._opponent_pressure(state) or self._fast_delivery_mode(state) or self._should_lock_delivery(state):
             return state.terminal_node if state.me.verified else state.gate_node
         route_task = self._best_reachable_task(state)
         if route_task is not None:
@@ -3455,6 +3518,38 @@ class BaselineStrategy:
             return True
         if me.good_fruit < 78 or me.freshness < 68:
             return me.task_score_base >= self.config.target_task_score
+        return False
+
+    def _fast_delivery_mode(self, state: GameState) -> bool:
+        me = state.me
+        if me.station is None:
+            return False
+        if me.station == state.terminal_node:
+            return False
+        if me.station == state.gate_node and not me.verified:
+            return False
+        current_rank = self._station_progress_rank(me.station)
+        if current_rank >= 1:
+            return True
+        if state.phase in RUSH_PHASES:
+            return True
+        if self._need_endgame(state) or self._must_lock_delivery(state):
+            return True
+        return False
+
+    def _opening_keypoint_race_mode(self, state: GameState) -> bool:
+        me = state.me
+        if me.station is None or self._station_progress_rank(me.station) != 0:
+            return False
+        if me.station not in {"S03", "S04", "S05", "S06"}:
+            return False
+        if state.phase in RUSH_PHASES or self._need_endgame(state) or self._must_lock_delivery(state):
+            return True
+        if state.frame >= 80:
+            return True
+        opponent = state.opponent
+        if opponent is not None and opponent.station is not None and self._station_progress_rank(opponent.station) >= 1:
+            return True
         return False
 
     def _must_lock_delivery(self, state: GameState) -> bool:
@@ -3637,6 +3732,55 @@ class BaselineStrategy:
             return None
         extra = self._guard_extra_good_fruit(state, me.station)
         self.logger.info("pressure_guard_eval", target=me.station, opponentDistance=opponent_distance, selfNeedReturn=False, reason="passed_keypoint_guard_opponent", action="SET_GUARD", extraGoodFruit=extra)
+        return ActionBundle(main=MainAction(MainActionType.SET_GUARD, target=me.station, extra_good_fruit=extra))
+
+    def _priority_chokepoint_guard_action(self, state: GameState) -> ActionBundle | None:
+        """Use the real race chokepoints as weapons before considering side value."""
+
+        me = state.me
+        opponent = state.opponent
+        if state.phase in RUSH_PHASES or me.status not in PLANNING_STATES or me.current_process is not None:
+            return None
+        if me.station is None or me.station not in {"S10", state.gate_node}:
+            return None
+        if me.station == state.gate_node and not me.verified:
+            return None
+        if opponent is None or opponent.delivered:
+            return None
+        remaining_delivery = self._remaining_delivery_cost(state)
+        if remaining_delivery < 10**8 and state.turns_left <= remaining_delivery + 18:
+            self.logger.info("priority_guard_eval", target=me.station, reason="skip_immediate_delivery_deadline", remainingDelivery=remaining_delivery, turnsLeft=state.turns_left)
+            return None
+        station = state.station(me.station)
+        if station is not None and station.has_obstacle:
+            return None
+        if station is not None and station.guard_owner not in (None, "", me.team_id) and station.guard_defense > 0:
+            return None
+
+        opponent_distance = self.route_planner.estimate_frames(state, opponent.station, me.station) if opponent.station else 10**9
+        opponent_needs_node = (
+            self._opponent_route_depends_on_station(state, me.station)
+            or self._opponent_next_hop_to_gate(state) == me.station
+        )
+        if not opponent_needs_node:
+            self.logger.info("priority_guard_eval", target=me.station, opponentDistance=opponent_distance, reason="skip_opponent_not_threatened")
+            return None
+
+        if station is not None and station.guard_owner == me.team_id and station.guard_defense > 0:
+            if (
+                self._can_spend_squad(state, SquadActionType.SQUAD_REINFORCE, "late_aggressive_reinforce")
+                and not self._squad_action_on_cooldown(state, SquadActionType.SQUAD_REINFORCE, me.station)
+            ):
+                self.logger.info("priority_guard_eval", target=me.station, opponentDistance=opponent_distance, action="SQUAD_REINFORCE", reason="reinforce_key_delivery_chokepoint")
+                return ActionBundle(squad=SquadAction(SquadActionType.SQUAD_REINFORCE, me.station))
+            return None
+
+        if me.guard_points <= 0 or me.good_fruit < 82 or me.freshness < 78:
+            self.logger.info("priority_guard_eval", target=me.station, reason="skip_quality_or_guard_points", guardPoints=me.guard_points, goodFruit=me.good_fruit, freshness=me.freshness)
+            return None
+
+        extra = self._guard_extra_good_fruit(state, me.station)
+        self.logger.info("priority_guard_eval", target=me.station, opponentDistance=opponent_distance, action="SET_GUARD", extraGoodFruit=extra, reason="lock_key_delivery_chokepoint")
         return ActionBundle(main=MainAction(MainActionType.SET_GUARD, target=me.station, extra_good_fruit=extra))
 
     def _station_has_high_value_task(self, state: GameState, station_id: str | None) -> bool:

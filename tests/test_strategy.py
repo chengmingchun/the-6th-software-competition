@@ -115,8 +115,8 @@ class BaselineStrategyTest(unittest.TestCase):
             frame=100,
             phase="NORMAL",
             player_id="1001",
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S03", task_score_base=30),
-            tasks=[TaskInstance(id="task-1", template="T01", target="S03", score=30, process_frames=3)],
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=30),
+            tasks=[TaskInstance(id="task-1", template="T01", target="S01", score=30, process_frames=3)],
         )
         action = self.strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.CLAIM_TASK)
@@ -588,7 +588,9 @@ class BaselineStrategyTest(unittest.TestCase):
             edges=[RouteEdge(id="E1", start="S03", end="S14", distance=1)],
             tasks=[TaskInstance(id="task-loop", template="T01", target="S03", score=30, process_frames=3)],
         )
-        self.assertEqual(self.strategy.decide(first).main.action, MainActionType.CLAIM_TASK)
+        first_action = self.strategy.decide(first)
+        self.assertEqual(first_action.main.action, MainActionType.MOVE)
+        self.assertEqual(first_action.main.to_action()["targetNodeId"], "S14")
 
         stalled = GameState(
             frame=119,
@@ -623,11 +625,11 @@ class BaselineStrategyTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S09", task_score_base=30, resources={"SHORT_HORSE": 1}),
-            edges=[RouteEdge(id="E1", start="S09", end="S14", distance=1)],
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=30, resources={"SHORT_HORSE": 1}),
+            edges=[RouteEdge(id="E1", start="S01", end="S14", distance=1)],
             tasks=[
-                TaskInstance(id="task-a", template="T06", target="S09", score=30, process_frames=3),
-                TaskInstance(id="task-b", template="T06", target="S09", score=30, process_frames=3),
+                TaskInstance(id="task-a", template="T06", target="S01", score=30, process_frames=3),
+                TaskInstance(id="task-b", template="T06", target="S01", score=30, process_frames=3),
             ],
         )
         self.assertEqual(self.strategy.decide(first).main.to_action()["taskId"], "task-a")
@@ -637,11 +639,11 @@ class BaselineStrategyTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S09", task_score_base=30, resources={"SHORT_HORSE": 1}),
-            edges=[RouteEdge(id="E1", start="S09", end="S14", distance=1)],
+            me=PlayerState(player_id="1001", status=ConvoyStatus.IDLE, station="S01", task_score_base=30, resources={"SHORT_HORSE": 1}),
+            edges=[RouteEdge(id="E1", start="S01", end="S14", distance=1)],
             tasks=[
-                TaskInstance(id="task-a", template="T06", target="S09", score=30, process_frames=3),
-                TaskInstance(id="task-b", template="T06", target="S09", score=30, process_frames=3),
+                TaskInstance(id="task-a", template="T06", target="S01", score=30, process_frames=3),
+                TaskInstance(id="task-b", template="T06", target="S01", score=30, process_frames=3),
             ],
             action_results=[{"playerId": "1001", "action": "CLAIM_TASK", "accepted": False, "code": "TASK_CONDITION_NOT_MET", "taskId": "task-a"}],
         )
@@ -686,14 +688,14 @@ class BaselineStrategyTest(unittest.TestCase):
             phase="NORMAL",
             player_id="1001",
             roles={"gateNodeId": "S14"},
-            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S09", task_score_base=95, good_fruit=95),
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S10", task_score_base=95, good_fruit=95),
             opponent=PlayerState(player_id="1002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S08", task_score_base=90),
-            stations={"S09": Station(id="S09")},
-            edges=[RouteEdge(id="E1", start="S08", end="S09", distance=1), RouteEdge(id="E2", start="S09", end="S14", distance=1)],
+            stations={"S10": Station(id="S10", node_type="KEY_PASS")},
+            edges=[RouteEdge(id="E1", start="S08", end="S10", distance=1), RouteEdge(id="E2", start="S10", end="S14", distance=1)],
         )
         action = self.strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.SET_GUARD)
-        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S10")
         self.assertEqual(action.main.to_action()["extraGoodFruit"], 1)
 
     def test_repeated_window_suppresses_after_hard_limit(self) -> None:
