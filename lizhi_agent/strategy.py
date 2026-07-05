@@ -845,6 +845,10 @@ class BaselineStrategy:
                 if self._can_verify_gate(state):
                     return done(self._verify_action(state), "verify_gate")
                 return done(wait("at_gate_before_rush", active=True), "at_gate_before_rush")
+            rhythm = self._race_pressure_context(state)
+            pressure_guard = self._pressure_guard_action(state, rhythm)
+            if pressure_guard is not None:
+                return done(pressure_guard, "pressure_guard_gate")
             return done(self._move_to(state, state.terminal_node), "gate_to_terminal")
         pre_process_intel = self._pre_process_intel_action(state)
         if pre_process_intel is not None:
@@ -879,6 +883,9 @@ class BaselineStrategy:
         route_package = self._route_package_action(state)
         if route_package is not None:
             return done(route_package, "route_package_high_task_score")
+        pressure_guard = self._pressure_guard_action(state, rhythm)
+        if pressure_guard is not None:
+            return done(pressure_guard, "pressure_guard")
         if self._need_endgame(state) or self._opponent_pressure(state) or self._must_lock_delivery(state):
             self.logger.info("strategy_step", step="delivery_guard", reason="score_or_deadline_delivery_first")
             scout = self._route_support_squad_action(state)
@@ -891,9 +898,6 @@ class BaselineStrategy:
         if urgent_resource is not None:
             scout = self._route_support_squad_action(state, after_current_action=True)
             return done(self._claim_resource(urgent_resource, squad=scout), f"claim_urgent_resource:{urgent_resource.resource_type}")
-        pressure_guard = self._pressure_guard_action(state, rhythm)
-        if pressure_guard is not None:
-            return done(pressure_guard, "pressure_guard")
         station_task = self._best_station_task(state)
         if station_task is not None:
             scout = self._route_support_squad_action(state, after_current_action=True)
@@ -1582,7 +1586,6 @@ class BaselineStrategy:
             and me.station is not None
             and me.status in PLANNING_STATES
             and not self._need_endgame(state)
-            and not self._must_lock_delivery(state)
         )
         target_score = 120 if state.frame >= 300 or me.task_score_base >= 90 else 90
         rhythm = {
@@ -3406,11 +3409,19 @@ class BaselineStrategy:
             return None
         if state.phase in RUSH_PHASES or me.status not in PLANNING_STATES or me.current_process is not None:
             return None
-        if me.station in {state.start_node, state.gate_node, state.terminal_node}:
+        if me.station in {state.start_node, state.terminal_node}:
+            return None
+        if me.station == state.gate_node and not me.verified:
             return None
         if not self._is_key_chokepoint(me.station):
             return None
-        if me.good_fruit < 86 or me.freshness < 80:
+        priority_guard_point = me.station in {"S10", state.gate_node}
+        min_good = 82 if priority_guard_point else 86
+        if me.good_fruit < min_good or me.freshness < 80:
+            return None
+        remaining_delivery = self._remaining_delivery_cost(state)
+        if remaining_delivery < 10**8 and state.turns_left <= remaining_delivery + 20:
+            self.logger.info("pressure_guard_eval", target=me.station, opponentDistance=None, selfNeedReturn=False, reason="skip_immediate_delivery_deadline", remainingDelivery=remaining_delivery, turnsLeft=state.turns_left)
             return None
         station = state.station(me.station)
         if station is not None and station.has_obstacle:

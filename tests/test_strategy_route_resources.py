@@ -3385,6 +3385,26 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.SET_GUARD)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S11")
 
+    def test_pressure_mode_prioritizes_gate_guard_after_verify(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=340,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S14", task_score_base=125, good_fruit=88, freshness=88, guard_points=1, verified=True, squad_available=0),
+            opponent=PlayerState(player_id="1002", team_id="BLUE", status=ConvoyStatus.IDLE, station="S09", task_score_base=105),
+            stations={"S14": Station(id="S14", node_type="GATE")},
+            edges=[
+                RouteEdge(id="O1", start="S09", end="S14", route_type="ROAD", distance=3),
+                RouteEdge(id="M1", start="S14", end="S15", route_type="ROAD", distance=2),
+            ],
+        )
+        self.assertEqual(strategy._race_pressure_state(state), "pressure")
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.SET_GUARD)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
+
     def test_pressure_mode_does_not_guard_self_future_path(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
