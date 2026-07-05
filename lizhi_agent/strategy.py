@@ -63,6 +63,7 @@ WINDOW_REJECT_CODES = {
 }
 WINDOW_TERMINAL_STATUSES = {"SUPPRESSED", "RESOLVED", "FINISHED", "FINISH", "ENDED", "END", "CLOSED", "COMPLETED", "COMPLETE", "SETTLED"}
 WINDOW_HARD_MAX_SENDS = 3
+LOW_VALUE_ABSTAIN_MAX_SENDS = 2
 SCOUT_PATH_LOOKAHEAD = 3
 PROACTIVE_CLEAR_MIN_PATH_INDEX = 2
 PROACTIVE_CLEAR_MAX_PATH_INDEX = 5
@@ -764,6 +765,13 @@ class BaselineStrategy:
             self._suppress_window(object_key, state, "window_on_cooldown_or_station_escape")
             return None, None
         choice = self.window_strategy.choose(state, window, self.config)
+        if (
+            choice.card == WindowCard.ABSTAIN
+            and seen > LOW_VALUE_ABSTAIN_MAX_SENDS
+            and self.window_strategy._window_value(state, window) < 60
+        ):
+            self._suppress_window(object_key, state, f"low_value_abstain_limit:{seen}")
+            return None, None
         self.logger.info("strategy_step", step="window_card", contestId=window.id, contestType=window.window_type, target=window.target, resourceType=window.resource_type, taskId=window.task_id, roundIndex=window.round_index, chosenCard=choice.card.value, windowStyle=choice.style, choiceReason=choice.reason, roll=choice.roll)
         return WindowAction(window.id, choice.card), f"window:{window.window_type}:{choice.card.value}"
 

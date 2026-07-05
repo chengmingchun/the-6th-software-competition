@@ -2407,6 +2407,29 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertFalse(action.main.action == MainActionType.MOVE and action.main.to_action().get("targetNodeId") == "S10")
         self.assertEqual(action.main.to_action().get("targetNodeId"), "S09")
 
+    def test_move_blocked_node_field_stops_plain_move_when_no_alternate(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=319,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S08", task_score_base=95, squad_available=0),
+            stations={"S10": Station(id="S10")},
+            edges=[
+                RouteEdge(id="BAD", start="S08", end="S10", distance=1),
+                RouteEdge(id="BAD2", start="S10", end="S14", distance=1),
+            ],
+            action_results=[
+                {"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD", "node": "S10"},
+                {"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD", "node": "S10"},
+                {"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD", "node": "S10"},
+            ],
+        )
+        action = strategy.decide(state)
+        self.assertNotEqual(action.main.action, MainActionType.MOVE)
+        self.assertIn(action.main.action, {MainActionType.FORCED_PASS, MainActionType.BREAK_GUARD, MainActionType.WAIT})
+
     def test_learned_guard_ttl_expires_and_allows_probe_move(self) -> None:
         strategy = self.make_strategy()
         first = GameState(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import unittest
+from dataclasses import replace
 
 from lizhi_agent.actions import MainActionType, SquadActionType, WindowCard
 from lizhi_agent.config import StrategyConfig
@@ -1024,6 +1025,32 @@ class BaselineStrategyTest(unittest.TestCase):
         choice = strategy.window_strategy.choose(state, window, StrategyConfig.default())
         self.assertEqual(choice.card, WindowCard.ABSTAIN)
         self.assertEqual(choice.style, "MATCH_OPPONENT_ABSTAIN")
+
+    def test_low_value_window_suppresses_third_abstain(self) -> None:
+        strategy = BaselineStrategy("1001", StrategyConfig.default(), SilentLogger())
+        base = GameState(
+            frame=44,
+            phase="NORMAL",
+            player_id="1001",
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S02", guard_points=0, good_fruit=100, freshness=100),
+            windows=[
+                WindowState(
+                    id="dock-low-value",
+                    window_type="DOCK",
+                    target="S02",
+                    active=True,
+                    my_turn=True,
+                    round_index=1,
+                    raw={"redPlayerId": "1001", "bluePlayerId": "1002", "totalRounds": 3},
+                )
+            ],
+        )
+        first = strategy.decide(base)
+        second = strategy.decide(replace(base, frame=45, windows=[replace(base.windows[0], round_index=2)]))
+        third = strategy.decide(replace(base, frame=46, windows=[replace(base.windows[0], round_index=3)]))
+        self.assertEqual(first.window.card, WindowCard.ABSTAIN)
+        self.assertEqual(second.window.card, WindowCard.ABSTAIN)
+        self.assertIsNone(third.window)
 
     def test_symmetric_bots_pick_different_opening_window_cards(self) -> None:
         window = WindowState(
