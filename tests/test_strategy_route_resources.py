@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from lizhi_agent.actions import MainActionType, SquadActionType
+from lizhi_agent.actions import ActionBundle, MainAction, MainActionType, SquadActionType
 from lizhi_agent.config import StrategyConfig
 from lizhi_agent.logger import DecisionLogger
 from lizhi_agent.models import ConvoyStatus, GameState, PlayerState, ResourceStock, RouteEdge, Station, TaskInstance, WeatherState
@@ -2429,6 +2429,98 @@ class StrategyRouteResourceTest(unittest.TestCase):
         action = strategy.decide(state)
         self.assertNotEqual(action.main.action, MainActionType.MOVE)
         self.assertIn(action.main.action, {MainActionType.FORCED_PASS, MainActionType.BREAK_GUARD, MainActionType.WAIT})
+
+    def test_delivery_lock_no_plain_move_after_s14_blocked(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=370,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S13", task_score_base=120, squad_available=0),
+            stations={"S14": Station(id="S14")},
+            edges=[RouteEdge(id="GATE", start="S13", end="S14", distance=1), RouteEdge(id="TERM", start="S14", end="S15", distance=1)],
+            action_results=[{"playerId": "1001", "action": "MOVE", "accepted": False, "code": "MOVE_BLOCKED_BY_GUARD", "targetNodeId": "S14"}],
+        )
+        action = strategy.decide(state)
+        self.assertFalse(action.main.action == MainActionType.MOVE and action.main.to_action().get("targetNodeId") == "S14")
+        self.assertIn(action.main.action, {MainActionType.FORCED_PASS, MainActionType.BREAK_GUARD, MainActionType.WAIT})
+
+    def test_delivery_blocker_uses_forced_pass_when_squad_weaken_invalid(self) -> None:
+        strategy = self.make_strategy()
+        strategy._blocked_guard_nodes["S14"] = 1
+        strategy._blocked_guard_last_frame["S14"] = 370
+        strategy._guard_blocked_until["S14"] = 410
+        strategy._delivery_blocker_nodes.add("S14")
+        state = GameState(
+            frame=371,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S13", task_score_base=120, squad_available=8),
+            stations={"S14": Station(id="S14", guard_owner="BLUE", guard_defense=4)},
+            edges=[RouteEdge(id="GATE", start="S13", end="S14", distance=1), RouteEdge(id="TERM", start="S14", end="S15", distance=1)],
+            action_results=[{"playerId": "1001", "action": "SQUAD_WEAKEN", "accepted": False, "code": "INVALID_ACTION_TYPE", "nodeId": "S14"}],
+        )
+        action = strategy.decide(state)
+        self.assertIn(action.main.action, {MainActionType.FORCED_PASS, MainActionType.BREAK_GUARD})
+        self.assertFalse(action.main.action == MainActionType.MOVE and action.main.to_action().get("targetNodeId") == "S14")
+        self.assertFalse(action.squad is not None and action.squad.action == SquadActionType.SQUAD_WEAKEN)
+
+    def test_delivery_waits_for_active_squad_weaken(self) -> None:
+        strategy = self.make_strategy()
+        strategy._blocked_guard_nodes["S14"] = 1
+        strategy._blocked_guard_last_frame["S14"] = 370
+        strategy._guard_blocked_until["S14"] = 410
+        strategy._delivery_blocker_nodes.add("S14")
+        strategy._squad_weaken_until["S14"] = 380
+        state = GameState(
+            frame=371,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S13", task_score_base=120, squad_available=8),
+            stations={"S14": Station(id="S14", guard_owner="BLUE", guard_defense=4)},
+            edges=[RouteEdge(id="GATE", start="S13", end="S14", distance=1), RouteEdge(id="TERM", start="S14", end="S15", distance=1)],
+        )
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.WAIT)
+        self.assertIsNone(action.squad)
+
+    def test_move_blocked_clears_stale_no_blocker(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=370,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S13", task_score_base=120),
+            edges=[RouteEdge(id="GATE", start="S13", end="S14", distance=1), RouteEdge(id="TERM", start="S14", end="S15", distance=1)],
+        )
+        strategy._no_blocker_until["S14"] = 390
+        strategy._learn_error_code(state, "MOVE", "MOVE_BLOCKED_BY_GUARD", "S14", None, None, {})
+        self.assertNotIn("S14", strategy._no_blocker_until)
+        self.assertGreater(strategy._guard_blocked_until.get("S14", -1), state.frame)
+        self.assertIn("S14", strategy._delivery_blocker_nodes)
+
+    def test_final_guard_intercepts_plain_move_to_blocked_gate(self) -> None:
+        strategy = self.make_strategy()
+        strategy._blocked_guard_nodes["S14"] = 1
+        strategy._blocked_guard_last_frame["S14"] = 370
+        strategy._guard_blocked_until["S14"] = 410
+        strategy._delivery_blocker_nodes.add("S14")
+        state = GameState(
+            frame=371,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S13", task_score_base=120, squad_available=0),
+            stations={"S14": Station(id="S14")},
+            edges=[RouteEdge(id="GATE", start="S13", end="S14", distance=1), RouteEdge(id="TERM", start="S14", end="S15", distance=1)],
+        )
+        guarded = strategy._final_guard_delivery_blocker(state, ActionBundle(main=MainAction(MainActionType.MOVE, target="S14")))
+        self.assertFalse(guarded.main.action == MainActionType.MOVE and guarded.main.to_action().get("targetNodeId") == "S14")
+        self.assertIn(guarded.main.action, {MainActionType.FORCED_PASS, MainActionType.BREAK_GUARD, MainActionType.WAIT})
 
     def test_learned_guard_ttl_expires_and_allows_probe_move(self) -> None:
         strategy = self.make_strategy()

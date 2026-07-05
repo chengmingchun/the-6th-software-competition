@@ -38,6 +38,8 @@ SHORT_BUSY_COOLDOWN_FRAMES = 5
 GUARD_BLOCKED_COOLDOWN_FRAMES = 28
 GUARD_MEMORY_TTL_FRAMES = 60
 KEY_GUARD_MEMORY_TTL_FRAMES = 90
+RECENT_GUARD_BLOCK_FRAMES = 36
+RUSH_SQUAD_WEAKEN_INVALID_COOLDOWN_FRAMES = 600
 ICE_BOX_REJECT_CODES = {
     "INVALID_ACTION",
     "RESOURCE_NOT_APPLICABLE",
@@ -706,6 +708,11 @@ class BaselineStrategy:
         self._squad_weaken_until: dict[str, int] = {}
         self._squad_clear_until: dict[str, int] = {}
         self._no_blocker_until: dict[str, int] = {}
+        self._recent_move_blocked_target: str | None = None
+        self._recent_move_blocked_frame = -1
+        self._recent_move_blocked_count: dict[str, int] = {}
+        self._delivery_blocker_nodes: set[str] = set()
+        self._rush_squad_weaken_invalid = False
 
     def on_start(self, start_data: dict) -> None:
         self._start_seen = True
@@ -796,7 +803,10 @@ class BaselineStrategy:
 
         def done(bundle: ActionBundle, reason: str) -> Decision:
             reason_text = reason if window_reason is None else f"{reason}+{window_reason}"
-            return Decision(self._attach_window(bundle, window_action), reason_text)
+            guarded = self._final_guard_delivery_blocker(state, bundle)
+            if guarded is not bundle:
+                reason_text = f"{reason_text}+delivery_blocker_final_guard"
+            return Decision(self._attach_window(guarded, window_action), reason_text)
 
         if me.status in MOVING_STATES or self._is_transit_waiting(state):
             squad = self._moving_squad_guard_action(state)
@@ -838,6 +848,9 @@ class BaselineStrategy:
         fixed_process = self._fixed_process_action(state)
         if fixed_process is not None:
             return done(fixed_process, "fixed_process")
+        delivery_blocker = self._delivery_blocker_breaker_action(state)
+        if delivery_blocker is not None:
+            return done(delivery_blocker, "delivery_blocker_breaker")
         rush_tactic = self._rush_tactic_action(state)
         if rush_tactic is not None:
             return done(rush_tactic, "use_rush_tactic")
@@ -1089,7 +1102,8 @@ class BaselineStrategy:
             self.logger.info("feedback_learn", learned="resource_rejected", nodeId=node_id, resourceType=resource_type, code=code, result=raw)
         if action.startswith("SQUAD_") and code:
             squad_target = self._squad_reject_target(state, action, node)
-            until = state.frame + (999 if code == "INVALID_ACTION_TYPE" else 80)
+            invalid_squad_type = code == "INVALID_ACTION_TYPE"
+            until = state.frame + (RUSH_SQUAD_WEAKEN_INVALID_COOLDOWN_FRAMES if invalid_squad_type else 80)
             self._squad_action_cooldown_until[(action, squad_target)] = max(self._squad_action_cooldown_until.get((action, squad_target), 0), until)
             if action == SquadActionType.SQUAD_SCOUT.value:
                 self._scout_dispatched.discard(squad_target)
@@ -1097,14 +1111,37 @@ class BaselineStrategy:
                 self._squad_clear_until.pop(squad_target, None)
             elif action == SquadActionType.SQUAD_WEAKEN.value:
                 self._squad_weaken_until.pop(squad_target, None)
-            self.logger.info("feedback_learn", learned="squad_action_rejected", action=action, target=squad_target, code=code, cooldownUntil=until, result=raw)
+                if invalid_squad_type and state.phase in RUSH_PHASES:
+                    self._rush_squad_weaken_invalid = True
+            self.logger.info("feedback_learn", learned="squad_action_rejected", action=action, target=squad_target, code=code, cooldownUntil=until, rushSquadWeakenInvalid=self._rush_squad_weaken_invalid, result=raw)
         if action == "MOVE" and code == "MOVE_BLOCKED_BY_GUARD" and node:
             current = self._blocked_guard_nodes.get(node, 0)
             self._blocked_guard_nodes[node] = current + 1
             self._blocked_guard_last_frame[node] = state.frame
             until = state.frame + GUARD_BLOCKED_COOLDOWN_FRAMES
             self._guard_blocked_until[node] = max(self._guard_blocked_until.get(node, 0), until)
-            self.logger.info("feedback_learn", learned="move_blocked_by_guard", nodeId=node, count=current + 1, code=code, guardBlockedUntil=until, guardMemoryLastFrame=state.frame, guardMemoryTtl=self._guard_memory_ttl(state, node), result=raw)
+            stale_no_blocker = node in self._no_blocker_until
+            self._no_blocker_until.pop(node, None)
+            self._recent_move_blocked_target = node
+            self._recent_move_blocked_frame = state.frame
+            self._recent_move_blocked_count[node] = self._recent_move_blocked_count.get(node, 0) + 1
+            delivery_blocker = self._is_delivery_path_target(state, node)
+            if delivery_blocker:
+                self._delivery_blocker_nodes.add(node)
+            self.logger.info(
+                "feedback_learn",
+                learned="move_blocked_by_guard",
+                nodeId=node,
+                count=current + 1,
+                code=code,
+                guardBlockedUntil=until,
+                guardMemoryLastFrame=state.frame,
+                guardMemoryTtl=self._guard_memory_ttl(state, node),
+                recentBlockedCount=self._recent_move_blocked_count[node],
+                deliveryBlocker=delivery_blocker,
+                staleNoBlockerCleared=stale_no_blocker,
+                result=raw,
+            )
         if action in {"FORCED_PASS", "BREAK_GUARD", "CLEAR"} and code == "NO_BLOCKER":
             blocker_node = node
             if self._last_attempted_blocker_action is not None:
@@ -1120,6 +1157,7 @@ class BaselineStrategy:
             self._guard_blocked_until.pop(blocker_node, None)
             self._squad_weaken_until.pop(blocker_node, None)
             self._squad_clear_until.pop(blocker_node, None)
+            self._delivery_blocker_nodes.discard(blocker_node)
             self.logger.info("feedback_learn", learned="no_blocker_at_target", nodeId=blocker_node, action=action, cooldownUntil=until, result=raw)
 
     def _mark_process_pending(self, node: str, state: GameState, reason: str) -> None:
@@ -2451,6 +2489,9 @@ class BaselineStrategy:
                 continue
             if self._squad_weaken_until.get(target, -1) > state.frame:
                 continue
+            if state.phase in RUSH_PHASES and self._rush_squad_weaken_invalid:
+                self.logger.info("squad_eval_skip", action=SquadActionType.SQUAD_WEAKEN.value, target=target, reason="rush_squad_weaken_invalid_disabled")
+                continue
             if not self._can_spend_squad(state, SquadActionType.SQUAD_WEAKEN, "terminal_guard_preempt"):
                 return None
             if self._squad_action_on_cooldown(state, SquadActionType.SQUAD_WEAKEN, target):
@@ -2530,6 +2571,9 @@ class BaselineStrategy:
             self.logger.info("squad_eval", action="SQUAD_CLEAR", target=target, reason="moving_target_obstacle")
             return SquadAction(SquadActionType.SQUAD_CLEAR, target)
         if not self._can_spend_squad(state, SquadActionType.SQUAD_WEAKEN, "moving_guard_rescue"):
+            return None
+        if state.phase in RUSH_PHASES and self._rush_squad_weaken_invalid:
+            self.logger.info("squad_eval_skip", action=SquadActionType.SQUAD_WEAKEN.value, target=target, reason="rush_squad_weaken_invalid_disabled")
             return None
         if self._squad_action_on_cooldown(state, SquadActionType.SQUAD_WEAKEN, target):
             return None
@@ -3094,6 +3138,97 @@ class BaselineStrategy:
             return f"WINDOW:{contest_id}"
         return None
 
+    def _final_guard_delivery_blocker(self, state: GameState, bundle: ActionBundle) -> ActionBundle:
+        main = bundle.main
+        if main is None or main.action != MainActionType.MOVE or not main.target:
+            return bundle
+        if not self._delivery_blocker_pressure(state):
+            return bundle
+        target = str(main.target)
+        if not self._delivery_blocker_active(state, target):
+            return bundle
+        breaker = self._delivery_blocker_breaker_action(state, target=target)
+        if breaker is None:
+            return bundle
+        self.logger.info("delivery_blocker_final_guard", target=target, originalAction=main.action.value, replacement=breaker.main.action.value if breaker.main else None, squadAction=breaker.squad.action.value if breaker.squad else None)
+        return breaker
+
+    def _delivery_blocker_breaker_action(self, state: GameState, target: str | None = None) -> ActionBundle | None:
+        if not self._delivery_blocker_pressure(state) or state.me.station is None:
+            return None
+        objective = state.terminal_node if state.me.verified else state.gate_node
+        if objective not in {state.gate_node, state.terminal_node}:
+            return None
+        blocked = self._delivery_blocker_target(state, objective, target)
+        if blocked is None:
+            return None
+
+        if self._squad_weaken_until.get(blocked, -1) > state.frame:
+            self.logger.info("delivery_blocker_breaker", target=blocked, objective=objective, action="WAIT", reason="delivery_wait_squad_weaken_arrival", until=self._squad_weaken_until[blocked])
+            return wait("delivery_wait_squad_weaken_arrival", active=True)
+
+        station = state.station(blocked)
+        good, bad = self._fruit_to_break_guard(state, station, blocked, objective)
+        if good > 0 or bad > 0:
+            support = None
+            if not (state.phase in RUSH_PHASES and self._rush_squad_weaken_invalid):
+                support = self._squad_blocker_action(state, blocked, "enemy_guard")
+            action_name = "BREAK_GUARD+SQUAD_WEAKEN" if support is not None else "BREAK_GUARD"
+            self.logger.info("delivery_blocker_breaker", target=blocked, objective=objective, action=action_name, reason="delivery_break_guard", goodFruit=good, badFruit=bad)
+            return ActionBundle(main=MainAction(MainActionType.BREAK_GUARD, target=blocked, good_fruit=good, bad_fruit=bad), squad=support)
+
+        if self._must_lock_delivery(state) or self._need_endgame(state) or state.phase in RUSH_PHASES:
+            self.logger.info("delivery_blocker_breaker", target=blocked, objective=objective, action="FORCED_PASS", reason="delivery_forced_pass_blocked_guard", rushSquadWeakenInvalid=self._rush_squad_weaken_invalid)
+            return ActionBundle(main=MainAction(MainActionType.FORCED_PASS, target=blocked))
+
+        alternate = self._alternate_next_hop_avoiding_blocked(state, objective, blocked)
+        if alternate is not None:
+            self.logger.info("delivery_blocker_breaker", target=blocked, objective=objective, action="MOVE", nextHop=alternate, reason="delivery_safe_alternate")
+            return ActionBundle(main=MainAction(MainActionType.MOVE, target=alternate))
+
+        self.logger.info("delivery_blocker_breaker", target=blocked, objective=objective, action="WAIT", reason="delivery_blocker_no_legal_break")
+        return wait("delivery_blocker_no_legal_break", active=True)
+
+    def _delivery_blocker_pressure(self, state: GameState) -> bool:
+        return self._must_lock_delivery(state) or self._need_endgame(state) or state.phase in RUSH_PHASES
+
+    def _delivery_blocker_target(self, state: GameState, objective: str, target: str | None = None) -> str | None:
+        candidates: list[str] = []
+        if target:
+            candidates.append(str(target))
+        if state.me.station is not None:
+            plan = self.route_planner.plan(state, state.me.station, objective)
+            if plan is not None and plan.next_station is not None:
+                candidates.append(plan.next_station)
+        candidates.extend([state.gate_node, state.terminal_node])
+        for candidate in dict.fromkeys(candidates):
+            if self._delivery_blocker_active(state, candidate):
+                return candidate
+        return None
+
+    def _delivery_blocker_active(self, state: GameState, target: str) -> bool:
+        if self._no_blocker_until.get(target, -1) > state.frame:
+            return False
+        station = state.station(target)
+        if station is not None and station.has_enemy_guard(state.me.team_id):
+            return True
+        if self._guard_blocked_until.get(target, -1) > state.frame:
+            return True
+        if self._has_learned_guard(state, target):
+            return True
+        if self._recent_move_blocked_target == target and state.frame - self._recent_move_blocked_frame <= RECENT_GUARD_BLOCK_FRAMES:
+            return True
+        return target in self._delivery_blocker_nodes
+
+    def _is_delivery_path_target(self, state: GameState, target: str) -> bool:
+        if target in {state.gate_node, state.terminal_node}:
+            return True
+        if state.me.station is None:
+            return False
+        objective = state.terminal_node if state.me.verified else state.gate_node
+        plan = self.route_planner.plan(state, state.me.station, objective)
+        return plan is not None and target in plan.path[1:]
+
     def _move_towards_delivery(self, state: GameState, squad: SquadAction | None = None) -> ActionBundle:
         target = state.terminal_node if state.me.verified else state.gate_node
         return self._move_towards_node(state, target, squad=squad)
@@ -3325,6 +3460,7 @@ class BaselineStrategy:
         self._blocked_guard_nodes.pop(target, None)
         self._blocked_guard_last_frame.pop(target, None)
         self._guard_blocked_until.pop(target, None)
+        self._delivery_blocker_nodes.discard(target)
         self.logger.info("feedback_learn", learned="guard_memory_expired", nodeId=target, lastFrame=last_frame, frame=state.frame, ttl=ttl)
         return False
 
@@ -3530,6 +3666,9 @@ class BaselineStrategy:
         if blocker == "enemy_guard":
             station = state.station(target)
             if station is None or not station.has_enemy_guard(state.me.team_id):
+                return None
+            if state.phase in RUSH_PHASES and self._rush_squad_weaken_invalid:
+                self.logger.info("squad_eval_skip", action=SquadActionType.SQUAD_WEAKEN.value, target=target, reason="rush_squad_weaken_invalid_disabled")
                 return None
             if not self._can_spend_squad(state, SquadActionType.SQUAD_WEAKEN, "blocked_route_guard"):
                 return None
