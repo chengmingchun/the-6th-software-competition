@@ -1805,11 +1805,37 @@ class BaselineStrategy:
             cost = self._path_estimated_cost(state, path)
             if cost >= 10**8:
                 continue
+            backtrack_penalty = self._path_backtrack_penalty(state, path)
+            forbidden_backtrack = self._path_has_forbidden_backtrack(state, path, state.gate_node)
+            min_rank = self._path_min_progress_rank(path)
+            current_rank = self._station_progress_rank(me.station)
+            if forbidden_backtrack:
+                self.logger.info(
+                    "route_package_eval",
+                    path=list(path),
+                    backtrackPenalty=backtrack_penalty,
+                    forbiddenBacktrack=True,
+                    minRankInPath=min_rank,
+                    currentRank=current_rank,
+                    reason="skip_backtracking_route",
+                )
+                continue
             route_type = self._path_route_type(state, path)
             task_score = self._path_task_score(state, path)
             score_value = self._route_package_score_value(state, task_score, cost)
             mountain_route = self._path_has_route_type(state, path, "MOUNTAIN")
-            item = {"path": path, "cost": cost, "route_type": route_type, "task_score": task_score, "score_value": score_value, "mountain_route": mountain_route}
+            item = {
+                "path": path,
+                "cost": cost,
+                "route_type": route_type,
+                "task_score": task_score,
+                "score_value": score_value,
+                "mountain_route": mountain_route,
+                "backtrack_penalty": backtrack_penalty,
+                "forbidden_backtrack": False,
+                "min_rank_in_path": min_rank,
+                "current_rank": current_rank,
+            }
             scored_paths.append(item)
             if not mountain_route:
                 mainline_task_score = max(mainline_task_score, task_score)
@@ -1832,7 +1858,7 @@ class BaselineStrategy:
             item["guard_decay_remaining"] = blocker_info["guardDecayRemaining"]
             item["forced_pass_tax"] = blocker_info["forcedPassTax"]
             rhythm_adjustment = self._route_package_rhythm_adjustment(state, item, mainline_task_score)
-            adjusted_score_value = int(item["score_value"]) - missed_task_penalty - guard_resolution_cost + rhythm_adjustment
+            adjusted_score_value = int(item["score_value"]) - missed_task_penalty - guard_resolution_cost - int(item["backtrack_penalty"]) + rhythm_adjustment
             item["rhythm_adjustment"] = rhythm_adjustment
             item["adjusted_score_value"] = adjusted_score_value
             packages.append(item)
@@ -1853,6 +1879,10 @@ class BaselineStrategy:
                     "guardResolutionMode": p["guard_resolution_mode"],
                     "guardDecayRemaining": p["guard_decay_remaining"],
                     "forcedPassTax": p["forced_pass_tax"],
+                    "backtrackPenalty": p["backtrack_penalty"],
+                    "forbiddenBacktrack": p["forbidden_backtrack"],
+                    "minRankInPath": p["min_rank_in_path"],
+                    "currentRank": p["current_rank"],
                     "rhythmAdjustment": p["rhythm_adjustment"],
                     "mountainRoute": p["mountain_route"],
                     "escapeRoute": p["escape_route"],
@@ -1862,6 +1892,165 @@ class BaselineStrategy:
             ],
         )
         return packages
+
+    def _station_progress_rank(self, node: str | None) -> int:
+        if node in {"S01", "S02", "S03", "S04", "S05", "S06"}:
+            return 0
+        if node in {"S07", "S08", "S09"}:
+            return 1
+        if node in {"S10", "S11", "S12"}:
+            return 2
+        if node in {"S13", "S14", "S15"}:
+            return 3
+        return 0
+
+    def _path_min_progress_rank(self, path: tuple[str, ...]) -> int:
+        if not path:
+            return 0
+        return min(self._station_progress_rank(node) for node in path)
+
+    def _is_terminal_return_path(self, path: tuple[str, ...]) -> bool:
+        return len(path) >= 2 and path[0] == "S15" and path[1] == "S14"
+
+    def _path_backtrack_penalty(self, state: GameState, path: tuple[str, ...]) -> int:
+        if self._is_terminal_return_path(path):
+            return 0
+        current = state.me.station or (path[0] if path else None)
+        current_rank = self._station_progress_rank(current)
+        penalty = 0
+        nodes_after_start = path[1:]
+        for node in nodes_after_start:
+            rank = self._station_progress_rank(node)
+            if rank < current_rank:
+                penalty += (current_rank - rank) * 80
+        if current_rank >= 1 and any(self._station_progress_rank(node) == 0 for node in nodes_after_start):
+            penalty += 150
+        if current in {"S07", "S08", "S09"} and any(node in {"S04", "S05"} for node in nodes_after_start):
+            penalty += 200
+        if current_rank >= 2 and any(self._station_progress_rank(node) < 2 for node in nodes_after_start):
+            penalty += 300
+        return penalty
+
+    def _path_has_raw_backtrack_violation(self, state: GameState, path: tuple[str, ...]) -> bool:
+        if self._is_terminal_return_path(path):
+            return False
+        current = state.me.station or (path[0] if path else None)
+        current_rank = self._station_progress_rank(current)
+        nodes_after_start = path[1:]
+        if current_rank >= 1 and any(self._station_progress_rank(node) == 0 for node in nodes_after_start):
+            return True
+        if current_rank >= 2 and any(self._station_progress_rank(node) == 1 for node in nodes_after_start):
+            return True
+        if current_rank >= 3 and any(self._station_progress_rank(node) == 2 for node in nodes_after_start):
+            return True
+        return False
+
+    def _objective_is_delivery_target(self, state: GameState, objective: str | None) -> bool:
+        return objective in {state.gate_node, state.terminal_node}
+
+    def _has_non_backtracking_route(self, state: GameState, objective: str) -> bool:
+        if state.me.station is None:
+            return False
+        for path in self._simple_paths(state, state.me.station, objective, max_depth=8, max_paths=64):
+            if len(path) >= 2 and not self._path_has_raw_backtrack_violation(state, path):
+                return True
+        return False
+
+    def _path_has_forbidden_backtrack(self, state: GameState, path: tuple[str, ...], objective: str | None) -> bool:
+        if not self._path_has_raw_backtrack_violation(state, path):
+            return False
+        if objective is not None and self._objective_is_delivery_target(state, objective) and not self._has_non_backtracking_route(state, objective):
+            return False
+        return True
+
+    def _combined_path_via_next_hop(self, state: GameState, next_hop: str, objective: str) -> tuple[str, ...] | None:
+        if state.me.station is None:
+            return None
+        plan = self.route_planner.plan(state, next_hop, objective)
+        if plan is None:
+            return (state.me.station, next_hop)
+        return (state.me.station, *plan.path)
+
+    def _alternate_next_hop_avoiding_backtrack(self, state: GameState, objective: str, rejected_next_hop: str) -> str | None:
+        if state.me.station is None:
+            return None
+        for neighbor in state.neighbors(state.me.station):
+            if neighbor == rejected_next_hop:
+                continue
+            station = state.station(neighbor)
+            if station is not None and station.has_obstacle:
+                continue
+            plan = self.route_planner.plan(state, neighbor, objective)
+            if plan is None or state.me.station in plan.path[1:]:
+                continue
+            combined = (state.me.station, *plan.path)
+            if not self._path_has_forbidden_backtrack(state, combined, objective):
+                return neighbor
+        return None
+
+    def _safe_next_hop_after_backtrack_guard(self, state: GameState, next_hop: str, objective: str, *, reason_prefix: str = "") -> tuple[str | None, str | None]:
+        if state.me.station is None:
+            return next_hop, None
+        path = self._combined_path_via_next_hop(state, next_hop, objective)
+        if path is None or not self._path_has_raw_backtrack_violation(state, path):
+            return next_hop, None
+        if not self._path_has_forbidden_backtrack(state, path, objective):
+            self.logger.info(
+                "route_decision",
+                fromNode=state.me.station,
+                target=objective,
+                nextHop=next_hop,
+                path=list(path),
+                currentRank=self._station_progress_rank(state.me.station),
+                minRankInPath=self._path_min_progress_rank(path),
+                backtrackPenalty=self._path_backtrack_penalty(state, path),
+                reason="backtrack_only_viable_delivery_route",
+            )
+            return next_hop, "backtrack_only_viable_delivery_route"
+        alternate = self._alternate_next_hop_avoiding_backtrack(state, objective, next_hop)
+        if alternate is not None:
+            self.logger.info(
+                "route_decision",
+                fromNode=state.me.station,
+                target=objective,
+                nextHop=alternate,
+                rejectedNextHop=next_hop,
+                alternateNextHop=alternate,
+                currentRank=self._station_progress_rank(state.me.station),
+                minRankInPath=self._path_min_progress_rank(path),
+                backtrackPenalty=self._path_backtrack_penalty(state, path),
+                reason=f"{reason_prefix}avoid_backtracking_next_hop" if reason_prefix else "avoid_backtracking_next_hop",
+            )
+            return alternate, "avoid_backtracking_next_hop"
+        if not self._objective_is_delivery_target(state, objective):
+            gate_plan = self.route_planner.plan(state, state.me.station, state.gate_node)
+            if gate_plan is not None and len(gate_plan.path) >= 2 and not self._path_has_forbidden_backtrack(state, gate_plan.path, state.gate_node):
+                alternate = gate_plan.path[1]
+                self.logger.info(
+                    "route_decision",
+                    fromNode=state.me.station,
+                    target=objective,
+                    nextHop=alternate,
+                    rejectedNextHop=next_hop,
+                    alternateNextHop=alternate,
+                    currentRank=self._station_progress_rank(state.me.station),
+                    minRankInPath=self._path_min_progress_rank(path),
+                    backtrackPenalty=self._path_backtrack_penalty(state, path),
+                    reason=f"{reason_prefix}avoid_backtracking_next_hop" if reason_prefix else "avoid_backtracking_next_hop",
+                )
+                return str(alternate), "avoid_backtracking_next_hop"
+        self.logger.info(
+            "route_decision",
+            fromNode=state.me.station,
+            target=objective,
+            nextHop=None,
+            rejectedNextHop=next_hop,
+            currentRank=self._station_progress_rank(state.me.station),
+            minRankInPath=self._path_min_progress_rank(path),
+            backtrackPenalty=self._path_backtrack_penalty(state, path),
+            reason=f"{reason_prefix}avoid_backtracking_next_hop" if reason_prefix else "avoid_backtracking_next_hop",
+        )
+        return None, "avoid_backtracking_next_hop"
 
     def _route_package_score_value(self, state: GameState, path_task_score: int, package_cost: int) -> int:
         projected_task_base = min(self.config.greed_task_score, state.me.task_score_base + max(0, path_task_score))
@@ -4069,6 +4258,10 @@ class BaselineStrategy:
                     self.logger.info("route_decision", fromNode=state.me.station, target=target, nextHop=neighbor, avoided=next_hop, reason="avoid_learned_or_cooling_guard")
                     next_hop = neighbor
                     break
+        guarded_next_hop, backtrack_reason = self._safe_next_hop_after_backtrack_guard(state, next_hop, target)
+        if guarded_next_hop is None:
+            return wait(backtrack_reason or "avoid_backtracking_next_hop", active=True)
+        next_hop = guarded_next_hop
         # Safety gate: handle any blocker before MOVE
         station = state.station(next_hop)
         if self._squad_weaken_until.get(next_hop, -1) > state.frame:
@@ -4120,6 +4313,10 @@ class BaselineStrategy:
                     self.logger.info("route_decision", fromNode=state.me.station, target=objective, nextHop=neighbor, avoided=next_hop, reason="route_package_avoid_learned_or_cooling_guard")
                     next_hop = neighbor
                     break
+        guarded_next_hop, backtrack_reason = self._safe_next_hop_after_backtrack_guard(state, next_hop, objective, reason_prefix="route_package_")
+        if guarded_next_hop is None:
+            return wait(backtrack_reason or "route_package_avoid_backtracking_next_hop", active=True)
+        next_hop = guarded_next_hop
         station = state.station(next_hop)
         if self._squad_weaken_until.get(next_hop, -1) > state.frame:
             self.logger.info("blocker_decision", target=next_hop, blocker="enemy_guard", action="WAIT", reason="wait_squad_weaken_arrival_before_route_package_move", until=self._squad_weaken_until[next_hop])

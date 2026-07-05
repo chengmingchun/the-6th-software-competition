@@ -867,7 +867,7 @@ class StrategyRouteResourceTest(unittest.TestCase):
         self.assertEqual(action.main.action, MainActionType.MOVE)
         self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
 
-    def test_verified_ice_box_detour_uses_terminal_objective(self) -> None:
+    def test_verified_ice_box_detour_does_not_backtrack_to_early_node(self) -> None:
         strategy = self.make_strategy()
         state = GameState(
             frame=260,
@@ -886,7 +886,8 @@ class StrategyRouteResourceTest(unittest.TestCase):
         )
         action = strategy.decide(state)
         self.assertEqual(action.main.action, MainActionType.MOVE)
-        self.assertEqual(action.main.to_action()["targetNodeId"], "S02")
+        self.assertNotEqual(action.main.to_action()["targetNodeId"], "S02")
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
 
     def test_hot_weather_allows_larger_ice_box_detour(self) -> None:
         strategy = self.make_strategy()
@@ -2672,6 +2673,126 @@ class StrategyRouteResourceTest(unittest.TestCase):
         road = next(package for package in packages if package["path"] == ("S01", "S02", "S14"))
         mountain = next(package for package in packages if package["path"] == ("S01", "S08", "S14"))
         self.assertGreaterEqual(road["cost"] - mountain["cost"], 75)
+
+    def test_no_backtrack_from_s07_to_water_route(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S07", task_score_base=60, squad_available=0),
+            edges=[
+                RouteEdge(id="F1", start="S07", end="S09", route_type="ROAD", distance=1),
+                RouteEdge(id="F2", start="S09", end="S10", route_type="ROAD", distance=1),
+                RouteEdge(id="F3", start="S10", end="S14", route_type="ROAD", distance=1),
+                RouteEdge(id="B1", start="S07", end="S05", route_type="WATER", distance=1),
+                RouteEdge(id="B2", start="S05", end="S04", route_type="WATER", distance=1),
+                RouteEdge(id="B3", start="S04", end="S14", route_type="ROAD", distance=1),
+            ],
+            tasks=[TaskInstance(id="bait-water-task", template="T08", target="S04", score=90, process_frames=4)],
+        )
+        packages = strategy._route_packages_to_gate(state)
+        self.assertTrue(packages)
+        self.assertFalse(any("S04" in package["path"] or "S05" in package["path"] for package in packages))
+        action = strategy.decide(state)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
+
+    def test_no_backtrack_from_s09_to_early_nodes(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=260,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S09", task_score_base=90, squad_available=0),
+            edges=[
+                RouteEdge(id="F1", start="S09", end="S10", route_type="ROAD", distance=1),
+                RouteEdge(id="F2", start="S10", end="S14", route_type="ROAD", distance=1),
+                RouteEdge(id="B1", start="S09", end="S07", route_type="ROAD", distance=1),
+                RouteEdge(id="B2", start="S07", end="S05", route_type="WATER", distance=1),
+                RouteEdge(id="B3", start="S05", end="S04", route_type="WATER", distance=1),
+            ],
+        )
+        action = strategy._move_towards_node(state, "S04")
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S10")
+
+    def test_no_backtrack_from_s13_to_midgame(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=430,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S13", task_score_base=120, squad_available=0),
+            edges=[
+                RouteEdge(id="F1", start="S13", end="S14", route_type="ROAD", distance=1),
+                RouteEdge(id="B1", start="S13", end="S12", route_type="ROAD", distance=1),
+                RouteEdge(id="B2", start="S12", end="S10", route_type="ROAD", distance=1),
+            ],
+        )
+        action = strategy._move_towards_node(state, "S10")
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
+
+    def test_allow_terminal_return_s15_to_s14(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=500,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14", "terminalNodeIds": ["S15"]},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S15", verified=False, task_score_base=120),
+            edges=[RouteEdge(id="R", start="S15", end="S14", route_type="ROAD", distance=1)],
+        )
+        action = strategy._move_towards_node(state, "S14")
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S14")
+
+    def test_backtrack_allowed_only_if_no_forward_route(self) -> None:
+        logger = RecordingLogger()
+        strategy = BaselineStrategy("1001", StrategyConfig.default(), logger)
+        state = GameState(
+            frame=500,
+            phase="RUSH",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S13", task_score_base=120),
+            edges=[
+                RouteEdge(id="ONLY1", start="S13", end="S12", route_type="ROAD", distance=1),
+                RouteEdge(id="ONLY2", start="S12", end="S14", route_type="ROAD", distance=1),
+            ],
+        )
+        action = strategy._move_towards_node(state, "S14")
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S12")
+        self.assertTrue(any(event == "route_decision" and fields.get("reason") == "backtrack_only_viable_delivery_route" for event, fields in logger.records))
+
+    def test_backtrack_penalty_logged(self) -> None:
+        logger = RecordingLogger()
+        strategy = BaselineStrategy("1001", StrategyConfig.default(), logger)
+        state = GameState(
+            frame=220,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S07", task_score_base=60, squad_available=0),
+            edges=[
+                RouteEdge(id="F1", start="S07", end="S09", route_type="ROAD", distance=1),
+                RouteEdge(id="F2", start="S09", end="S14", route_type="ROAD", distance=1),
+                RouteEdge(id="B1", start="S07", end="S05", route_type="WATER", distance=1),
+                RouteEdge(id="B2", start="S05", end="S14", route_type="ROAD", distance=1),
+            ],
+        )
+        strategy._route_packages_to_gate(state)
+        skip_logs = [fields for event, fields in logger.records if event == "route_package_eval" and fields.get("reason") == "skip_backtracking_route"]
+        self.assertTrue(skip_logs)
+        self.assertIn("backtrackPenalty", skip_logs[0])
+        self.assertIn("forbiddenBacktrack", skip_logs[0])
+        self.assertIn("currentRank", skip_logs[0])
+        self.assertIn("minRankInPath", skip_logs[0])
 
     def test_station_task_skips_expired_task(self) -> None:
         strategy = self.make_strategy()
