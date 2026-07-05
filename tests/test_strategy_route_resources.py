@@ -1700,8 +1700,7 @@ class StrategyRouteResourceTest(unittest.TestCase):
         )
         action = strategy.decide(state)
         self.assertIsNotNone(action.main)
-        self.assertEqual(action.main.action, MainActionType.MOVE)
-        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
+        self.assertEqual(action.main.action, MainActionType.WAIT)
 
     def test_pushes_mandatory_chokepoint_instead_of_waiting_live_trap(self) -> None:
         strategy = self.make_strategy()
@@ -1784,7 +1783,8 @@ class StrategyRouteResourceTest(unittest.TestCase):
         )
         action = strategy.decide(state)
         self.assertIsNotNone(action.main)
-        self.assertEqual(action.main.action, MainActionType.WAIT)
+        self.assertEqual(action.main.action, MainActionType.MOVE)
+        self.assertEqual(action.main.to_action()["targetNodeId"], "S09")
 
     def test_delivery_route_pushes_live_trap_when_no_alternate(self) -> None:
         strategy = self.make_strategy()
@@ -2536,6 +2536,20 @@ class StrategyRouteResourceTest(unittest.TestCase):
         road = next(package for package in packages if package["path"] == ("S01", "S02", "S14"))
         mountain = next(package for package in packages if package["path"] == ("S01", "S08", "S14"))
         self.assertGreaterEqual(road["cost"] - mountain["cost"], 75)
+
+    def test_station_task_skips_expired_task(self) -> None:
+        strategy = self.make_strategy()
+        state = GameState(
+            frame=100,
+            phase="NORMAL",
+            player_id="1001",
+            roles={"gateNodeId": "S14"},
+            me=PlayerState(player_id="1001", team_id="RED", status=ConvoyStatus.IDLE, station="S03", task_score_base=30),
+            edges=[RouteEdge(id="G", start="S03", end="S14", route_type="ROAD", distance=1)],
+            tasks=[TaskInstance(id="expired", template="T08", target="S03", score=45, process_frames=4, expire_frame=99)],
+        )
+        action = strategy.decide(state)
+        self.assertNotEqual(action.main.action, MainActionType.CLAIM_TASK)
 
     def test_route_package_values_delivery_score_jump_to_ninety_tasks(self) -> None:
         strategy = self.make_strategy()

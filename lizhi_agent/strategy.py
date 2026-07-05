@@ -1978,6 +1978,8 @@ class BaselineStrategy:
             task
             for task in state.tasks
             if self._can_claim_task_from_station(state, task, state.me.station)
+            and self._task_can_be_considered(state, task)
+            and self._task_can_start_by(state, task, 0)
             and task.id not in self._rejected_task_ids
             and not self._is_task_scope_rejected(state, task)
             and not self._is_object_on_cooldown(state, self._task_object_key(task.id))
@@ -2060,9 +2062,7 @@ class BaselineStrategy:
         for task in state.tasks:
             if task.id in self._rejected_task_ids or self._is_object_on_cooldown(state, self._task_object_key(task.id)):
                 continue
-            if self._is_task_scope_rejected(state, task):
-                continue
-            if not self._task_requirements_met(state, task) or task.score <= 0:
+            if not self._task_can_be_considered(state, task) or task.score <= 0:
                 continue
             for approach in self._task_approach_candidates(state, task):
                 if exclude_current_station and approach == state.me.station:
@@ -3543,9 +3543,27 @@ class BaselineStrategy:
 
     def _t04_for_target(self, state: GameState, target: str) -> TaskInstance | None:
         for task in state.tasks:
-            if task.template == "T04" and task.target == target and self._task_requirements_met(state, task) and task.id not in self._rejected_task_ids and not self._is_task_scope_rejected(state, task):
+            if (
+                task.template == "T04"
+                and task.target == target
+                and self._task_can_be_considered(state, task)
+                and self._task_can_start_by(state, task, 0)
+            ):
                 return task
         return None
+
+    def _task_can_be_considered(self, state: GameState, task: TaskInstance) -> bool:
+        return (
+            task.id not in self._rejected_task_ids
+            and not self._is_task_scope_rejected(state, task)
+            and self._task_requirements_met(state, task)
+            and self._task_can_start_by(state, task, 0)
+        )
+
+    def _task_can_start_by(self, state: GameState, task: TaskInstance, arrival_frames: int) -> bool:
+        if task.expire_frame <= 0:
+            return True
+        return state.frame + max(0, arrival_frames) <= task.expire_frame
 
     def _task_requirements_met(self, state: GameState, task: TaskInstance) -> bool:
         if not task.available_for(state.player_id):
