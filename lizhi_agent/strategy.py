@@ -891,6 +891,9 @@ class BaselineStrategy:
         race_speed = self._race_speed_resource_action(state, rhythm)
         if race_speed is not None:
             return done(race_speed, "race_speed_resource")
+        task_floor = self._minimum_task_floor_action(state)
+        if task_floor is not None:
+            return done(task_floor, "minimum_task_floor")
         priority_guard = self._priority_chokepoint_guard_action(state)
         if priority_guard is not None:
             return done(priority_guard, "priority_chokepoint_guard")
@@ -3529,7 +3532,7 @@ class BaselineStrategy:
         if me.station == state.gate_node and not me.verified:
             return False
         current_rank = self._station_progress_rank(me.station)
-        if current_rank >= 1:
+        if current_rank >= 1 and me.task_score_base >= 60:
             return True
         if state.phase in RUSH_PHASES:
             return True
@@ -3543,13 +3546,68 @@ class BaselineStrategy:
             return False
         if me.station not in {"S03", "S04", "S05", "S06"}:
             return False
+        if me.task_score_base < 60:
+            if self._minimum_task_floor_candidate(state) is not None or self._has_nearby_task_floor_candidate(state):
+                return False
         if state.phase in RUSH_PHASES or self._need_endgame(state) or self._must_lock_delivery(state):
             return True
-        if state.frame >= 80:
+        if me.task_score_base >= 60 and state.frame >= 80:
             return True
         opponent = state.opponent
-        if opponent is not None and opponent.station is not None and self._station_progress_rank(opponent.station) >= 1:
+        if opponent is not None and opponent.station is not None and (opponent.station in {"S10", "S13", state.gate_node, state.terminal_node} or self._station_progress_rank(opponent.station) >= 2 or opponent.verified):
             return True
+        return False
+
+    def _minimum_task_floor_action(self, state: GameState) -> ActionBundle | None:
+        task = self._minimum_task_floor_candidate(state)
+        if task is None:
+            return None
+        scout = self._route_support_squad_action(state, after_current_action=True)
+        self.logger.info("task_eval_floor", station=state.me.station, chosen=task.id, score=task.score, processFrames=task.process_frames, reason="minimum_task_score_floor")
+        return self._claim_task(task, squad=scout)
+
+    def _minimum_task_floor_candidate(self, state: GameState) -> TaskInstance | None:
+        me = state.me
+        if me.task_score_base >= 60 or me.status not in PLANNING_STATES or me.current_process is not None or me.station is None:
+            return None
+        tasks = [
+            task
+            for task in state.tasks
+            if task.score >= 30
+            and task.process_frames <= 8
+            and self._can_claim_task_from_station(state, task, me.station)
+            and self._task_can_be_considered(state, task)
+            and self._task_can_start_by(state, task, 0)
+            and task.id not in self._rejected_task_ids
+            and not self._is_task_scope_rejected(state, task)
+            and not self._is_object_on_cooldown(state, self._task_object_key(task.id))
+        ]
+        if not tasks:
+            return None
+        return max(tasks, key=lambda task: (task.score, -task.process_frames))
+
+    def _has_nearby_task_floor_candidate(self, state: GameState) -> bool:
+        me = state.me
+        if me.task_score_base >= 60 or me.station is None:
+            return False
+        neighbors = set(state.neighbors(me.station))
+        objective = state.terminal_node if me.verified else state.gate_node
+        plan = self.route_planner.plan(state, me.station, objective)
+        path_nodes = set(plan.path[1:3]) if plan is not None else set()
+        for task in state.tasks:
+            if (
+                task.score >= 30
+                and task.process_frames <= 8
+                and task.target in neighbors
+                and task.target in path_nodes
+                and self._task_can_be_considered(state, task)
+                and self._task_can_start_by(state, task, 0)
+                and task.id not in self._rejected_task_ids
+                and not self._is_task_scope_rejected(state, task)
+                and not self._is_object_on_cooldown(state, self._task_object_key(task.id))
+                and self._task_requirements_met(state, task)
+            ):
+                return True
         return False
 
     def _must_lock_delivery(self, state: GameState) -> bool:
@@ -3739,9 +3797,10 @@ class BaselineStrategy:
 
         me = state.me
         opponent = state.opponent
-        if state.phase in RUSH_PHASES or me.status not in PLANNING_STATES or me.current_process is not None:
+        gate_lock_in_rush = me.station == state.gate_node and me.verified
+        if (state.phase in RUSH_PHASES and not gate_lock_in_rush) or me.status not in PLANNING_STATES or me.current_process is not None:
             return None
-        if me.station is None or me.station not in {"S10", state.gate_node}:
+        if me.station is None or me.station not in {"S10", "S13", state.gate_node}:
             return None
         if me.station == state.gate_node and not me.verified:
             return None
